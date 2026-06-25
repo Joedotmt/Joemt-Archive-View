@@ -1,9 +1,9 @@
 # JVVV
 
 JVVV is a small desktop catalogue application inspired by Virtual Volumes View.
-It scans removable drives or folders into a local SQLite database so their
-contents can be browsed and searched later, even while the original drive is
-disconnected.
+It scans removable drives or folders into user-managed `.jvvv` catalogue files
+so their contents can be browsed and searched later, even while the original
+drive is disconnected.
 
 The MVP focuses on reliable scanning, offline browsing, volume statistics, and
 fast search. It does not generate thumbnails, previews, or use any server/cloud
@@ -12,7 +12,7 @@ component.
 ## Features
 
 - Create, edit, delete, scan, and rescan catalogue volumes.
-- Store folder structure and file metadata in SQLite.
+- Store each catalogue as a single SQLite-backed `.jvvv` file.
 - Browse indexed folders and files offline.
 - Search by filename, partial filename, extension, folder name, and relative
   path across all volumes.
@@ -41,27 +41,19 @@ On Windows, activate the environment with:
 python -m jvvv
 ```
 
-The database is stored in the standard application-data directory for your
-operating system:
-
-- Windows: `%APPDATA%\JVVV\jvvv.sqlite3`
-- macOS: `~/Library/Application Support/JVVV/jvvv.sqlite3`
-- Linux: `${XDG_DATA_HOME:-~/.local/share}/jvvv/jvvv.sqlite3`
-
-For development or tests, you can override the database path:
-
-```bash
-JVVV_DB_PATH=/tmp/jvvv-dev.sqlite3 python -m jvvv
-```
+JVVV starts without opening a catalogue. Use **File > New Catalogue** to create
+a `.jvvv` file, or **File > Open Catalogue** to open an existing one. The file
+is a valid SQLite database and contains the full catalogue.
 
 ## Usage
 
-1. Click **Add Volume**.
-2. Enter a catalogue name and choose a connected drive or folder.
-3. Select the new volume and click **Scan**.
-4. Browse the saved folder tree and file list after the scan completes.
-5. Use the search bar to search across all indexed volumes.
-6. Use **Rescan** to refresh an existing catalogue.
+1. Choose **File > New Catalogue** and save a `.jvvv` file.
+2. Click **New Volume**.
+3. Enter a volume name and choose a connected drive or folder.
+4. Select the new volume and click **Scan**.
+5. Browse the saved folder tree and file list after the scan completes.
+6. Use the search bar to search across all indexed volumes.
+7. Use **Rescan** to refresh an existing catalogue.
 
 When rescanning, the app asks whether removed files should be deleted from the
 catalogue or marked as missing.
@@ -98,5 +90,5 @@ For a single executable:
 pyinstaller --name JVVV --onefile --windowed --collect-all PySide6 jvvv_app.py
 ```
 
-The generated application will be in `dist/`. The SQLite database is still
-created in the user's standard application-data directory at runtime.
+The generated application will be in `dist/`. Catalogue records are saved in
+the `.jvvv` files users create or open.

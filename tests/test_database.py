@@ -4,7 +4,13 @@ import sqlite3
 
 import pytest
 
-from jvvv.database import Database, count_rows
+from jvvv.database import (
+    Database,
+    InvalidCatalogueError,
+    count_rows,
+    create_catalogue,
+    open_catalogue,
+)
 
 
 def test_database_initializes_schema(tmp_path):
@@ -20,6 +26,30 @@ def test_database_initializes_schema(tmp_path):
         assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 1
     finally:
         db.close()
+
+
+def test_create_catalogue_appends_extension_and_reopens(tmp_path):
+    db = create_catalogue(tmp_path / "Archive")
+    try:
+        assert db.path == tmp_path / "Archive.jvvv"
+        assert db.path.exists()
+        db.create_volume("Archive", str(tmp_path))
+    finally:
+        db.close()
+
+    db = open_catalogue(tmp_path / "Archive.jvvv")
+    try:
+        assert count_rows(db, "volumes") == 1
+    finally:
+        db.close()
+
+
+def test_open_catalogue_rejects_invalid_file(tmp_path):
+    path = tmp_path / "broken.jvvv"
+    path.write_text("not a sqlite database", encoding="utf-8")
+
+    with pytest.raises(InvalidCatalogueError):
+        open_catalogue(path)
 
 
 def test_volume_crud(tmp_path):

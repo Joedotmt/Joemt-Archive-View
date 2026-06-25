@@ -8,7 +8,9 @@ from typing import Any, Callable
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEventLoop,
     QFileInfo,
+    QLockFile,
     QModelIndex,
     QObject,
     QPoint,
@@ -46,15 +48,27 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionProgressBar,
+    QStackedWidget,
     QTableView,
     QTabWidget,
+    QTextBrowser,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .database import Database, parse_db_time
+from .config import APP_NAME
+from .database import (
+    CATALOGUE_EXTENSION,
+    CatalogueError,
+    CatalogueInUseError,
+    Database,
+    catalogue_path_with_extension,
+    create_catalogue,
+    open_catalogue,
+    parse_db_time,
+)
 from .scanner import VolumeScanner, get_storage_stats
 from .utils import format_size, open_in_file_manager, percentage_full, relative_path_for_display
 
@@ -65,6 +79,7 @@ ROLE_RELATIVE_PATH = Qt.ItemDataRole.UserRole + 2
 ROLE_ITEM_TYPE = Qt.ItemDataRole.UserRole + 3
 ROLE_ITEM_ID = Qt.ItemDataRole.UserRole + 4
 ROLE_PERCENT_FULL = Qt.ItemDataRole.UserRole + 5
+CATALOGUE_FILE_FILTER = "Joemt Archive View Files (*.jvvv)"
 
 
 @dataclass(frozen=True)
@@ -561,6 +576,124 @@ class VolumeDialog(QDialog):
         super().accept()
 
 
+class ItemPropertiesDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        icon: QIcon,
+        name: str,
+        subtitle: str,
+        properties: list[tuple[str, str]],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Properties - {name}")
+        self.resize(760, 520)
+        self.setMinimumSize(560, 380)
+        self.copy_text = "\n".join(f"{label}: {value}" for label, value in properties)
+
+        icon_label = QLabel()
+        icon_label.setPixmap(icon.pixmap(QSize(48, 48)))
+        icon_label.setFixedSize(QSize(56, 56))
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        name_label = QLabel(name)
+        name_label.setWordWrap(True)
+        name_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        name_font = name_label.font()
+        name_font.setPointSize(name_font.pointSize() + 3)
+        name_font.setBold(True)
+        name_label.setFont(name_font)
+
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+
+        heading_layout = QVBoxLayout()
+        heading_layout.addWidget(name_label)
+        heading_layout.addWidget(subtitle_label)
+
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(icon_label)
+        top_layout.addLayout(heading_layout, 1)
+
+        self.details_edit = QPlainTextEdit()
+        self.details_edit.setReadOnly(True)
+        self.details_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.details_edit.setPlainText(self.copy_text)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        copy_button = buttons.addButton("Copy All", QDialogButtonBox.ButtonRole.ActionRole)
+        copy_button.clicked.connect(self.copy_all)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(top_layout)
+        layout.addWidget(self.details_edit, 1)
+        layout.addWidget(buttons)
+
+    def copy_all(self) -> None:
+        QApplication.clipboard().setText(self.copy_text)
+
+
+class HelpDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("JVVV Help")
+        self.resize(640, 520)
+
+        content = QTextBrowser()
+        content.setOpenExternalLinks(False)
+        content.setHtml(self._help_html())
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(content, 1)
+        layout.addWidget(buttons)
+
+    def _help_html(self) -> str:
+        sections = [
+            (
+                "About JVVV",
+                "JVVV indexes removable drives and folders into a catalogue file so "
+                "you can browse and search offline files later.",
+            ),
+            (
+                "Creating a Catalogue",
+                "Choose File &gt; New Catalogue, pick a location, and save a .jvvv file. "
+                "The file is a SQLite database that contains the full catalogue.",
+            ),
+            (
+                "Adding and Scanning a Volume",
+                "Open a catalogue, choose New Volume, select a drive or folder, then "
+                "scan it. Rescan later to update changed files or mark missing ones.",
+            ),
+            (
+                "Browsing and Searching",
+                "Select a volume to browse its saved folder tree. Use Search to find "
+                "files or folders by name, extension, or relative path even when the "
+                "original volume is offline.",
+            ),
+        ]
+        section_html = "\n".join(
+            f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
+        )
+        return f"""
+        <html>
+        <body>
+            <h1>{APP_NAME}</h1>
+            {section_html}
+        </body>
+        </html>
+        """
+
+
 class ScanWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(dict)
@@ -607,7 +740,9 @@ class ScanWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.db = Database()
+        self.db: Database | None = None
+        self.catalogue_path: Path | None = None
+        self.catalogue_lock: QLockFile | None = None
         self.current_volume_id: int | None = None
         self.current_folder_id: int | None = None
         self.scan_thread: QThread | None = None
@@ -618,34 +753,94 @@ class MainWindow(QMainWindow):
         self.browser_model = BrowserTableModel(self.browser_icons, self)
         self.search_model = SearchResultsTableModel(self.browser_icons, self)
         self.volume_full_delegate = VolumeFullDelegate(self)
-        
-        self.setWindowTitle("Joemt Archive View")
+        self.catalogue_actions: list[QAction] = []
+        self.catalogue_widgets: list[QWidget] = []
+
+        self.setWindowTitle(APP_NAME)
         self.resize(1180, 760)
         self.setStatusBar(QStatusBar())
 
+        self._build_menu_bar()
         self._build_ui()
         self._connect_signals()
-        self.refresh_volumes()
+        self._set_catalogue_open(False)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self.scan_worker is not None:
-            answer = QMessageBox.question(
-                self,
-                "Scan Running",
-                "A scan is still running. Cancel it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-            self.scan_worker.cancel()
-            self.statusBar().showMessage("Cancellation requested. Close the app after the scan stops.")
+        if not self.close_catalogue(show_status=False):
             event.ignore()
             return
-        self.db.close()
         super().closeEvent(event)
 
+    def _build_menu_bar(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+
+        self.new_catalogue_action = QAction("New Catalogue\u2026", self)
+        self.new_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.New))
+        self.new_catalogue_action.triggered.connect(self.new_catalogue)
+        file_menu.addAction(self.new_catalogue_action)
+
+        self.open_catalogue_action = QAction("Open Catalogue\u2026", self)
+        self.open_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Open))
+        self.open_catalogue_action.triggered.connect(self.open_catalogue_from_dialog)
+        file_menu.addAction(self.open_catalogue_action)
+
+        self.close_catalogue_action = QAction("Close Catalogue", self)
+        self.close_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Close))
+        self.close_catalogue_action.triggered.connect(lambda: self.close_catalogue())
+        file_menu.addAction(self.close_catalogue_action)
+
+        file_menu.addSeparator()
+
+        self.exit_action = QAction("Exit", self)
+        self.exit_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Quit))
+        self.exit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        self.exit_action.triggered.connect(QApplication.instance().quit)
+        file_menu.addAction(self.exit_action)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        self.help_action = QAction("Help", self)
+        self.help_action.setShortcut(QKeySequence(QKeySequence.StandardKey.HelpContents))
+        self.help_action.triggered.connect(self.show_help)
+        help_menu.addAction(self.help_action)
+
     def _build_ui(self) -> None:
+        self.stack = QStackedWidget()
+        self.welcome_page = self._build_welcome_page()
+        self.catalogue_page = self._build_catalogue_workspace()
+        self.stack.addWidget(self.welcome_page)
+        self.stack.addWidget(self.catalogue_page)
+        self.setCentralWidget(self.stack)
+
+    def _build_welcome_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(14)
+
+        title = QLabel("No Catalogue Open")
+        title_font = title.font()
+        title_font.setPointSize(title_font.pointSize() + 8)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        description = QLabel("Create a new catalogue file or open an existing .jvvv catalogue.")
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        description.setWordWrap(True)
+
+        self.welcome_new_button = QPushButton("Create New Catalogue")
+        self.welcome_open_button = QPushButton("Open Existing Catalogue")
+        self.welcome_new_button.setMinimumWidth(240)
+        self.welcome_open_button.setMinimumWidth(240)
+
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addSpacing(8)
+        layout.addWidget(self.welcome_new_button, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.welcome_open_button, 0, Qt.AlignmentFlag.AlignCenter)
+        return page
+
+    def _build_catalogue_workspace(self) -> QWidget:
         self.volume_table = QTableView()
         self.volume_table.setModel(self.volume_model)
         self.configure_table_view(self.volume_table)
@@ -694,7 +889,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        self.setCentralWidget(splitter)
+        return splitter
 
     def _build_details_box(self) -> QGroupBox:
         box = QGroupBox("Volume Details")
@@ -848,9 +1043,12 @@ class MainWindow(QMainWindow):
         return widget
 
     def _connect_signals(self) -> None:
+        self.welcome_new_button.clicked.connect(self.new_catalogue)
+        self.welcome_open_button.clicked.connect(self.open_catalogue_from_dialog)
         self.add_button.clicked.connect(self.add_volume)
         self.volume_table.selectionModel().selectionChanged.connect(self.on_volume_selection_changed)
         self.volume_table.customContextMenuRequested.connect(self.show_volume_context_menu)
+        self.volume_table.doubleClicked.connect(self.edit_volume_index)
         self.folder_tree.itemExpanded.connect(self.load_tree_children)
         self.folder_tree.currentItemChanged.connect(self.on_folder_changed)
         self.up_button.clicked.connect(self.navigate_parent_folder)
@@ -863,10 +1061,12 @@ class MainWindow(QMainWindow):
         self.open_file_button.clicked.connect(lambda: self.open_selected_real_item(reveal=False))
         self.reveal_file_button.clicked.connect(lambda: self.open_selected_real_item(reveal=True))
 
-        refresh_action = QAction("Refresh", self)
-        refresh_action.setShortcut("F5")
-        refresh_action.triggered.connect(self.refresh_volumes)
-        self.addAction(refresh_action)
+        self.refresh_action = QAction("Refresh", self)
+        self.refresh_action.setShortcut("F5")
+        self.refresh_action.triggered.connect(self.refresh_volumes)
+        self.addAction(self.refresh_action)
+        self.catalogue_actions = [self.close_catalogue_action, self.refresh_action]
+        self.catalogue_widgets = [self.add_button, self.search_edit, self.search_button]
 
         self.add_browser_shortcut(QKeySequence("Backspace"), self.navigate_parent_folder)
         self.add_browser_shortcut(QKeySequence("Alt+Up"), self.navigate_parent_folder)
@@ -882,7 +1082,212 @@ class MainWindow(QMainWindow):
         shortcut.activated.connect(callback)
         self.browser_shortcuts.append(shortcut)
 
+    def show_help(self) -> None:
+        dialog = HelpDialog(self)
+        dialog.exec()
+
+    def new_catalogue(self) -> None:
+        path = self._choose_new_catalogue_path()
+        if path is None:
+            return
+        if self.db is not None and not self.close_catalogue(show_status=False):
+            return
+
+        lock: QLockFile | None = None
+        db: Database | None = None
+        try:
+            lock = self._acquire_catalogue_lock(path)
+            db = create_catalogue(path, overwrite=path.exists())
+        except Exception as exc:
+            if db is not None:
+                db.close()
+            if lock is not None:
+                lock.unlock()
+            self._show_catalogue_error("New Catalogue Failed", exc)
+            return
+
+        self._open_catalogue_in_window(db, path, lock)
+        self.statusBar().showMessage("Catalogue created.", 4000)
+
+    def open_catalogue_from_dialog(self) -> None:
+        path_text, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Catalogue",
+            str(self.catalogue_path.parent if self.catalogue_path else Path.home()),
+            CATALOGUE_FILE_FILTER,
+        )
+        if not path_text:
+            return
+        self.open_catalogue_path(catalogue_path_with_extension(path_text))
+
+    def open_catalogue_path(self, path: str | Path) -> None:
+        path = catalogue_path_with_extension(path)
+        if self.db is not None and not self.close_catalogue(show_status=False):
+            return
+
+        lock: QLockFile | None = None
+        db: Database | None = None
+        try:
+            lock = self._acquire_catalogue_lock(path)
+            db = open_catalogue(path)
+        except Exception as exc:
+            if db is not None:
+                db.close()
+            if lock is not None:
+                lock.unlock()
+            self._show_catalogue_error("Open Catalogue Failed", exc)
+            return
+
+        self._open_catalogue_in_window(db, path, lock)
+        self.statusBar().showMessage("Catalogue opened.", 4000)
+
+    def close_catalogue(self, show_status: bool = True) -> bool:
+        if self.db is None:
+            self._set_catalogue_open(False)
+            return True
+
+        if not self._stop_scan_for_catalogue_close():
+            return False
+
+        db = self.db
+        lock = self.catalogue_lock
+        self.db = None
+        self.catalogue_path = None
+        self.catalogue_lock = None
+        self._set_catalogue_open(False)
+
+        try:
+            db.close()
+        finally:
+            if lock is not None:
+                lock.unlock()
+
+        if show_status:
+            self.statusBar().showMessage("Catalogue closed.", 4000)
+        return True
+
+    def _choose_new_catalogue_path(self) -> Path | None:
+        dialog = QFileDialog(self, "New Catalogue")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter(CATALOGUE_FILE_FILTER)
+        dialog.setDefaultSuffix(CATALOGUE_EXTENSION.lstrip("."))
+        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
+        dialog.setDirectory(str(self.catalogue_path.parent if self.catalogue_path else Path.home()))
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        selected = dialog.selectedFiles()
+        if not selected:
+            return None
+        path = catalogue_path_with_extension(selected[0])
+        if path.exists():
+            answer = QMessageBox.question(
+                self,
+                "Overwrite Catalogue",
+                f"Replace the existing catalogue file?\n\n{path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+        return path
+
+    def _acquire_catalogue_lock(self, path: Path) -> QLockFile:
+        lock = QLockFile(f"{path}.lock")
+        if not lock.tryLock(100):
+            raise CatalogueInUseError(
+                "This catalogue appears to be open in another JVVV window or process."
+            )
+        return lock
+
+    def _open_catalogue_in_window(self, db: Database, path: Path, lock: QLockFile) -> None:
+        self.db = db
+        self.catalogue_path = path
+        self.catalogue_lock = lock
+        self._set_catalogue_open(True)
+        self.refresh_volumes()
+
+    def _stop_scan_for_catalogue_close(self) -> bool:
+        if self.scan_worker is None:
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Scan Running",
+            "A scan is still running. Cancel it before closing the catalogue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+
+        self.scan_worker.cancel()
+        self.scan_progress.setFormat("Cancelling...")
+        self.statusBar().showMessage("Cancelling scan...")
+
+        for _ in range(50):
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+            if self.scan_thread is None or not self.scan_thread.isRunning():
+                return True
+            self.scan_thread.wait(100)
+
+        QMessageBox.information(
+            self,
+            "Scan Cancelling",
+            "Cancellation has been requested. Close the catalogue after the scan stops.",
+        )
+        return False
+
+    def _set_catalogue_open(self, is_open: bool) -> None:
+        if hasattr(self, "stack"):
+            self.stack.setCurrentWidget(self.catalogue_page if is_open else self.welcome_page)
+        self.close_catalogue_action.setEnabled(is_open)
+        for action in self.catalogue_actions:
+            action.setEnabled(is_open)
+        for widget in self.catalogue_widgets:
+            widget.setEnabled(is_open)
+        for shortcut in self.browser_shortcuts:
+            shortcut.setEnabled(is_open)
+
+        if not is_open:
+            self._clear_catalogue_views()
+        self._update_window_title()
+
+    def _clear_catalogue_views(self) -> None:
+        self.current_volume_id = None
+        self.current_folder_id = None
+        self.volume_model.set_items([])
+        self.browser_model.set_items([])
+        self.search_model.set_items([])
+        self.search_edit.clear()
+        self.scan_log.clear()
+        self.show_volume_details(None)
+        self.clear_browser()
+        self.on_search_selection_changed()
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Idle")
+        self.statusBar().clearMessage()
+
+    def _update_window_title(self) -> None:
+        if self.catalogue_path is None:
+            self.setWindowTitle(APP_NAME)
+        else:
+            self.setWindowTitle(f"{APP_NAME} - {self.catalogue_path.name}")
+
+    def _show_catalogue_error(self, title: str, exc: Exception) -> None:
+        message = str(exc) or "The catalogue could not be opened."
+        if isinstance(exc, CatalogueInUseError):
+            QMessageBox.warning(self, "Catalogue In Use", message)
+        elif isinstance(exc, (CatalogueError, OSError, FileNotFoundError, PermissionError)):
+            QMessageBox.critical(self, title, message)
+        else:
+            QMessageBox.critical(self, title, message)
+
     def refresh_volumes(self) -> None:
+        if self.db is None:
+            self._clear_catalogue_views()
+            return
         selected_id = self.selected_volume_id() or self.current_volume_id
         volumes = self.db.list_volumes()
         items = [
@@ -916,10 +1321,14 @@ class MainWindow(QMainWindow):
         return item.id if item is not None else None
 
     def selected_volume(self):
+        if self.db is None:
+            return None
         volume_id = self.selected_volume_id()
         return self.db.get_volume(volume_id) if volume_id is not None else None
 
     def show_volume_context_menu(self, point: QPoint) -> None:
+        if self.db is None:
+            return
         index = self.volume_table.indexAt(point)
         menu = QMenu(self)
 
@@ -963,12 +1372,14 @@ class MainWindow(QMainWindow):
         menu.exec(self.volume_table.viewport().mapToGlobal(point))
 
     def on_volume_selection_changed(self, selected=None, deselected=None) -> None:
+        if self.db is None:
+            return
         volume_id = self.selected_volume_id()
         self.show_selected_volume(volume_id)
 
     def show_selected_volume(self, volume_id: int | None) -> None:
         self.current_volume_id = volume_id
-        volume = self.db.get_volume(volume_id) if volume_id is not None else None
+        volume = self.db.get_volume(volume_id) if self.db is not None and volume_id is not None else None
         self.show_volume_details(volume)
         self.load_volume_browser(volume_id)
         self.load_scan_log(volume_id)
@@ -1006,6 +1417,8 @@ class MainWindow(QMainWindow):
         self.detail_full.setValue(full)
 
     def add_volume(self) -> None:
+        if self.db is None:
+            return
         dialog = VolumeDialog(self, "New Volume")
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1026,6 +1439,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "New Volume Failed", str(exc))
 
     def edit_volume(self) -> None:
+        if self.db is None:
+            return
+        if self.scan_worker is not None:
+            QMessageBox.information(self, "Scan Running", "Wait for the current scan to finish or cancel it.")
+            return
         volume = self.selected_volume()
         if volume is None:
             return
@@ -1040,7 +1458,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Edit Volume Failed", str(exc))
 
+    def edit_volume_index(self, index: QModelIndex) -> None:
+        if self.db is None or not index.isValid():
+            return
+        item = self.volume_model.item_at(index)
+        if item is None:
+            return
+        if self.select_volume(item.id):
+            self.edit_volume()
+
     def delete_volume(self) -> None:
+        if self.db is None:
+            return
         volume = self.selected_volume()
         if volume is None:
             return
@@ -1075,6 +1504,8 @@ class MainWindow(QMainWindow):
             self.start_scan(remove_deleted=False, is_rescan=True)
 
     def start_scan(self, remove_deleted: bool, is_rescan: bool) -> None:
+        if self.db is None:
+            return
         if self.scan_worker is not None:
             QMessageBox.information(self, "Scan Running", "Wait for the current scan to finish or cancel it.")
             return
@@ -1141,22 +1572,37 @@ class MainWindow(QMainWindow):
         self.scan_thread = None
 
     def refresh_after_scan(self) -> None:
+        if self.db is None:
+            return
+        path = self.db.path
         self.db.close()
-        self.db = Database(self.db.path)
+        try:
+            self.db = open_catalogue(path)
+        except Exception as exc:
+            self.db = None
+            if self.catalogue_lock is not None:
+                self.catalogue_lock.unlock()
+                self.catalogue_lock = None
+            self.catalogue_path = None
+            self._set_catalogue_open(False)
+            self._show_catalogue_error("Catalogue Refresh Failed", exc)
+            return
         self.refresh_volumes()
         self.perform_search()
 
     def select_volume(self, volume_id: int) -> bool:
         for row, item in enumerate(self.volume_model.items):
             if item.id == volume_id:
+                index = self.volume_model.index(row, 0)
                 self.volume_table.selectRow(row)
-                self.volume_table.scrollTo(self.volume_model.index(row, 0))
+                self.volume_table.setCurrentIndex(index)
+                self.volume_table.scrollTo(index)
                 return True
         return False
 
     def load_volume_browser(self, volume_id: int | None) -> None:
         self.clear_browser()
-        if volume_id is None:
+        if self.db is None or volume_id is None:
             return
         volume = self.db.get_volume(volume_id)
         if volume is None:
@@ -1195,7 +1641,7 @@ class MainWindow(QMainWindow):
 
     def add_placeholder_if_needed(self, item: QTreeWidgetItem) -> None:
         folder_id = item.data(0, ROLE_FOLDER_ID)
-        if self.current_volume_id is None or folder_id is None:
+        if self.db is None or self.current_volume_id is None or folder_id is None:
             return
         if self.db.list_child_folders(self.current_volume_id, int(folder_id)):
             placeholder = QTreeWidgetItem([""])
@@ -1203,7 +1649,7 @@ class MainWindow(QMainWindow):
             item.addChild(placeholder)
 
     def load_tree_children(self, item: QTreeWidgetItem) -> None:
-        if self.current_volume_id is None:
+        if self.db is None or self.current_volume_id is None:
             return
         if item.childCount() == 1 and item.child(0).data(0, ROLE_FOLDER_ID) == -1:
             item.takeChild(0)
@@ -1218,7 +1664,7 @@ class MainWindow(QMainWindow):
             self.add_placeholder_if_needed(child)
 
     def on_folder_changed(self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None) -> None:
-        if current is None or self.current_volume_id is None:
+        if self.db is None or current is None or self.current_volume_id is None:
             return
         folder_id = current.data(0, ROLE_FOLDER_ID)
         if folder_id is None or int(folder_id) < 0:
@@ -1227,6 +1673,8 @@ class MainWindow(QMainWindow):
         self.load_directory_items(self.current_volume_id, self.current_folder_id)
 
     def load_directory_items(self, volume_id: int, folder_id: int) -> None:
+        if self.db is None:
+            return
         folder = self.db.get_folder(folder_id)
         if folder is None:
             self.browser_model.set_items([])
@@ -1305,7 +1753,7 @@ class MainWindow(QMainWindow):
         self.select_browser_relative_path(item.relative_path)
 
     def navigate_parent_folder(self) -> None:
-        if self.current_folder_id is None:
+        if self.db is None or self.current_folder_id is None:
             return
         folder = self.db.get_folder(self.current_folder_id)
         if folder is None or folder["parent_id"] is None:
@@ -1316,11 +1764,14 @@ class MainWindow(QMainWindow):
         self.select_folder_path(parent["relative_path"])
 
     def show_browser_context_menu(self, point: QPoint) -> None:
+        if self.db is None:
+            return
         index = self.file_table.indexAt(point)
         if not index.isValid():
             return
 
         self.file_table.selectRow(index.row())
+        self.file_table.setCurrentIndex(self.browser_model.index(index.row(), 0))
         item = self.browser_model.item_at(index)
         if item is None:
             return
@@ -1348,7 +1799,129 @@ class MainWindow(QMainWindow):
         copy_action.setEnabled(real_path is not None)
         copy_action.triggered.connect(lambda checked=False, item=item: self.copy_browser_path(item))
 
+        menu.addSeparator()
+        properties_action = menu.addAction("Properties")
+        properties_action.triggered.connect(
+            lambda checked=False, item_type=item.item_type, item_id=item.item_id: self.show_browser_item_properties(
+                item_type,
+                item_id,
+            )
+        )
+
         menu.exec(self.file_table.viewport().mapToGlobal(point))
+
+    def show_browser_item_properties(self, item_type: str, item_id: int) -> None:
+        if self.db is None:
+            return
+        record = self.db.get_item_properties(item_type, item_id)
+        if record is None:
+            QMessageBox.information(
+                self,
+                "Properties Unavailable",
+                "The selected catalogue record is no longer available.",
+            )
+            return
+
+        name = self.catalogue_item_display_name(record)
+        type_label = self.catalogue_item_type_label(record)
+        icon = self.browser_icons.icon_for(self.browser_item_from_record(record, type_label))
+        dialog = ItemPropertiesDialog(
+            self,
+            icon,
+            name,
+            type_label,
+            self.catalogue_item_property_rows(record),
+        )
+        dialog.exec()
+
+    def browser_item_from_record(self, record, type_label: str) -> BrowserItem:
+        return BrowserItem(
+            item_type=record["item_type"],
+            item_id=record["item_id"],
+            name=self.catalogue_item_display_name(record),
+            relative_path=record["relative_path"],
+            type_label=type_label,
+            extension=record["extension"] or "",
+            size_bytes=record["size_bytes"] or 0,
+            modified_at=record["modified_at"],
+            missing=bool(record["missing"]),
+            parent_id=record["parent_id"],
+        )
+
+    def catalogue_item_display_name(self, record) -> str:
+        return record["name"] or "/"
+
+    def catalogue_item_type_label(self, record) -> str:
+        if record["item_type"] == "folder":
+            return "Folder"
+        extension = (record["extension"] or "").lstrip(".")
+        category = file_type_label(extension)
+        if not extension:
+            return "File"
+        if category == extension.upper():
+            return f"{extension.upper()} file"
+        return f"{extension.upper()} {category.lower()}"
+
+    def catalogue_item_property_rows(self, record) -> list[tuple[str, str]]:
+        item_type = record["item_type"]
+        relative_path = record["relative_path"] or ""
+        source_path = record["source_path"] or ""
+        physical_path = self.physical_path_for_source(source_path, relative_path) if source_path else None
+        volume_connected = bool(source_path and Path(source_path).exists())
+        item_exists = self.current_item_exists_text(physical_path, volume_connected)
+
+        properties = [
+            ("Name", self.catalogue_item_display_name(record)),
+            ("Kind", "Folder" if item_type == "folder" else "File"),
+            ("Type", self.catalogue_item_type_label(record)),
+            ("Volume", record["volume_name"]),
+            ("Relative path", relative_path_for_display(relative_path)),
+            ("Full physical path", str(physical_path) if physical_path is not None else "Unavailable"),
+            ("Parent folder", self.parent_folder_display(record)),
+        ]
+
+        if item_type == "file":
+            extension = (record["extension"] or "").lstrip(".")
+            properties.extend(
+                [
+                    ("Extension", f".{extension}" if extension else "Unavailable"),
+                    ("Size", format_size(record["size_bytes"] or 0)),
+                ]
+            )
+        else:
+            properties.extend(
+                [
+                    ("Indexed child folders", str(record["child_folder_count"] or 0)),
+                    ("Indexed child files", str(record["child_file_count"] or 0)),
+                ]
+            )
+
+        properties.extend(
+            [
+                ("Modified", self._display_time(record["modified_at"])),
+                ("Catalogue record ID", f"{item_type}:{record['item_id']}"),
+                ("Catalogue status", "Missing" if record["missing"] else "Indexed"),
+                ("Volume status", "Connected" if volume_connected else "Disconnected"),
+                ("Exists on connected volume", item_exists),
+                ("Last recorded by scan", self._display_time(record["scanned_at"])),
+            ]
+        )
+        return properties
+
+    def parent_folder_display(self, record) -> str:
+        if record["parent_id"] is None:
+            return "None (volume root)"
+        parent_path = record["parent_relative_path"]
+        if parent_path is None:
+            return "Unavailable"
+        return relative_path_for_display(parent_path)
+
+    def current_item_exists_text(self, physical_path: Path | None, volume_connected: bool) -> str:
+        if physical_path is None:
+            return "Unavailable"
+        if not volume_connected:
+            return "Unavailable (volume disconnected)"
+        return "Yes" if physical_path.exists() else "No"
 
     def open_real_browser_item(self, item: BrowserItem, reveal: bool) -> None:
         real_path = self.browser_real_path(item)
@@ -1373,7 +1946,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Path copied.", 3000)
 
     def browser_real_path(self, item: BrowserItem) -> Path | None:
-        if self.current_volume_id is None:
+        if self.db is None or self.current_volume_id is None:
             return None
         volume = self.db.get_volume(self.current_volume_id)
         if volume is None:
@@ -1381,7 +1954,10 @@ class MainWindow(QMainWindow):
         return self.real_path_for(volume, item.relative_path)
 
     def real_path_for(self, volume, relative_path: str) -> Path:
-        path = Path(volume["source_path"])
+        return self.physical_path_for_source(volume["source_path"], relative_path)
+
+    def physical_path_for_source(self, source_path: str, relative_path: str) -> Path:
+        path = Path(source_path)
         for part in PurePosixPath(relative_path).parts:
             if part not in {"", "."}:
                 path /= part
@@ -1404,6 +1980,10 @@ class MainWindow(QMainWindow):
         return False
 
     def perform_search(self) -> None:
+        if self.db is None:
+            self.search_model.set_items([])
+            self.on_search_selection_changed()
+            return
         query = self.search_edit.text().strip()
         if not query:
             self.search_model.set_items([])
@@ -1441,6 +2021,8 @@ class MainWindow(QMainWindow):
         return self.search_model.item_at(self.search_table.currentIndex())
 
     def selected_search_real_path(self) -> Path | None:
+        if self.db is None:
+            return None
         item = self.selected_search_item()
         if item is None:
             return None
@@ -1461,6 +2043,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open Failed", str(exc))
 
     def open_search_location(self, clicked_index: QModelIndex | None = None) -> None:
+        if self.db is None:
+            return
         item = self.search_model.item_at(clicked_index) if clicked_index is not None else self.selected_search_item()
         if item is None:
             return
@@ -1475,7 +2059,7 @@ class MainWindow(QMainWindow):
             )
 
     def select_folder_path(self, relative_path: str) -> None:
-        if self.current_volume_id is None:
+        if self.db is None or self.current_volume_id is None:
             return
         root = self.folder_tree.topLevelItem(0)
         if root is None:
@@ -1503,7 +2087,7 @@ class MainWindow(QMainWindow):
 
     def load_scan_log(self, volume_id: int | None) -> None:
         self.scan_log.clear()
-        if volume_id is None:
+        if self.db is None or volume_id is None:
             return
         history = self.db.list_scan_history(volume_id)
         errors = self.db.list_scan_errors(volume_id)
