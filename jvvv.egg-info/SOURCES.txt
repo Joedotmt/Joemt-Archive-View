@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+jvvv/__init__.py
+jvvv/__main__.py
+jvvv/app.py
+jvvv/config.py
+jvvv/database.py
+jvvv/scanner.py
+jvvv/utils.py
+jvvv.egg-info/PKG-INFO
+jvvv.egg-info/SOURCES.txt
+jvvv.egg-info/dependency_links.txt
+jvvv.egg-info/requires.txt
+jvvv.egg-info/top_level.txt
+tests/test_database.py
+tests/test_scanner.py
+tests/test_search.py

@@ -12,6 +12,10 @@ from typing import Callable, Iterator, Sequence
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
 SCHEMA_VERSION = 2
 CATALOGUE_EXTENSION = ".jvvv"
+SQLITE_INTEGER_MIN = -(2**63)
+SQLITE_INTEGER_MAX = 2**63 - 1
+UINT64_MODULUS = 2**64
+UINT64_MAX = UINT64_MODULUS - 1
 REQUIRED_TABLES = {"volumes", "folders", "files", "scan_history", "scan_errors"}
 REQUIRED_COLUMNS = {
     "volumes": {
@@ -115,6 +119,19 @@ def parse_db_time(value: str | None) -> datetime | None:
         return datetime.strptime(value, ISO_FORMAT)
     except ValueError:
         return None
+
+
+def normalize_identity_integer(value: int | None) -> int | None:
+    if value is None:
+        return None
+    integer = int(value)
+    if integer == 0:
+        return None
+    if SQLITE_INTEGER_MIN <= integer <= SQLITE_INTEGER_MAX:
+        return integer
+    if SQLITE_INTEGER_MAX < integer <= UINT64_MAX:
+        return integer - UINT64_MODULUS
+    return None
 
 
 class Database:
@@ -558,6 +575,8 @@ class Database:
         identity_device: int | None = None,
         identity_inode: int | None = None,
     ) -> int:
+        identity_device = normalize_identity_integer(identity_device)
+        identity_inode = normalize_identity_integer(identity_inode)
         cur = self.connection.execute(
             """
             INSERT INTO files (

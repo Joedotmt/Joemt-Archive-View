@@ -138,3 +138,56 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
         assert root["direct_file_count"] == 1
     finally:
         migrated.close()
+
+
+def test_upsert_file_accepts_unsigned_64_bit_identity_values(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        scanned_at = "2026-06-25T12:00:00.000000+0000"
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        folder_id = db.ensure_folder(
+            volume_id=volume_id,
+            parent_id=None,
+            name="Archive",
+            relative_path="",
+            scanned_at=scanned_at,
+        )
+        identity_device = 2**63 + 7
+        identity_inode = 2**63 + 99
+
+        db.upsert_file(
+            volume_id=volume_id,
+            folder_id=folder_id,
+            name="original.bin",
+            relative_path="original.bin",
+            extension="bin",
+            size_bytes=1024,
+            modified_at=None,
+            scanned_at=scanned_at,
+            identity_device=identity_device,
+            identity_inode=identity_inode,
+        )
+        db.upsert_file(
+            volume_id=volume_id,
+            folder_id=folder_id,
+            name="linked.bin",
+            relative_path="linked.bin",
+            extension="bin",
+            size_bytes=1024,
+            modified_at=None,
+            scanned_at=scanned_at,
+            identity_device=identity_device,
+            identity_inode=identity_inode,
+        )
+
+        rows = list(db.connection.execute("SELECT identity_device, identity_inode FROM files"))
+        assert {row["identity_device"] for row in rows} == {identity_device - 2**64}
+        assert {row["identity_inode"] for row in rows} == {identity_inode - 2**64}
+
+        db.rebuild_folder_statistics(volume_id, scanned_at)
+        root = db.get_root_folder(volume_id)
+        assert root["recursive_size_bytes"] == 1024
+        assert root["recursive_file_count"] == 2
+        assert root["direct_file_count"] == 2
+    finally:
+        db.close()

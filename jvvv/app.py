@@ -649,58 +649,75 @@ class ItemPropertiesDialog(QDialog):
     def copy_all(self) -> None:
         QApplication.clipboard().setText(self.copy_text)
 
-
 class HelpDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("JVVV Help")
-        self.resize(640, 520)
+        self.setWindowTitle(f"Help - {APP_NAME}")
+        self.resize(700, 560)
+        self.setStyleSheet("""
+            QDialog { background: palette(window); }
+            QLabel#subtitle { font-size: 13px; }
+            QTextBrowser {
+                background: palette(base); border: 1px solid palette(mid);
+                border-radius: 8px; padding: 8px;
+            }
+            QPushButton { min-width: 88px; padding: 6px 14px; }
+        """)
+
+        title = QLabel(f"<b style='font-size:24px'>{APP_NAME}</b>")
+        subtitle = QLabel("Offline catalogues for removable drives and folders")
+        subtitle.setObjectName("subtitle")
 
         content = QTextBrowser()
-        content.setOpenExternalLinks(False)
+        content.setOpenExternalLinks(True)
         content.setHtml(self._help_html())
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setDefault(True)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addSpacing(6)
         layout.addWidget(content, 1)
         layout.addWidget(buttons)
 
     def _help_html(self) -> str:
         sections = [
-            (
-                "About JVVV",
-                "JVVV indexes removable drives and folders into a catalogue file so "
-                "you can browse and search offline files later.",
-            ),
-            (
-                "Creating a Catalogue",
-                "Choose File &gt; New Catalogue, pick a location, and save a .jvvv file. "
-                "The file is a SQLite database that contains the full catalogue.",
-            ),
-            (
-                "Adding and Scanning a Volume",
-                "Open a catalogue, choose New Volume, select a drive or folder, then "
-                "scan it. Rescan later to update changed files or mark missing ones.",
-            ),
-            (
-                "Browsing and Searching",
-                "Select a volume to browse its saved folder tree. Use Search to find "
-                "files or folders by name, extension, or relative path even when the "
-                "original volume is offline.",
-            ),
+            ("1. Create a catalogue",
+             "Choose <b>File → New Catalogue</b>, select a location, and save the "
+             "<code>.jvvv</code> file. It is a portable SQLite catalogue."),
+            ("2. Add and scan a volume",
+             "Choose <b>New Volume</b>, select a drive or folder, then scan it. "
+             "Rescan later to record changes and mark missing items."),
+            ("3. Browse offline",
+             "Select a saved volume to explore its folder tree, even when the "
+             "original drive is disconnected."),
+            ("4. Search",
+             "Find files and folders by name, extension, or relative path across "
+             "the stored catalogue."),
         ]
-        section_html = "\n".join(
+        section_html = "".join(
             f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
         )
         return f"""
-        <html>
-        <body>
-            <h1>{APP_NAME}</h1>
-            {section_html}
-        </body>
-        </html>
+        <style>
+            body {{ font-size: 14px; }}
+            h1 {{ margin-bottom: 4px; }}
+            h2 {{ margin-top: 20px; font-size: 17px; }}
+            p {{ margin: 5px 0 10px; }}
+            a {{ text-decoration: none; }}
+        </style>
+        <h1>Quick start</h1>
+        <p><b>New Catalogue → New Volume → Scan → Browse or Search</b></p>
+        {section_html}
+        <hr>
+        <p><b>About</b><br>{APP_NAME} is GPLv3 open-source software by Joemt.<br>
+        <a href="https://github.com/joedotmt/Joemt-Archive-View">Source code</a>
+        &nbsp;·&nbsp; <a href="https://joe.mt">joe.mt</a></p>
         """
 
 
