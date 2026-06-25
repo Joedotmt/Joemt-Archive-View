@@ -26,7 +26,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QPolygon, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPalette, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -54,7 +54,6 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QStyle,
     QStyledItemDelegate,
-    QStyleOptionProgressBar,
     QStackedWidget,
     QTableView,
     QTabWidget,
@@ -92,6 +91,33 @@ ROLE_ITEM_TYPE = Qt.ItemDataRole.UserRole + 3
 ROLE_ITEM_ID = Qt.ItemDataRole.UserRole + 4
 ROLE_PERCENT_FULL = Qt.ItemDataRole.UserRole + 5
 CATALOGUE_FILE_FILTER = "Joemt Archive View Files (*.jvvv)"
+PROGRESS_BAR_HEIGHT = 16
+UI_ZOOM_STEP = 0.1
+MIN_UI_ZOOM = 0.8
+MAX_UI_ZOOM = 1.6
+
+
+def progress_bar_style(height: int) -> str:
+    return f"""
+QProgressBar {{
+    min-height: {height}px;
+    max-height: {height}px;
+    border: 1px solid palette(mid);
+    border-radius: 3px;
+    background: palette(base);
+    text-align: center;
+}}
+QProgressBar::chunk {{
+    border-radius: 2px;
+    background: palette(highlight);
+}}
+"""
+
+
+def configure_progress_bar(progress_bar: QProgressBar, zoom: float = 1.0) -> None:
+    height = max(1, round(PROGRESS_BAR_HEIGHT * zoom))
+    progress_bar.setMinimumHeight(height + 2)
+    progress_bar.setStyleSheet(progress_bar_style(height))
 
 
 @dataclass(frozen=True)
@@ -366,7 +392,7 @@ class CatalogueIconProvider:
 class VolumeItem:
     id: int
     drive_id: str
-    name: str
+    name: str | None
     source_path: str
     register_status: str
     condition: str
@@ -397,7 +423,7 @@ class SearchResultItem:
     item_id: int
     name: str
     volume_id: int
-    volume_name: str
+    volume_name: str | None
     relative_path: str
     size_bytes: int | None
     modified_at: str | None
@@ -454,7 +480,7 @@ class VolumeTableModel(StandardTableModel):
                     lambda item: item.drive_id or "-",
                     sort_key=lambda item: drive_id_sort_key(item.drive_id),
                 ),
-                TableColumn("Name", lambda item: item.name),
+                TableColumn("Name", lambda item: display_volume_name(item.name)),
                 TableColumn("Status", lambda item: item.register_status),
                 TableColumn("Condition", lambda item: item.condition),
                 TableColumn("Connector", lambda item: item.connector),
@@ -486,7 +512,7 @@ class SearchResultsTableModel(StandardTableModel):
             [
                 TableColumn("Name", lambda item: item.name, decoration=self.icon_for),
                 TableColumn("Kind", lambda item: item.item_type.title()),
-                TableColumn("Volume", lambda item: item.volume_name),
+                TableColumn("Volume", lambda item: display_volume_name(item.volume_name)),
                 TableColumn("Relative Path", lambda item: relative_path_for_display(item.relative_path)),
                 TableColumn(
                     "Size",
@@ -534,14 +560,45 @@ class SearchResultsTableModel(StandardTableModel):
 class VolumeFullDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index: QModelIndex) -> None:  # type: ignore[override]
         percent = int(index.data(ROLE_PERCENT_FULL) or 0)
-        progress = QStyleOptionProgressBar()
-        progress.rect = option.rect.adjusted(6, 4, -6, -4)
-        progress.minimum = 0
-        progress.maximum = 100
-        progress.progress = percent
-        progress.text = f"{percent}%"
-        progress.textVisible = True
-        QApplication.style().drawControl(QStyle.ControlElement.CE_ProgressBar, progress, painter)
+        percent = max(0, min(100, percent))
+
+        painter.save()
+        style = option.widget.style() if option.widget is not None else QApplication.style()
+        style.drawPrimitive(QStyle.PrimitiveElement.PE_PanelItemViewItem, option, painter, option.widget)
+
+        content_rect = option.rect.adjusted(6, 4, -6, -4)
+        text = f"{percent}%"
+        text_width = option.fontMetrics.horizontalAdvance("100%")
+        bar_rect = content_rect.adjusted(0, 0, -(text_width + 8), 0)
+
+        if bar_rect.width() > 0 and bar_rect.height() > 0:
+            radius = 3.0
+            base_color = option.palette.color(QPalette.ColorRole.Base)
+            border_color = option.palette.color(QPalette.ColorRole.Mid)
+            chunk_color = option.palette.color(QPalette.ColorRole.Highlight)
+
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(border_color)
+            painter.setBrush(base_color)
+            painter.drawRoundedRect(QRectF(bar_rect), radius, radius)
+
+            if percent > 0:
+                fill_rect = QRectF(bar_rect)
+                fill_rect.setWidth(max(2.0, fill_rect.width() * (percent / 100)))
+                fill_rect = fill_rect.adjusted(1, 1, -1, -1)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(chunk_color)
+                painter.drawRoundedRect(fill_rect, radius - 1, radius - 1)
+
+        text_color = option.palette.color(
+            QPalette.ColorRole.HighlightedText
+            if option.state & QStyle.StateFlag.State_Selected
+            else QPalette.ColorRole.Text
+        )
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(text_color)
+        painter.drawText(content_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, text)
+        painter.restore()
 
 
 def display_db_time(value: str | None) -> str:
@@ -580,6 +637,10 @@ def volume_reference(drive_id: str | None, name: str | None) -> str:
     return drive_id or name or "-"
 
 
+def display_volume_name(name: str | None) -> str:
+    return name or "-"
+
+
 def volume_matches_filter(item: VolumeItem, query: str) -> bool:
     text = query.strip().casefold()
     if not text:
@@ -587,7 +648,7 @@ def volume_matches_filter(item: VolumeItem, query: str) -> bool:
     haystack = " ".join(
         [
             item.drive_id or "",
-            item.name,
+            item.name or "",
             item.register_status,
             item.condition,
             item.description,
@@ -720,7 +781,7 @@ class VolumeDialog(QDialog):
         }
 
         self.drive_id_edit = QLineEdit(volume["drive_id"] if volume is not None else suggested_drive_id)
-        self.name_edit = QLineEdit(volume["name"] if volume is not None else "")
+        self.name_edit = QLineEdit((volume["name"] or "") if volume is not None else "")
         self.path_edit = QLineEdit(volume["source_path"] if volume is not None else "")
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.browse)
@@ -770,7 +831,10 @@ class VolumeDialog(QDialog):
         self.mirror_check.setChecked(bool(volume is not None and volume["is_mirror"]))
         self.master_combo = QComboBox()
         self.master_combo.addItem("Select master drive...", None)
-        for row in sorted(self.master_options, key=lambda item: (drive_id_sort_key(item["drive_id"]), item["name"].casefold())):
+        for row in sorted(
+            self.master_options,
+            key=lambda item: (drive_id_sort_key(item["drive_id"]), (item["name"] or "").casefold()),
+        ):
             self.master_combo.addItem(volume_reference(row["drive_id"], row["name"]), int(row["id"]))
         if volume is not None and volume["master_volume_id"] is not None:
             self.set_master_volume_id(int(volume["master_volume_id"]))
@@ -818,8 +882,6 @@ class VolumeDialog(QDialog):
         directory = QFileDialog.getExistingDirectory(self, "Choose Drive or Folder", self.path_edit.text())
         if directory:
             self.path_edit.setText(directory)
-            if not self.name_edit.text().strip():
-                self.name_edit.setText(Path(directory).name or directory)
             self.apply_content_date_guess(directory)
 
     def apply_content_date_guess(self, source_path: str | None = None) -> None:
@@ -866,16 +928,13 @@ class VolumeDialog(QDialog):
 
     def validate_form(self) -> str | None:
         name, _source_path, register = self.values()
-        if not name:
-            return "Enter a volume name."
-
-        existing_name_id = self.existing_names.get(name.casefold())
-        if existing_name_id is not None and existing_name_id != self.current_volume_id:
+        existing_name_id = self.existing_names.get(name.casefold()) if name else None
+        if name and existing_name_id is not None and existing_name_id != self.current_volume_id:
             return "Volume names must be unique within the catalogue."
 
         drive_id = register["drive_id"]
         if not is_valid_drive_id(drive_id):
-            return "Drive ID must use the format AID- followed by at least three digits."
+            return "Enter a Drive ID."
 
         existing_drive_id = self.existing_drive_ids.get(str(drive_id).casefold())
         if existing_drive_id is not None and existing_drive_id != self.current_volume_id:
@@ -1110,6 +1169,8 @@ class MainWindow(QMainWindow):
         self.volume_full_delegate = VolumeFullDelegate(self)
         self.catalogue_actions: list[QAction] = []
         self.catalogue_widgets: list[QWidget] = []
+        self.base_ui_font = QFont(QApplication.font())
+        self.ui_zoom = 1.0
 
         self.setWindowTitle(APP_NAME)
         self.resize(1180, 760)
@@ -1152,11 +1213,78 @@ class MainWindow(QMainWindow):
         self.exit_action.triggered.connect(QApplication.instance().quit)
         file_menu.addAction(self.exit_action)
 
+        view_menu = self.menuBar().addMenu("&View")
+        self.zoom_in_action = QAction("Zoom In", self)
+        self.zoom_in_action.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+=")])
+        self.zoom_in_action.triggered.connect(self.zoom_in)
+        view_menu.addAction(self.zoom_in_action)
+
+        self.zoom_out_action = QAction("Zoom Out", self)
+        self.zoom_out_action.setShortcut("Ctrl + -")
+        self.zoom_out_action.triggered.connect(self.zoom_out)
+        view_menu.addAction(self.zoom_out_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         self.help_action = QAction("Help", self)
         self.help_action.setShortcut(QKeySequence(QKeySequence.StandardKey.HelpContents))
         self.help_action.triggered.connect(self.show_help)
         help_menu.addAction(self.help_action)
+
+    def zoom_in(self) -> None:
+        self.set_ui_zoom(self.ui_zoom + UI_ZOOM_STEP)
+
+    def zoom_out(self) -> None:
+        self.set_ui_zoom(self.ui_zoom - UI_ZOOM_STEP)
+
+    def set_ui_zoom(self, zoom: float) -> None:
+        zoom = round(max(MIN_UI_ZOOM, min(MAX_UI_ZOOM, zoom)), 2)
+        if zoom == self.ui_zoom:
+            return
+
+        self.ui_zoom = zoom
+        font = QFont(self.base_ui_font)
+        point_size = self.base_ui_font.pointSizeF()
+        if point_size > 0:
+            font.setPointSizeF(max(6.0, point_size * zoom))
+        elif self.base_ui_font.pixelSize() > 0:
+            font.setPixelSize(max(6, round(self.base_ui_font.pixelSize() * zoom)))
+        QApplication.setFont(font)
+
+        self.apply_ui_zoom()
+        self.statusBar().showMessage(f"UI zoom {round(zoom * 100)}%", 3000)
+
+    def apply_ui_zoom(self) -> None:
+        self.zoom_in_action.setEnabled(self.ui_zoom < MAX_UI_ZOOM)
+        self.zoom_out_action.setEnabled(self.ui_zoom > MIN_UI_ZOOM)
+
+        if hasattr(self, "welcome_title_label"):
+            title_font = QFont(QApplication.font())
+            point_size = title_font.pointSizeF()
+            if point_size > 0:
+                title_font.setPointSizeF(point_size + (8 * self.ui_zoom))
+            elif title_font.pixelSize() > 0:
+                title_font.setPixelSize(title_font.pixelSize() + self.scaled_ui_value(8))
+            title_font.setBold(True)
+            self.welcome_title_label.setFont(title_font)
+
+        for table_name in ("volume_table", "file_table", "search_table"):
+            table = getattr(self, table_name, None)
+            if table is not None:
+                table.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
+                table.verticalHeader().setDefaultSectionSize(self.scaled_ui_value(24))
+
+        if hasattr(self, "folder_tree"):
+            self.folder_tree.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
+
+        if hasattr(self, "scan_progress"):
+            configure_progress_bar(self.scan_progress, self.ui_zoom)
+        if hasattr(self, "detail_full"):
+            configure_progress_bar(self.detail_full, self.ui_zoom)
+        if hasattr(self, "detail_description"):
+            self.detail_description.setMaximumHeight(self.scaled_ui_value(76))
+
+    def scaled_ui_value(self, value: int) -> int:
+        return max(1, round(value * self.ui_zoom))
 
     def _build_ui(self) -> None:
         self.stack = QStackedWidget()
@@ -1178,6 +1306,7 @@ class MainWindow(QMainWindow):
         title_font.setBold(True)
         title.setFont(title_font)
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.welcome_title_label = title
 
         description = QLabel("Create a new catalogue file or open an existing .jvvv catalogue.")
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1216,10 +1345,14 @@ class MainWindow(QMainWindow):
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("Volumes"))
+        left_layout.setContentsMargins(0, 0, 2, 0)
+        volume_header = QHBoxLayout()
+        volume_header.addWidget(QLabel("Volumes"))
+        volume_header.addStretch(1)
+        volume_header.addWidget(self.add_button)
+        left_layout.addLayout(volume_header)
         left_layout.addWidget(self.volume_filter_edit)
         left_layout.addWidget(self.volume_table, 1)
-        left_layout.addWidget(self.add_button)
 
         self.details_box = self._build_details_box()
         self.tabs = QTabWidget()
@@ -1235,14 +1368,17 @@ class MainWindow(QMainWindow):
         self.scan_progress.setValue(0)
         self.scan_progress.setFormat("Idle")
         self.scan_progress.setTextVisible(True)
+        configure_progress_bar(self.scan_progress)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(2, 0, 0, 0)
         right_layout.addWidget(self.details_box)
         right_layout.addWidget(self.tabs, 1)
         right_layout.addWidget(self.scan_progress)
 
         splitter = QSplitter()
+        splitter.setHandleWidth(2)
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
@@ -1255,9 +1391,10 @@ class MainWindow(QMainWindow):
         self.detail_full = QProgressBar()
         self.detail_full.setRange(0, 100)
         self.detail_full.setFormat("%p% full")
+        configure_progress_bar(self.detail_full)
         self.detail_description = QPlainTextEdit()
         self.detail_description.setReadOnly(True)
-        self.detail_description.setMaximumHeight(76)
+        self.detail_description.setMaximumHeight(self.scaled_ui_value(76))
 
         grid = QGridLayout(box)
         labels = [
@@ -1306,7 +1443,7 @@ class MainWindow(QMainWindow):
         self.offline_label = QLabel("")
         self.folder_tree = QTreeWidget()
         self.folder_tree.setHeaderLabel("Folders")
-        self.folder_tree.setIconSize(QSize(18, 18))
+        self.folder_tree.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
 
         self.up_button = QPushButton("UP")
         self.up_button.setEnabled(False)
@@ -1349,11 +1486,11 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setAlternatingRowColors(True)
-        table.setIconSize(QSize(18, 18))
+        table.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
         table.setWordWrap(False)
         table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(24)
+        table.verticalHeader().setDefaultSectionSize(self.scaled_ui_value(24))
 
         header = table.horizontalHeader()
         header.setSectionsMovable(False)
@@ -1789,7 +1926,7 @@ class MainWindow(QMainWindow):
         full = percentage_full(volume["used_bytes"], volume["capacity_bytes"])
         values = {
             "drive_id": volume["drive_id"] or "-",
-            "name": volume["name"],
+            "name": display_volume_name(volume["name"]),
             "path": volume["source_path"] or "-",
             "connection": "Connected" if connected else "Offline",
             "register_status": volume["register_status"],
@@ -2302,7 +2439,7 @@ class MainWindow(QMainWindow):
             ("Name", self.catalogue_item_display_name(record)),
             ("Kind", "Folder" if item_type == "folder" else "File"),
             ("Type", self.catalogue_item_type_label(record)),
-            ("Volume", record["volume_name"]),
+            ("Volume", display_volume_name(record["volume_name"])),
             ("Relative path", relative_path_for_display(relative_path)),
             ("Full physical path", str(physical_path) if physical_path is not None else "Unavailable"),
             ("Parent folder", self.parent_folder_display(record)),

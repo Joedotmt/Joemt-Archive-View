@@ -11,9 +11,9 @@ from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CATALOGUE_EXTENSION = ".jvvv"
-DRIVE_ID_RE = re.compile(r"^AID-\d{3,}$")
+AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
 VOLUME_CONDITIONS = ["New", "Good", "Fair", "Poor", "Damaged", "Failed", "Unknown"]
 CONNECTOR_OPTIONS = ["USB-B", "USB-Micro-B", "USB-Mini", "USB-C", "Network", "Other", "Unknown"]
@@ -144,16 +144,17 @@ def parse_db_time(value: str | None) -> datetime | None:
 
 
 def is_valid_drive_id(value: str) -> bool:
-    return bool(DRIVE_ID_RE.fullmatch(value.strip()))
+    return bool(value.strip())
 
 
 def drive_id_sequence(value: str | None) -> int | None:
     if not value:
         return None
     text = value.strip()
-    if not is_valid_drive_id(text):
+    match = AID_DRIVE_ID_RE.fullmatch(text)
+    if match is None:
         return None
-    return int(text[4:])
+    return int(match.group(1))
 
 
 def drive_id_sort_key(value: str | None) -> tuple[int, int, str]:
@@ -262,7 +263,10 @@ class Database:
                 f"supports up to version {SCHEMA_VERSION}."
             )
         if version < SCHEMA_VERSION:
+            disable_foreign_keys = version < 4
             try:
+                if disable_foreign_keys:
+                    self.connection.execute("PRAGMA foreign_keys = OFF")
                 self.connection.execute("BEGIN IMMEDIATE")
                 if version < 1:
                     self._apply_migration_1()
@@ -273,11 +277,17 @@ class Database:
                 if version < 3:
                     self._apply_migration_3()
                     version = 3
+                if version < 4:
+                    self._apply_migration_4()
+                    version = 4
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
                 self.connection.rollback()
                 raise
+            finally:
+                if disable_foreign_keys:
+                    self.connection.execute("PRAGMA foreign_keys = ON")
         self.validate_schema()
 
     def validate_catalogue(self) -> None:
@@ -337,7 +347,7 @@ class Database:
             """
             CREATE TABLE IF NOT EXISTS volumes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                name TEXT UNIQUE COLLATE NOCASE,
                 source_path TEXT NOT NULL,
                 capacity_bytes INTEGER NOT NULL DEFAULT 0,
                 used_bytes INTEGER NOT NULL DEFAULT 0,
@@ -487,6 +497,46 @@ class Database:
         for row in existing:
             self._insert_default_volume_register(self.connection, int(row["id"]))
 
+    def _apply_migration_4(self) -> None:
+        name_column = next(
+            (row for row in self.connection.execute("PRAGMA table_info(volumes)") if row["name"] == "name"),
+            None,
+        )
+        if name_column is None or not bool(name_column["notnull"]):
+            return
+
+        self.connection.execute(
+            """
+            CREATE TABLE volumes_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE COLLATE NOCASE,
+                source_path TEXT NOT NULL,
+                capacity_bytes INTEGER NOT NULL DEFAULT 0,
+                used_bytes INTEGER NOT NULL DEFAULT 0,
+                free_bytes INTEGER NOT NULL DEFAULT 0,
+                indexed_file_count INTEGER NOT NULL DEFAULT 0,
+                indexed_folder_count INTEGER NOT NULL DEFAULT 0,
+                last_scan_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO volumes_new (
+                id, name, source_path, capacity_bytes, used_bytes, free_bytes,
+                indexed_file_count, indexed_folder_count, last_scan_at, created_at, updated_at
+            )
+            SELECT
+                id, NULLIF(name, ''), source_path, capacity_bytes, used_bytes, free_bytes,
+                indexed_file_count, indexed_folder_count, last_scan_at, created_at, updated_at
+            FROM volumes
+            """
+        )
+        self.connection.execute("DROP TABLE volumes")
+        self.connection.execute("ALTER TABLE volumes_new RENAME TO volumes")
+
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column not in self._column_names(table):
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -509,6 +559,12 @@ class Database:
         if not text:
             return ""
         return str(Path(text).expanduser())
+
+    def _normalize_volume_name(self, name: str | None) -> str | None:
+        if name is None:
+            return None
+        text = name.strip()
+        return text or None
 
     def _volume_select_sql(self, where: str = "") -> str:
         return f"""
@@ -589,7 +645,7 @@ class Database:
 
         drive_id = str(data.get("drive_id") or "").strip()
         if not is_valid_drive_id(drive_id):
-            raise ValueError("Drive ID must use the format AID- followed by at least three digits.")
+            raise ValueError("Drive ID is required.")
         data["drive_id"] = drive_id
 
         status = str(data.get("status") or "").strip()
@@ -742,15 +798,13 @@ class Database:
 
     def create_volume(
         self,
-        name: str,
+        name: str | None,
         source_path: str = "",
         register: dict[str, Any] | None = None,
     ) -> int:
         now = utc_now()
         source = self._normalize_source_path(source_path)
-        clean_name = name.strip()
-        if not clean_name:
-            raise ValueError("Volume name is required.")
+        clean_name = self._normalize_volume_name(name)
         with self.transaction() as conn:
             cur = conn.execute(
                 """
@@ -766,13 +820,11 @@ class Database:
     def update_volume(
         self,
         volume_id: int,
-        name: str,
+        name: str | None,
         source_path: str,
         register: dict[str, Any] | None = None,
     ) -> None:
-        clean_name = name.strip()
-        if not clean_name:
-            raise ValueError("Volume name is required.")
+        clean_name = self._normalize_volume_name(name)
         with self.transaction() as conn:
             conn.execute(
                 """

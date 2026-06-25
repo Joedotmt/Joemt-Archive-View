@@ -25,7 +25,12 @@ def test_database_initializes_schema(tmp_path):
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
         assert "volume_register" in tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        volume_columns = {
+            row["name"]: row
+            for row in db.connection.execute("PRAGMA table_info(volumes)")
+        }
+        assert volume_columns["name"]["notnull"] == 0
         folder_columns = {
             row["name"]
             for row in db.connection.execute("PRAGMA table_info(folders)")
@@ -122,10 +127,27 @@ def test_duplicate_volume_names_are_rejected(tmp_path):
         db.close()
 
 
+def test_volume_name_is_optional_and_drive_id_allows_custom_text(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        first_id = db.create_volume("", str(tmp_path), {"drive_id": "Shelf B / Client Archive"})
+        second_id = db.create_volume("", str(tmp_path), {"drive_id": "2026-offsite-copy"})
+
+        first = db.get_volume(first_id)
+        second = db.get_volume(second_id)
+        assert first["name"] is None
+        assert first["drive_id"] == "Shelf B / Client Archive"
+        assert second["name"] is None
+        assert second["drive_id"] == "2026-offsite-copy"
+    finally:
+        db.close()
+
+
 def test_next_drive_id_uses_highest_existing_aid_sequence(tmp_path):
     db = Database(tmp_path / "catalogue.sqlite3")
     try:
         db.create_volume("First", str(tmp_path), {"drive_id": "AID-001"})
+        db.create_volume("Custom", str(tmp_path), {"drive_id": "Shelf B"})
         db.create_volume("Large", str(tmp_path), {"drive_id": "AID-1250"})
         assert db.next_drive_id() == "AID-1251"
 
@@ -212,7 +234,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 4
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
