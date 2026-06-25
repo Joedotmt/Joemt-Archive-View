@@ -1,0 +1,41 @@
+name: Windows Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Build Windows executable
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name JVVV --collect-all PySide6 jvvv_app.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JVVV-windows
+          path: dist/JVVV.exe
