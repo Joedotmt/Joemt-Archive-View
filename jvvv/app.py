@@ -264,7 +264,7 @@ class BrowserItem:
     relative_path: str
     type_label: str
     extension: str = ""
-    size_bytes: int = 0
+    size_bytes: int | None = 0
     modified_at: str | None = None
     missing: bool = False
     parent_id: int | None = None
@@ -373,7 +373,7 @@ class SearchResultItem:
     volume_id: int
     volume_name: str
     relative_path: str
-    size_bytes: int
+    size_bytes: int | None
     modified_at: str | None
     missing: bool
     source_path: str
@@ -393,8 +393,8 @@ class BrowserTableModel(StandardTableModel):
                 TableColumn("Type", lambda item: item.type_label),
                 TableColumn(
                     "Size",
-                    lambda item: "" if item.is_folder else format_size(item.size_bytes),
-                    sort_key=lambda item: item.size_bytes,
+                    lambda item: display_indexed_size(item.size_bytes),
+                    sort_key=lambda item: size_sort_key(item.size_bytes),
                     alignment=Qt.AlignmentFlag.AlignRight,
                 ),
                 TableColumn("Modified", lambda item: display_db_time(item.modified_at), sort_key=lambda item: item.modified_at or ""),
@@ -462,8 +462,8 @@ class SearchResultsTableModel(StandardTableModel):
                 TableColumn("Relative Path", lambda item: relative_path_for_display(item.relative_path)),
                 TableColumn(
                     "Size",
-                    lambda item: "" if item.is_folder else format_size(item.size_bytes),
-                    sort_key=lambda item: item.size_bytes,
+                    lambda item: display_indexed_size(item.size_bytes),
+                    sort_key=lambda item: size_sort_key(item.size_bytes),
                     alignment=Qt.AlignmentFlag.AlignRight,
                 ),
                 TableColumn("Modified", lambda item: display_db_time(item.modified_at), sort_key=lambda item: item.modified_at or ""),
@@ -521,6 +521,16 @@ def display_db_time(value: str | None) -> str:
     if parsed is None:
         return "-"
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def display_indexed_size(value: int | None) -> str:
+    if value is None:
+        return "Unknown"
+    return format_size(value)
+
+
+def size_sort_key(value: int | None) -> int:
+    return -1 if value is None else int(value)
 
 
 class VolumeDialog(QDialog):
@@ -1691,6 +1701,7 @@ class MainWindow(QMainWindow):
                     name=child["name"],
                     relative_path=child["relative_path"],
                     type_label="Folder",
+                    size_bytes=child["recursive_size_bytes"],
                     modified_at=child["modified_at"],
                     missing=bool(child["missing"]),
                     parent_id=child["parent_id"],
@@ -1842,7 +1853,7 @@ class MainWindow(QMainWindow):
             relative_path=record["relative_path"],
             type_label=type_label,
             extension=record["extension"] or "",
-            size_bytes=record["size_bytes"] or 0,
+            size_bytes=record["size_bytes"],
             modified_at=record["modified_at"],
             missing=bool(record["missing"]),
             parent_id=record["parent_id"],
@@ -1885,14 +1896,18 @@ class MainWindow(QMainWindow):
             properties.extend(
                 [
                     ("Extension", f".{extension}" if extension else "Unavailable"),
-                    ("Size", format_size(record["size_bytes"] or 0)),
+                    ("Size", display_indexed_size(record["size_bytes"])),
                 ]
             )
         else:
             properties.extend(
                 [
-                    ("Indexed child folders", str(record["child_folder_count"] or 0)),
-                    ("Indexed child files", str(record["child_file_count"] or 0)),
+                    ("Total indexed size", display_indexed_size(record["size_bytes"])),
+                    ("Files", self._display_optional_count(record["recursive_file_count"])),
+                    ("Subfolders", self._display_optional_count(record["recursive_subfolder_count"])),
+                    ("Direct files", self._display_optional_count(record["direct_file_count"])),
+                    ("Direct subfolders", self._display_optional_count(record["direct_subfolder_count"])),
+                    ("Statistics updated", self._display_unknown_time(record["stats_updated_at"])),
                 ]
             )
 
@@ -2109,6 +2124,12 @@ class MainWindow(QMainWindow):
 
     def _display_time(self, value: str | None) -> str:
         return display_db_time(value)
+
+    def _display_unknown_time(self, value: str | None) -> str:
+        return "Unknown" if not value else display_db_time(value)
+
+    def _display_optional_count(self, value: int | None) -> str:
+        return "Unknown" if value is None else f"{int(value):,}"
 
 
 def main() -> int:

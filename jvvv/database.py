@@ -6,11 +6,11 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CATALOGUE_EXTENSION = ".jvvv"
 REQUIRED_TABLES = {"volumes", "folders", "files", "scan_history", "scan_errors"}
 REQUIRED_COLUMNS = {
@@ -36,6 +36,12 @@ REQUIRED_COLUMNS = {
         "missing",
         "scanned_at",
         "modified_at",
+        "recursive_size_bytes",
+        "recursive_file_count",
+        "recursive_subfolder_count",
+        "direct_file_count",
+        "direct_subfolder_count",
+        "stats_updated_at",
     },
     "files": {
         "id",
@@ -48,6 +54,8 @@ REQUIRED_COLUMNS = {
         "modified_at",
         "missing",
         "scanned_at",
+        "identity_device",
+        "identity_inode",
     },
     "scan_history": {
         "id",
@@ -85,6 +93,9 @@ class InvalidCatalogueError(CatalogueError):
 
 class UnsupportedCatalogueError(CatalogueError):
     pass
+
+
+FolderStatsProgress = Callable[[int, int, str], None]
 
 
 def utc_now() -> str:
@@ -179,11 +190,16 @@ class Database:
                 f"This catalogue uses schema version {version}, but this version of JVVV "
                 f"supports up to version {SCHEMA_VERSION}."
             )
-        if version < 1:
+        if version < SCHEMA_VERSION:
             try:
                 self.connection.execute("BEGIN IMMEDIATE")
-                self._apply_migration_1()
-                self.connection.execute("PRAGMA user_version = 1")
+                if version < 1:
+                    self._apply_migration_1()
+                    version = 1
+                if version < 2:
+                    self._apply_migration_2()
+                    version = 2
+                self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
                 self.connection.rollback()
@@ -321,6 +337,35 @@ class Database:
         ]
         for statement in statements:
             self.connection.execute(statement)
+
+    def _apply_migration_2(self) -> None:
+        folder_columns = {
+            "recursive_size_bytes": "INTEGER",
+            "recursive_file_count": "INTEGER",
+            "recursive_subfolder_count": "INTEGER",
+            "direct_file_count": "INTEGER",
+            "direct_subfolder_count": "INTEGER",
+            "stats_updated_at": "TEXT",
+        }
+        file_columns = {
+            "identity_device": "INTEGER",
+            "identity_inode": "INTEGER",
+        }
+        for column, definition in folder_columns.items():
+            self._add_column_if_missing("folders", column, definition)
+        for column, definition in file_columns.items():
+            self._add_column_if_missing("files", column, definition)
+
+        statements = [
+            "CREATE INDEX IF NOT EXISTS idx_folders_volume_stats_size ON folders(volume_id, recursive_size_bytes)",
+            "CREATE INDEX IF NOT EXISTS idx_files_identity ON files(volume_id, identity_device, identity_inode)",
+        ]
+        for statement in statements:
+            self.connection.execute(statement)
+
+    def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
+        if column not in self._column_names(table):
+            self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -510,14 +555,16 @@ class Database:
         size_bytes: int,
         modified_at: str | None,
         scanned_at: str,
+        identity_device: int | None = None,
+        identity_inode: int | None = None,
     ) -> int:
         cur = self.connection.execute(
             """
             INSERT INTO files (
                 volume_id, folder_id, name, relative_path, extension,
-                size_bytes, modified_at, missing, scanned_at
+                size_bytes, modified_at, missing, scanned_at, identity_device, identity_inode
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             ON CONFLICT(volume_id, relative_path) DO UPDATE SET
                 folder_id = excluded.folder_id,
                 name = excluded.name,
@@ -525,7 +572,9 @@ class Database:
                 size_bytes = excluded.size_bytes,
                 modified_at = excluded.modified_at,
                 missing = 0,
-                scanned_at = excluded.scanned_at
+                scanned_at = excluded.scanned_at,
+                identity_device = excluded.identity_device,
+                identity_inode = excluded.identity_inode
             RETURNING id
             """,
             (
@@ -537,6 +586,8 @@ class Database:
                 size_bytes,
                 modified_at,
                 scanned_at,
+                identity_device,
+                identity_inode,
             ),
         )
         return int(cur.fetchone()["id"])
@@ -583,6 +634,205 @@ class Database:
                 """,
                 (volume_id, scanned_at),
             )
+
+    def rebuild_folder_statistics(
+        self,
+        volume_id: int,
+        stats_updated_at: str | None = None,
+        progress_callback: FolderStatsProgress | None = None,
+    ) -> int:
+        updated_at = stats_updated_at or utc_now()
+        with self.transaction() as conn:
+            folder_rows = list(
+                conn.execute(
+                    """
+                    SELECT id, parent_id, relative_path
+                    FROM folders
+                    WHERE volume_id = ? AND missing = 0
+                    """,
+                    (volume_id,),
+                )
+            )
+            total = len(folder_rows)
+            if progress_callback:
+                progress_callback(0, total, "Preparing folder statistics")
+
+            stats: dict[int, dict[str, int]] = {}
+            depth_by_id: dict[int, int] = {}
+            parent_by_id: dict[int, int | None] = {}
+            children_by_parent: dict[int, list[int]] = {}
+            for row in folder_rows:
+                folder_id = int(row["id"])
+                relative_path = row["relative_path"] or ""
+                parent_id = row["parent_id"]
+                stats[folder_id] = {
+                    "direct_size": 0,
+                    "direct_file_count": 0,
+                    "direct_subfolder_count": 0,
+                    "recursive_size": 0,
+                    "recursive_file_count": 0,
+                    "recursive_subfolder_count": 0,
+                }
+                depth_by_id[folder_id] = 0 if not relative_path else relative_path.count("/") + 1
+                parent_by_id[folder_id] = int(parent_id) if parent_id is not None else None
+                if parent_id is not None:
+                    children_by_parent.setdefault(int(parent_id), []).append(folder_id)
+
+            for folder_id, children in children_by_parent.items():
+                if folder_id in stats:
+                    stats[folder_id]["direct_subfolder_count"] = len(children)
+
+            direct_file_rows = conn.execute(
+                """
+                SELECT
+                    folder_id,
+                    COUNT(*) AS direct_file_count,
+                    COALESCE(SUM(size_bytes), 0) AS direct_size
+                FROM files
+                WHERE volume_id = ?
+                  AND missing = 0
+                  AND folder_id IS NOT NULL
+                GROUP BY folder_id
+                """,
+                (volume_id,),
+            )
+            for row in direct_file_rows:
+                folder_id = int(row["folder_id"])
+                if folder_id in stats:
+                    stats[folder_id]["direct_size"] = int(row["direct_size"] or 0)
+                    stats[folder_id]["direct_file_count"] = int(row["direct_file_count"] or 0)
+
+            processed = 0
+            for folder_id in sorted(depth_by_id, key=lambda key: depth_by_id[key], reverse=True):
+                folder_stats = stats[folder_id]
+                recursive_size = folder_stats["direct_size"]
+                recursive_file_count = folder_stats["direct_file_count"]
+                recursive_subfolder_count = folder_stats["direct_subfolder_count"]
+                for child_id in children_by_parent.get(folder_id, []):
+                    if child_id not in stats:
+                        continue
+                    child_stats = stats[child_id]
+                    recursive_size += child_stats["recursive_size"]
+                    recursive_file_count += child_stats["recursive_file_count"]
+                    recursive_subfolder_count += child_stats["recursive_subfolder_count"]
+                folder_stats["recursive_size"] = recursive_size
+                folder_stats["recursive_file_count"] = recursive_file_count
+                folder_stats["recursive_subfolder_count"] = recursive_subfolder_count
+
+                processed += 1
+                if progress_callback and (processed == total or processed % 1000 == 0):
+                    progress_callback(processed, total, "Calculating folder statistics")
+
+            self._dedupe_linked_file_sizes(conn, volume_id, stats, parent_by_id)
+
+            conn.execute(
+                """
+                UPDATE folders
+                SET recursive_size_bytes = NULL,
+                    recursive_file_count = NULL,
+                    recursive_subfolder_count = NULL,
+                    direct_file_count = NULL,
+                    direct_subfolder_count = NULL,
+                    stats_updated_at = NULL
+                WHERE volume_id = ?
+                """,
+                (volume_id,),
+            )
+            update_rows = [
+                (
+                    folder_stats["recursive_size"],
+                    folder_stats["recursive_file_count"],
+                    folder_stats["recursive_subfolder_count"],
+                    folder_stats["direct_file_count"],
+                    folder_stats["direct_subfolder_count"],
+                    updated_at,
+                    folder_id,
+                )
+                for folder_id, folder_stats in stats.items()
+            ]
+            conn.executemany(
+                """
+                UPDATE folders
+                SET recursive_size_bytes = ?,
+                    recursive_file_count = ?,
+                    recursive_subfolder_count = ?,
+                    direct_file_count = ?,
+                    direct_subfolder_count = ?,
+                    stats_updated_at = ?
+                WHERE id = ?
+                """,
+                update_rows,
+            )
+            if progress_callback:
+                progress_callback(total, total, "Folder statistics updated")
+            return total
+
+    def _dedupe_linked_file_sizes(
+        self,
+        conn: sqlite3.Connection,
+        volume_id: int,
+        stats: dict[int, dict[str, int]],
+        parent_by_id: dict[int, int | None],
+    ) -> None:
+        rows = conn.execute(
+            """
+            WITH duplicate_identities AS (
+                SELECT
+                    identity_device,
+                    identity_inode,
+                    MAX(size_bytes) AS size_bytes
+                FROM files
+                WHERE volume_id = ?
+                  AND missing = 0
+                  AND folder_id IS NOT NULL
+                  AND identity_device IS NOT NULL
+                  AND identity_inode IS NOT NULL
+                GROUP BY identity_device, identity_inode
+                HAVING COUNT(*) > 1
+            )
+            SELECT
+                f.identity_device,
+                f.identity_inode,
+                f.folder_id,
+                d.size_bytes
+            FROM files f
+            JOIN duplicate_identities d
+              ON d.identity_device = f.identity_device
+             AND d.identity_inode = f.identity_inode
+            WHERE f.volume_id = ?
+              AND f.missing = 0
+              AND f.folder_id IS NOT NULL
+            ORDER BY f.identity_device, f.identity_inode
+            """,
+            (volume_id, volume_id),
+        )
+
+        current_identity: tuple[int, int] | None = None
+        current_size = 0
+        ancestor_counts: dict[int, int] = {}
+
+        def apply_current_group() -> None:
+            if current_identity is None:
+                return
+            for folder_id, count in ancestor_counts.items():
+                if count > 1:
+                    stats[folder_id]["recursive_size"] -= (count - 1) * current_size
+
+        for row in rows:
+            identity = (int(row["identity_device"]), int(row["identity_inode"]))
+            if identity != current_identity:
+                apply_current_group()
+                current_identity = identity
+                current_size = int(row["size_bytes"] or 0)
+                ancestor_counts = {}
+
+            folder_id = int(row["folder_id"])
+            current = folder_id
+            while current is not None and current in stats:
+                ancestor_counts[current] = ancestor_counts.get(current, 0) + 1
+                current = parent_by_id.get(current)
+
+        apply_current_group()
 
     def refresh_volume_counts(self, volume_id: int, scanned_at: str | None = None) -> None:
         file_count = self.connection.execute(
@@ -666,13 +916,18 @@ class Database:
                     f.modified_at,
                     f.missing,
                     f.scanned_at,
+                    f.identity_device,
+                    f.identity_inode,
                     v.name AS volume_name,
                     v.source_path,
                     parent.id AS parent_folder_id,
                     parent.name AS parent_folder_name,
                     parent.relative_path AS parent_relative_path,
-                    NULL AS child_folder_count,
-                    NULL AS child_file_count
+                    NULL AS recursive_file_count,
+                    NULL AS recursive_subfolder_count,
+                    NULL AS direct_file_count,
+                    NULL AS direct_subfolder_count,
+                    NULL AS stats_updated_at
                 FROM files f
                 JOIN volumes v ON v.id = f.volume_id
                 LEFT JOIN folders parent ON parent.id = f.folder_id
@@ -692,27 +947,22 @@ class Database:
                     fo.name,
                     fo.relative_path,
                     '' AS extension,
-                    0 AS size_bytes,
+                    fo.recursive_size_bytes AS size_bytes,
                     fo.modified_at,
                     fo.missing,
                     fo.scanned_at,
+                    NULL AS identity_device,
+                    NULL AS identity_inode,
                     v.name AS volume_name,
                     v.source_path,
                     parent.id AS parent_folder_id,
                     parent.name AS parent_folder_name,
                     parent.relative_path AS parent_relative_path,
-                    (
-                        SELECT COUNT(*)
-                        FROM folders child
-                        WHERE child.volume_id = fo.volume_id
-                          AND child.parent_id = fo.id
-                    ) AS child_folder_count,
-                    (
-                        SELECT COUNT(*)
-                        FROM files child
-                        WHERE child.volume_id = fo.volume_id
-                          AND child.folder_id = fo.id
-                    ) AS child_file_count
+                    fo.recursive_file_count,
+                    fo.recursive_subfolder_count,
+                    fo.direct_file_count,
+                    fo.direct_subfolder_count,
+                    fo.stats_updated_at
                 FROM folders fo
                 JOIN volumes v ON v.id = fo.volume_id
                 LEFT JOIN folders parent ON parent.id = fo.parent_id
@@ -776,7 +1026,7 @@ class Database:
                     v.id AS volume_id,
                     v.name AS volume_name,
                     fo.relative_path,
-                    0 AS size_bytes,
+                    fo.recursive_size_bytes AS size_bytes,
                     fo.modified_at,
                     fo.missing,
                     v.source_path,

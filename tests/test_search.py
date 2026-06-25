@@ -32,5 +32,6 @@ def test_search_across_multiple_volumes(tmp_path):
         folder_results = [row for row in db.search("Invoices") if row["item_type"] == "folder"]
         assert len(folder_results) == 1
         assert folder_results[0]["relative_path"] == "Invoices"
+        assert folder_results[0]["size_bytes"] == len(b"pdf")
     finally:
         db.close()

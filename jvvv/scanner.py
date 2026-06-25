@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -124,10 +125,12 @@ class VolumeScanner:
                         full_path = current_path / directory
                         rel_path = normalize_relative_path(full_path.relative_to(root))
                         try:
-                            stat = full_path.stat()
+                            stat_result = full_path.lstat()
                         except OSError as exc:
                             errors_count += 1
                             self.db.add_scan_error(scan_id, volume_id, rel_path, str(exc))
+                            continue
+                        if self._is_link_or_reparse_point(stat_result) or not stat.S_ISDIR(stat_result.st_mode):
                             continue
 
                         folder_id = self.db.ensure_folder(
@@ -136,7 +139,7 @@ class VolumeScanner:
                             name=directory,
                             relative_path=rel_path,
                             scanned_at=scanned_at,
-                            modified_at=format_timestamp(stat.st_mtime),
+                            modified_at=format_timestamp(stat_result.st_mtime),
                         )
                         folder_ids[rel_path] = folder_id
                         folders_seen += 1
@@ -155,10 +158,12 @@ class VolumeScanner:
                         full_path = current_path / file_name
                         rel_path = normalize_relative_path(full_path.relative_to(root))
                         try:
-                            stat = full_path.stat()
+                            stat_result = full_path.lstat()
                         except OSError as exc:
                             errors_count += 1
                             self.db.add_scan_error(scan_id, volume_id, rel_path, str(exc))
+                            continue
+                        if self._is_link_or_reparse_point(stat_result) or not stat.S_ISREG(stat_result.st_mode):
                             continue
 
                         extension = full_path.suffix[1:].lower() if full_path.suffix else ""
@@ -168,9 +173,11 @@ class VolumeScanner:
                             name=file_name,
                             relative_path=rel_path,
                             extension=extension,
-                            size_bytes=stat.st_size,
-                            modified_at=format_timestamp(stat.st_mtime),
+                            size_bytes=stat_result.st_size,
+                            modified_at=format_timestamp(stat_result.st_mtime),
                             scanned_at=scanned_at,
+                            identity_device=self._stat_identity_value(stat_result, "st_dev"),
+                            identity_inode=self._stat_identity_value(stat_result, "st_ino"),
                         )
                         files_seen += 1
                         if files_seen % self.batch_size == 0:
@@ -183,6 +190,18 @@ class VolumeScanner:
 
                 if status == "completed":
                     self.db.finalize_scan_items(volume_id, scanned_at, remove_deleted)
+                    self._emit_progress(files_seen, folders_seen, "Calculating folder sizes...")
+                    self.db.rebuild_folder_statistics(
+                        volume_id,
+                        stats_updated_at=scanned_at,
+                        progress_callback=lambda done, total, message: self._on_stats_progress(
+                            files_seen,
+                            folders_seen,
+                            done,
+                            total,
+                            message,
+                        ),
+                    )
                     self.db.refresh_volume_counts(volume_id, scanned_at)
                 else:
                     self.db.refresh_volume_counts(volume_id)
@@ -208,3 +227,32 @@ class VolumeScanner:
     def _emit_progress(self, files_seen: int, folders_seen: int, current_path: str) -> None:
         if self.progress_callback:
             self.progress_callback(files_seen, folders_seen, current_path)
+
+    def _on_stats_progress(
+        self,
+        files_seen: int,
+        folders_seen: int,
+        done: int,
+        total: int,
+        message: str,
+    ) -> None:
+        if self._cancelled():
+            raise ScanCancelled("Scan cancelled.")
+        if total:
+            self._emit_progress(files_seen, folders_seen, f"{message} ({done}/{total})")
+        else:
+            self._emit_progress(files_seen, folders_seen, message)
+
+    def _is_link_or_reparse_point(self, stat_result: os.stat_result) -> bool:
+        if stat.S_ISLNK(stat_result.st_mode):
+            return True
+        attributes = getattr(stat_result, "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(reparse_flag and attributes & reparse_flag)
+
+    def _stat_identity_value(self, stat_result: os.stat_result, name: str) -> int | None:
+        value = getattr(stat_result, name, None)
+        if value is None:
+            return None
+        integer = int(value)
+        return integer if integer > 0 else None

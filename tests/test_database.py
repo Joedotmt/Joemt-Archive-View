@@ -23,7 +23,19 @@ def test_database_initializes_schema(tmp_path):
             )
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        folder_columns = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA table_info(folders)")
+        }
+        assert {
+            "recursive_size_bytes",
+            "recursive_file_count",
+            "recursive_subfolder_count",
+            "direct_file_count",
+            "direct_subfolder_count",
+            "stats_updated_at",
+        } <= folder_columns
     finally:
         db.close()
 
@@ -81,3 +93,48 @@ def test_duplicate_volume_names_are_rejected(tmp_path):
             db.create_volume("archive", str(tmp_path))
     finally:
         db.close()
+
+
+def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
+    path = tmp_path / "catalogue.jvvv"
+    db = Database(path, initialize=False)
+    try:
+        with db.transaction() as conn:
+            db._apply_migration_1()
+            conn.execute("PRAGMA user_version = 1")
+            volume_id = db.create_volume("Archive", str(tmp_path))
+            folder_id = db.ensure_folder(
+                volume_id=volume_id,
+                parent_id=None,
+                name="Archive",
+                relative_path="",
+                scanned_at="2026-06-25T12:00:00.000000+0000",
+            )
+            conn.execute(
+                """
+                INSERT INTO files (
+                    volume_id, folder_id, name, relative_path, extension,
+                    size_bytes, modified_at, missing, scanned_at
+                )
+                VALUES (?, ?, 'file.txt', 'file.txt', 'txt', 123, NULL, 0, ?)
+                """,
+                (volume_id, folder_id, "2026-06-25T12:00:00.000000+0000"),
+            )
+    finally:
+        db.close()
+
+    migrated = open_catalogue(path)
+    try:
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        root = migrated.get_root_folder(volume_id)
+        assert root is not None
+        assert root["recursive_size_bytes"] is None
+        assert root["recursive_file_count"] is None
+
+        migrated.rebuild_folder_statistics(volume_id)
+        root = migrated.get_root_folder(volume_id)
+        assert root["recursive_size_bytes"] == 123
+        assert root["recursive_file_count"] == 1
+        assert root["direct_file_count"] == 1
+    finally:
+        migrated.close()
