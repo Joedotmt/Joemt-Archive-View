@@ -883,7 +883,7 @@ class MainWindow(QMainWindow):
         self.browser_shortcuts.append(shortcut)
 
     def refresh_volumes(self) -> None:
-        selected_id = self.current_volume_id
+        selected_id = self.selected_volume_id() or self.current_volume_id
         volumes = self.db.list_volumes()
         items = [
             VolumeItem(
@@ -906,11 +906,10 @@ class MainWindow(QMainWindow):
         if items:
             visible_ids = {item.id for item in self.volume_model.items}
             target_id = selected_id if selected_id in visible_ids else self.volume_model.items[0].id
-            self.select_volume(target_id)
+            if self.select_volume(target_id):
+                self.show_selected_volume(target_id)
         elif not volumes:
-            self.current_volume_id = None
-            self.show_volume_details(None)
-            self.clear_browser()
+            self.show_selected_volume(None)
 
     def selected_volume_id(self) -> int | None:
         item = self.volume_model.item_at(self.volume_table.currentIndex())
@@ -965,6 +964,9 @@ class MainWindow(QMainWindow):
 
     def on_volume_selection_changed(self, selected=None, deselected=None) -> None:
         volume_id = self.selected_volume_id()
+        self.show_selected_volume(volume_id)
+
+    def show_selected_volume(self, volume_id: int | None) -> None:
         self.current_volume_id = volume_id
         volume = self.db.get_volume(volume_id) if volume_id is not None else None
         self.show_volume_details(volume)
@@ -1141,11 +1143,7 @@ class MainWindow(QMainWindow):
     def refresh_after_scan(self) -> None:
         self.db.close()
         self.db = Database(self.db.path)
-        selected = self.current_volume_id
         self.refresh_volumes()
-        if selected is not None:
-            self.current_volume_id = None
-            self.select_volume(selected)
         self.perform_search()
 
     def select_volume(self, volume_id: int) -> bool:
