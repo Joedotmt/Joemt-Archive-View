@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import os
 import sys
 import traceback
 from pathlib import Path, PurePosixPath
@@ -8,6 +10,7 @@ from typing import Any, Callable
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QDate,
     QEventLoop,
     QFileInfo,
     QLockFile,
@@ -17,6 +20,7 @@ from PySide6.QtCore import (
     QRectF,
     QSize,
     Qt,
+    QLocale,
     QThread,
     QTimer,
     Signal,
@@ -35,6 +39,9 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -60,12 +67,17 @@ from PySide6.QtWidgets import (
 
 from .config import APP_NAME
 from .database import (
+    ARCHIVE_STATUSES,
     CATALOGUE_EXTENSION,
+    CONNECTOR_OPTIONS,
     CatalogueError,
     CatalogueInUseError,
     Database,
+    VOLUME_CONDITIONS,
     catalogue_path_with_extension,
     create_catalogue,
+    drive_id_sort_key,
+    is_valid_drive_id,
     open_catalogue,
     parse_db_time,
 )
@@ -353,8 +365,22 @@ class CatalogueIconProvider:
 @dataclass(frozen=True)
 class VolumeItem:
     id: int
+    drive_id: str
     name: str
     source_path: str
+    register_status: str
+    condition: str
+    description: str
+    connector: str
+    is_mirror: bool
+    master_volume_id: int | None
+    master_drive_id: str | None
+    master_name: str | None
+    date_added: str
+    earliest_content_date: str | None
+    latest_content_date: str | None
+    retired_date: str | None
+    mirror_date: str | None
     capacity_bytes: int
     used_bytes: int
     free_bytes: int
@@ -423,19 +449,21 @@ class VolumeTableModel(StandardTableModel):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(
             [
+                TableColumn(
+                    "Drive ID",
+                    lambda item: item.drive_id or "-",
+                    sort_key=lambda item: drive_id_sort_key(item.drive_id),
+                ),
                 TableColumn("Name", lambda item: item.name),
-                TableColumn("Status", lambda item: "Connected" if item.connected else "Offline"),
+                TableColumn("Status", lambda item: item.register_status),
+                TableColumn("Condition", lambda item: item.condition),
+                TableColumn("Connector", lambda item: item.connector),
+                TableColumn("Connection", lambda item: "Connected" if item.connected else "Offline"),
                 TableColumn("Full", lambda item: f"{item.percent_full}%", sort_key=lambda item: item.percent_full),
                 TableColumn(
                     "Files",
                     lambda item: str(item.indexed_file_count),
                     sort_key=lambda item: item.indexed_file_count,
-                    alignment=Qt.AlignmentFlag.AlignRight,
-                ),
-                TableColumn(
-                    "Folders",
-                    lambda item: str(item.indexed_folder_count),
-                    sort_key=lambda item: item.indexed_folder_count,
                     alignment=Qt.AlignmentFlag.AlignRight,
                 ),
                 TableColumn("Last Scan", lambda item: display_db_time(item.last_scan_at), sort_key=lambda item: item.last_scan_at or ""),
@@ -533,20 +561,167 @@ def size_sort_key(value: int | None) -> int:
     return -1 if value is None else int(value)
 
 
+def source_path_exists(source_path: str | None) -> bool:
+    return bool(source_path and Path(source_path).exists())
+
+
+def display_db_date(value: str | None) -> str:
+    if not value:
+        return "-"
+    qdate = QDate.fromString(value, Qt.DateFormat.ISODate)
+    if not qdate.isValid():
+        return value
+    return QLocale.system().toString(qdate, QLocale.FormatType.ShortFormat)
+
+
+def volume_reference(drive_id: str | None, name: str | None) -> str:
+    if drive_id and name:
+        return f"{drive_id} - {name}"
+    return drive_id or name or "-"
+
+
+def volume_matches_filter(item: VolumeItem, query: str) -> bool:
+    text = query.strip().casefold()
+    if not text:
+        return True
+    haystack = " ".join(
+        [
+            item.drive_id or "",
+            item.name,
+            item.register_status,
+            item.condition,
+            item.description,
+            item.connector,
+        ]
+    ).casefold()
+    return all(term in haystack for term in text.split())
+
+
+def guess_content_dates_from_path(source_path: str) -> tuple[str | None, str | None]:
+    if not source_path:
+        return None, None
+    root = Path(source_path)
+    if not root.exists():
+        return None, None
+
+    earliest: str | None = None
+    latest: str | None = None
+
+    def include_timestamp(timestamp: float) -> None:
+        nonlocal earliest, latest
+        value = datetime.fromtimestamp(timestamp).date().isoformat()
+        earliest = value if earliest is None or value < earliest else earliest
+        latest = value if latest is None or value > latest else latest
+
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            include_timestamp(current.stat().st_mtime)
+        except OSError:
+            pass
+        if not current.is_dir():
+            continue
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        stat_result = entry.stat(follow_symlinks=False)
+                        include_timestamp(stat_result.st_mtime)
+                    except OSError:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+        except OSError:
+            continue
+
+    return earliest, latest
+
+
+def set_combo_value(combo: QComboBox, value: str) -> None:
+    index = combo.findText(value)
+    if index < 0:
+        combo.addItem(value)
+        index = combo.findText(value)
+    combo.setCurrentIndex(index)
+
+
+class OptionalDateEdit(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.known_check = QCheckBox("Known")
+        self.date_edit = QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat(QLocale.system().dateFormat(QLocale.FormatType.ShortFormat))
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.known_check)
+        layout.addWidget(self.date_edit, 1)
+
+        self.known_check.toggled.connect(self._sync_enabled)
+        self._sync_enabled()
+
+    def _sync_enabled(self) -> None:
+        self.date_edit.setEnabled(self.isEnabled() and self.known_check.isChecked())
+
+    def setEnabled(self, enabled: bool) -> None:  # type: ignore[override]
+        super().setEnabled(enabled)
+        self._sync_enabled()
+
+    def value(self) -> str | None:
+        if not self.known_check.isChecked():
+            return None
+        return self.date_edit.date().toString(Qt.DateFormat.ISODate)
+
+    def set_value(self, value: str | None) -> None:
+        if value:
+            qdate = QDate.fromString(value, Qt.DateFormat.ISODate)
+            self.date_edit.setDate(qdate if qdate.isValid() else QDate.currentDate())
+            self.known_check.setChecked(True)
+        else:
+            self.known_check.setChecked(False)
+        self._sync_enabled()
+
+    def set_value_if_empty(self, value: str | None) -> None:
+        if value and not self.value():
+            self.set_value(value)
+
+    def clear(self) -> None:
+        self.set_value(None)
+
+
 class VolumeDialog(QDialog):
     def __init__(
         self,
         parent: QWidget | None = None,
         title: str = "New Volume",
-        name: str = "",
-        source_path: str = "",
+        volume=None,
+        suggested_drive_id: str = "",
+        master_options: list[Any] | None = None,
+        mirror_dependents: list[Any] | None = None,
+        existing_volumes: list[Any] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(680)
+        self.current_volume_id = int(volume["id"]) if volume is not None else None
+        self.master_options = master_options or []
+        self.mirror_dependents = mirror_dependents or []
+        self.existing_names = {
+            str(row["name"]).casefold(): int(row["id"])
+            for row in existing_volumes or []
+            if row["name"]
+        }
+        self.existing_drive_ids = {
+            str(row["drive_id"]).casefold(): int(row["id"])
+            for row in existing_volumes or []
+            if row["drive_id"]
+        }
 
-        self.name_edit = QLineEdit(name)
-        self.path_edit = QLineEdit(source_path)
+        self.drive_id_edit = QLineEdit(volume["drive_id"] if volume is not None else suggested_drive_id)
+        self.name_edit = QLineEdit(volume["name"] if volume is not None else "")
+        self.path_edit = QLineEdit(volume["source_path"] if volume is not None else "")
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.browse)
 
@@ -554,9 +729,74 @@ class VolumeDialog(QDialog):
         path_row.addWidget(self.path_edit, 1)
         path_row.addWidget(self.browse_button)
 
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(ARCHIVE_STATUSES)
+        set_combo_value(
+            self.status_combo,
+            volume["register_status"] if volume is not None else ARCHIVE_STATUSES[0],
+        )
+
+        self.condition_combo = QComboBox()
+        self.condition_combo.addItems(VOLUME_CONDITIONS)
+        set_combo_value(
+            self.condition_combo,
+            volume["condition"] if volume is not None else "Unknown",
+        )
+
+        self.connector_combo = QComboBox()
+        self.connector_combo.setEditable(True)
+        self.connector_combo.addItems(CONNECTOR_OPTIONS)
+        self.connector_combo.setCurrentText(volume["connector"] if volume is not None else "Unknown")
+
+        self.date_added_edit = QDateEdit(QDate.currentDate())
+        self.date_added_edit.setCalendarPopup(True)
+        self.date_added_edit.setDisplayFormat(QLocale.system().dateFormat(QLocale.FormatType.ShortFormat))
+        if volume is not None and volume["date_added"]:
+            qdate = QDate.fromString(volume["date_added"], Qt.DateFormat.ISODate)
+            if qdate.isValid():
+                self.date_added_edit.setDate(qdate)
+
+        self.earliest_date_edit = OptionalDateEdit()
+        self.latest_date_edit = OptionalDateEdit()
+        self.retired_date_edit = OptionalDateEdit()
+        self.mirror_date_edit = OptionalDateEdit()
+        if volume is not None:
+            self.earliest_date_edit.set_value(volume["earliest_content_date"])
+            self.latest_date_edit.set_value(volume["latest_content_date"])
+            self.retired_date_edit.set_value(volume["retired_date"])
+            self.mirror_date_edit.set_value(volume["mirror_date"])
+
+        self.mirror_check = QCheckBox("This is a mirror drive")
+        self.mirror_check.setChecked(bool(volume is not None and volume["is_mirror"]))
+        self.master_combo = QComboBox()
+        self.master_combo.addItem("Select master drive...", None)
+        for row in sorted(self.master_options, key=lambda item: (drive_id_sort_key(item["drive_id"]), item["name"].casefold())):
+            self.master_combo.addItem(volume_reference(row["drive_id"], row["name"]), int(row["id"]))
+        if volume is not None and volume["master_volume_id"] is not None:
+            self.set_master_volume_id(int(volume["master_volume_id"]))
+
+        self.description_edit = QPlainTextEdit(volume["description"] if volume is not None else "")
+        self.description_edit.setMinimumHeight(90)
+
+        self.validation_label = QLabel("")
+        self.validation_label.setWordWrap(True)
+        self.validation_label.setStyleSheet("color: #b91c1c;")
+
         form = QFormLayout()
+        form.addRow("Drive ID", self.drive_id_edit)
         form.addRow("Name", self.name_edit)
         form.addRow("Drive or folder", path_row)
+        form.addRow("Status", self.status_combo)
+        form.addRow("Condition", self.condition_combo)
+        form.addRow("Connector", self.connector_combo)
+        form.addRow("Date Added", self.date_added_edit)
+        form.addRow("Earliest Content Date", self.earliest_date_edit)
+        form.addRow("Latest Content Date", self.latest_date_edit)
+        form.addRow("Retired Date", self.retired_date_edit)
+        form.addRow("", self.mirror_check)
+        form.addRow("Master Drive", self.master_combo)
+        form.addRow("Mirror Date", self.mirror_date_edit)
+        form.addRow("Description", self.description_edit)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -566,7 +806,13 @@ class VolumeDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(self.validation_label)
         layout.addWidget(buttons)
+
+        self.status_combo.currentTextChanged.connect(self.on_status_changed)
+        self.mirror_check.toggled.connect(self.on_mirror_toggled)
+        self.on_status_changed(self.status_combo.currentText())
+        self.on_mirror_toggled(self.mirror_check.isChecked())
 
     def browse(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Choose Drive or Folder", self.path_edit.text())
@@ -574,14 +820,96 @@ class VolumeDialog(QDialog):
             self.path_edit.setText(directory)
             if not self.name_edit.text().strip():
                 self.name_edit.setText(Path(directory).name or directory)
+            self.apply_content_date_guess(directory)
 
-    def values(self) -> tuple[str, str]:
-        return self.name_edit.text().strip(), self.path_edit.text().strip()
+    def apply_content_date_guess(self, source_path: str | None = None) -> None:
+        earliest, latest = guess_content_dates_from_path(source_path or self.path_edit.text().strip())
+        self.earliest_date_edit.set_value_if_empty(earliest)
+        self.latest_date_edit.set_value_if_empty(latest)
+
+    def set_master_volume_id(self, volume_id: int) -> None:
+        for index in range(self.master_combo.count()):
+            if self.master_combo.itemData(index) == volume_id:
+                self.master_combo.setCurrentIndex(index)
+                return
+
+    def on_status_changed(self, status: str) -> None:
+        if status == "Retired" and not self.retired_date_edit.value():
+            self.retired_date_edit.set_value(QDate.currentDate().toString(Qt.DateFormat.ISODate))
+
+    def on_mirror_toggled(self, checked: bool) -> None:
+        self.master_combo.setEnabled(checked)
+        self.mirror_date_edit.setEnabled(checked)
+        if not checked:
+            self.master_combo.setCurrentIndex(0)
+            self.mirror_date_edit.clear()
+
+    def values(self) -> tuple[str, str, dict[str, Any]]:
+        master_volume_id = self.master_combo.currentData()
+        register = {
+            "drive_id": self.drive_id_edit.text().strip(),
+            "is_mirror": self.mirror_check.isChecked(),
+            "status": self.status_combo.currentText().strip(),
+            "condition": self.condition_combo.currentText().strip(),
+            "description": self.description_edit.toPlainText(),
+            "earliest_content_date": self.earliest_date_edit.value(),
+            "latest_content_date": self.latest_date_edit.value(),
+            "connector": self.connector_combo.currentText().strip(),
+            "date_added": self.date_added_edit.date().toString(Qt.DateFormat.ISODate),
+            "retired_date": self.retired_date_edit.value(),
+            "mirror_date": self.mirror_date_edit.value() if self.mirror_check.isChecked() else None,
+            "master_volume_id": int(master_volume_id)
+            if self.mirror_check.isChecked() and master_volume_id is not None
+            else None,
+        }
+        return self.name_edit.text().strip(), self.path_edit.text().strip(), register
+
+    def validate_form(self) -> str | None:
+        name, _source_path, register = self.values()
+        if not name:
+            return "Enter a volume name."
+
+        existing_name_id = self.existing_names.get(name.casefold())
+        if existing_name_id is not None and existing_name_id != self.current_volume_id:
+            return "Volume names must be unique within the catalogue."
+
+        drive_id = register["drive_id"]
+        if not is_valid_drive_id(drive_id):
+            return "Drive ID must use the format AID- followed by at least three digits."
+
+        existing_drive_id = self.existing_drive_ids.get(str(drive_id).casefold())
+        if existing_drive_id is not None and existing_drive_id != self.current_volume_id:
+            return "Drive IDs must be unique within the catalogue."
+
+        earliest = register["earliest_content_date"]
+        latest = register["latest_content_date"]
+        if earliest and latest and earliest > latest:
+            return "Earliest Content Date cannot be after Latest Content Date."
+
+        date_added = register["date_added"]
+        retired_date = register["retired_date"]
+        if retired_date and retired_date < date_added:
+            return "Retired Date cannot be before Date Added."
+
+        mirror_date = register["mirror_date"]
+        if mirror_date and mirror_date < date_added:
+            return "Mirror Date cannot be before Date Added."
+
+        if self.mirror_check.isChecked():
+            master_volume_id = register["master_volume_id"]
+            if master_volume_id is None:
+                return "Select the non-mirror master drive."
+            if master_volume_id == self.current_volume_id:
+                return "A volume cannot mirror itself."
+            if self.mirror_dependents:
+                return "This volume is already a master drive. Remove its mirror relationships before marking it as a mirror."
+
+        return None
 
     def accept(self) -> None:
-        name, source_path = self.values()
-        if not name or not source_path:
-            QMessageBox.warning(self, "Missing Details", "Enter a volume name and source path.")
+        message = self.validate_form()
+        if message is not None:
+            self.validation_label.setText(message)
             return
         super().accept()
 
@@ -871,22 +1199,25 @@ class MainWindow(QMainWindow):
         self.volume_table = QTableView()
         self.volume_table.setModel(self.volume_model)
         self.configure_table_view(self.volume_table)
-        self.volume_table.setItemDelegateForColumn(2, self.volume_full_delegate)
+        self.volume_table.setItemDelegateForColumn(6, self.volume_full_delegate)
         self.volume_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.volume_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         QTimer.singleShot(
             0,
             lambda: self.apply_table_default_columns(
                 self.volume_table,
-                {1: 95, 2: 95, 3: 80, 4: 85, 5: 145},
+                {1: 150, 2: 105, 3: 95, 4: 110, 5: 95, 6: 80, 7: 80, 8: 145},
             ),
         )
 
+        self.volume_filter_edit = QLineEdit()
+        self.volume_filter_edit.setPlaceholderText("Filter volumes by ID, name, status, condition, description, or connector")
         self.add_button = QPushButton("New Volume")
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(QLabel("Volumes"))
+        left_layout.addWidget(self.volume_filter_edit)
         left_layout.addWidget(self.volume_table, 1)
         left_layout.addWidget(self.add_button)
 
@@ -920,38 +1251,55 @@ class MainWindow(QMainWindow):
 
     def _build_details_box(self) -> QGroupBox:
         box = QGroupBox("Volume Details")
-        self.detail_name = QLabel("-")
-        self.detail_path = QLabel("-")
-        self.detail_status = QLabel("-")
-        self.detail_capacity = QLabel("-")
-        self.detail_used = QLabel("-")
-        self.detail_free = QLabel("-")
-        self.detail_files = QLabel("-")
-        self.detail_folders = QLabel("-")
-        self.detail_last_scan = QLabel("-")
+        self.detail_labels: dict[str, QLabel] = {}
         self.detail_full = QProgressBar()
         self.detail_full.setRange(0, 100)
         self.detail_full.setFormat("%p% full")
+        self.detail_description = QPlainTextEdit()
+        self.detail_description.setReadOnly(True)
+        self.detail_description.setMaximumHeight(76)
 
         grid = QGridLayout(box)
         labels = [
-            ("Name", self.detail_name),
-            ("Path", self.detail_path),
-            ("Status", self.detail_status),
-            ("Capacity", self.detail_capacity),
-            ("Used", self.detail_used),
-            ("Free", self.detail_free),
-            ("Files", self.detail_files),
-            ("Folders", self.detail_folders),
-            ("Last scan", self.detail_last_scan),
+            ("drive_id", "Drive ID"),
+            ("name", "Name"),
+            ("path", "Scan Path"),
+            ("connection", "Connection"),
+            ("register_status", "Status"),
+            ("condition", "Condition"),
+            ("connector", "Connector"),
+            ("mirror", "Mirror Drive"),
+            ("master", "Master Drive"),
+            ("date_added", "Date Added"),
+            ("earliest_content_date", "Earliest Content"),
+            ("latest_content_date", "Latest Content"),
+            ("retired_date", "Retired Date"),
+            ("mirror_date", "Mirror Date"),
+            ("capacity", "Capacity"),
+            ("used", "Used"),
+            ("free", "Free"),
+            ("files", "Files"),
+            ("folders", "Folders"),
+            ("last_scan", "Last Scan"),
         ]
-        for index, (label, widget) in enumerate(labels):
-            row = index // 3
-            col = (index % 3) * 2
+        for index, (key, label) in enumerate(labels):
+            widget = QLabel("-")
+            widget.setWordWrap(key in {"path", "master"})
+            widget.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            self.detail_labels[key] = widget
+            row = index // 2
+            col = (index % 2) * 2
             grid.addWidget(QLabel(label), row, col)
             grid.addWidget(widget, row, col + 1)
-        grid.addWidget(QLabel("Full"), 3, 0)
-        grid.addWidget(self.detail_full, 3, 1, 1, 5)
+        full_row = (len(labels) + 1) // 2
+        grid.addWidget(QLabel("Full"), full_row, 0)
+        grid.addWidget(self.detail_full, full_row, 1, 1, 3)
+        description_row = full_row + 1
+        grid.addWidget(QLabel("Description"), description_row, 0)
+        grid.addWidget(self.detail_description, description_row, 1, 1, 3)
         return box
 
     def _build_browser_tab(self) -> QWidget:
@@ -1073,6 +1421,7 @@ class MainWindow(QMainWindow):
         self.welcome_new_button.clicked.connect(self.new_catalogue)
         self.welcome_open_button.clicked.connect(self.open_catalogue_from_dialog)
         self.add_button.clicked.connect(self.add_volume)
+        self.volume_filter_edit.textChanged.connect(lambda _text: self.refresh_volumes())
         self.volume_table.selectionModel().selectionChanged.connect(self.on_volume_selection_changed)
         self.volume_table.customContextMenuRequested.connect(self.show_volume_context_menu)
         self.volume_table.doubleClicked.connect(self.edit_volume_index)
@@ -1093,7 +1442,7 @@ class MainWindow(QMainWindow):
         self.refresh_action.triggered.connect(self.refresh_volumes)
         self.addAction(self.refresh_action)
         self.catalogue_actions = [self.close_catalogue_action, self.refresh_action]
-        self.catalogue_widgets = [self.add_button, self.search_edit, self.search_button]
+        self.catalogue_widgets = [self.add_button, self.volume_filter_edit, self.search_edit, self.search_button]
 
         self.add_browser_shortcut(QKeySequence("Backspace"), self.navigate_parent_folder)
         self.add_browser_shortcut(QKeySequence("Alt+Up"), self.navigate_parent_folder)
@@ -1286,6 +1635,7 @@ class MainWindow(QMainWindow):
         self.volume_model.set_items([])
         self.browser_model.set_items([])
         self.search_model.set_items([])
+        self.volume_filter_edit.clear()
         self.search_edit.clear()
         self.scan_log.clear()
         self.show_volume_details(None)
@@ -1317,22 +1667,38 @@ class MainWindow(QMainWindow):
             return
         selected_id = self.selected_volume_id() or self.current_volume_id
         volumes = self.db.list_volumes()
-        items = [
+        all_items = [
             VolumeItem(
                 id=volume["id"],
+                drive_id=volume["drive_id"] or "",
                 name=volume["name"],
                 source_path=volume["source_path"],
+                register_status=volume["register_status"],
+                condition=volume["condition"],
+                description=volume["description"] or "",
+                connector=volume["connector"],
+                is_mirror=bool(volume["is_mirror"]),
+                master_volume_id=volume["master_volume_id"],
+                master_drive_id=volume["master_drive_id"],
+                master_name=volume["master_name"],
+                date_added=volume["date_added"],
+                earliest_content_date=volume["earliest_content_date"],
+                latest_content_date=volume["latest_content_date"],
+                retired_date=volume["retired_date"],
+                mirror_date=volume["mirror_date"],
                 capacity_bytes=volume["capacity_bytes"],
                 used_bytes=volume["used_bytes"],
                 free_bytes=volume["free_bytes"],
                 indexed_file_count=volume["indexed_file_count"],
                 indexed_folder_count=volume["indexed_folder_count"],
                 last_scan_at=volume["last_scan_at"],
-                connected=Path(volume["source_path"]).exists(),
+                connected=source_path_exists(volume["source_path"]),
                 percent_full=percentage_full(volume["used_bytes"], volume["capacity_bytes"]),
             )
             for volume in volumes
         ]
+        filter_text = self.volume_filter_edit.text() if hasattr(self, "volume_filter_edit") else ""
+        items = [item for item in all_items if volume_matches_filter(item, filter_text)]
         self.volume_model.set_items(items)
 
         if items:
@@ -1340,7 +1706,7 @@ class MainWindow(QMainWindow):
             target_id = selected_id if selected_id in visible_ids else self.volume_model.items[0].id
             if self.select_volume(target_id):
                 self.show_selected_volume(target_id)
-        elif not volumes:
+        else:
             self.show_selected_volume(None)
 
     def selected_volume_id(self) -> int | None:
@@ -1368,7 +1734,7 @@ class MainWindow(QMainWindow):
         self.volume_table.selectRow(index.row())
         self.volume_table.setCurrentIndex(self.volume_model.index(index.row(), 0))
         volume = self.selected_volume()
-        connected = bool(volume and Path(volume["source_path"]).exists())
+        connected = bool(volume and source_path_exists(volume["source_path"]))
         scan_running = self.scan_worker is not None
 
         new_action = menu.addAction("New Volume")
@@ -1413,47 +1779,63 @@ class MainWindow(QMainWindow):
 
     def show_volume_details(self, volume) -> None:
         if volume is None:
-            values = ["-"] * 9
-            widgets = [
-                self.detail_name,
-                self.detail_path,
-                self.detail_status,
-                self.detail_capacity,
-                self.detail_used,
-                self.detail_free,
-                self.detail_files,
-                self.detail_folders,
-                self.detail_last_scan,
-            ]
-            for widget, value in zip(widgets, values):
-                widget.setText(value)
+            for widget in self.detail_labels.values():
+                widget.setText("-")
+            self.detail_description.clear()
             self.detail_full.setValue(0)
             return
 
-        connected = Path(volume["source_path"]).exists()
+        connected = source_path_exists(volume["source_path"])
         full = percentage_full(volume["used_bytes"], volume["capacity_bytes"])
-        self.detail_name.setText(volume["name"])
-        self.detail_path.setText(volume["source_path"])
-        self.detail_status.setText("Connected" if connected else "Offline")
-        self.detail_capacity.setText(format_size(volume["capacity_bytes"]))
-        self.detail_used.setText(format_size(volume["used_bytes"]))
-        self.detail_free.setText(format_size(volume["free_bytes"]))
-        self.detail_files.setText(str(volume["indexed_file_count"]))
-        self.detail_folders.setText(str(volume["indexed_folder_count"]))
-        self.detail_last_scan.setText(self._display_time(volume["last_scan_at"]))
+        values = {
+            "drive_id": volume["drive_id"] or "-",
+            "name": volume["name"],
+            "path": volume["source_path"] or "-",
+            "connection": "Connected" if connected else "Offline",
+            "register_status": volume["register_status"],
+            "condition": volume["condition"],
+            "connector": volume["connector"],
+            "mirror": "Yes" if volume["is_mirror"] else "No",
+            "master": volume_reference(volume["master_drive_id"], volume["master_name"])
+            if volume["master_volume_id"] is not None
+            else "-",
+            "date_added": display_db_date(volume["date_added"]),
+            "earliest_content_date": display_db_date(volume["earliest_content_date"]),
+            "latest_content_date": display_db_date(volume["latest_content_date"]),
+            "retired_date": display_db_date(volume["retired_date"]),
+            "mirror_date": display_db_date(volume["mirror_date"]),
+            "capacity": format_size(volume["capacity_bytes"]),
+            "used": format_size(volume["used_bytes"]),
+            "free": format_size(volume["free_bytes"]),
+            "files": str(volume["indexed_file_count"]),
+            "folders": str(volume["indexed_folder_count"]),
+            "last_scan": self._display_time(volume["last_scan_at"]),
+        }
+        for key, value in values.items():
+            self.detail_labels[key].setText(value)
+        self.detail_description.setPlainText(volume["description"] or "")
         self.detail_full.setValue(full)
 
     def add_volume(self) -> None:
         if self.db is None:
             return
-        dialog = VolumeDialog(self, "New Volume")
+        dialog = VolumeDialog(
+            self,
+            "New Volume",
+            suggested_drive_id=self.db.next_drive_id(),
+            master_options=self.db.list_master_volume_options(),
+            existing_volumes=self.db.list_volumes(),
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        name, source_path = dialog.values()
+        name, source_path, register = dialog.values()
+        if source_path and (not register["earliest_content_date"] or not register["latest_content_date"]):
+            dialog.apply_content_date_guess(source_path)
+            name, source_path, register = dialog.values()
         try:
-            volume_id = self.db.create_volume(name, source_path)
-            path = Path(source_path)
-            if path.exists():
+            volume_id = self.db.create_volume(name, source_path, register)
+            path = Path(source_path) if source_path else None
+            if path is not None and path.exists():
                 try:
                     capacity, used, free = get_storage_stats(path)
                     self.db.update_volume_storage(volume_id, capacity, used, free)
@@ -1474,12 +1856,19 @@ class MainWindow(QMainWindow):
         volume = self.selected_volume()
         if volume is None:
             return
-        dialog = VolumeDialog(self, "Edit Volume", volume["name"], volume["source_path"])
+        dialog = VolumeDialog(
+            self,
+            "Edit Volume",
+            volume=volume,
+            master_options=self.db.list_master_volume_options(volume["id"]),
+            mirror_dependents=self.db.list_mirror_dependents(volume["id"]),
+            existing_volumes=self.db.list_volumes(),
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        name, source_path = dialog.values()
+        name, source_path, register = dialog.values()
         try:
-            self.db.update_volume(volume["id"], name, source_path)
+            self.db.update_volume(volume["id"], name, source_path, register)
             self.refresh_volumes()
             self.statusBar().showMessage("Volume updated.", 4000)
         except Exception as exc:
@@ -1500,10 +1889,21 @@ class MainWindow(QMainWindow):
         volume = self.selected_volume()
         if volume is None:
             return
+        dependents = self.db.list_mirror_dependents(volume["id"])
+        if dependents:
+            names = "\n".join(f"- {volume_reference(row['drive_id'], row['name'])}" for row in dependents)
+            QMessageBox.warning(
+                self,
+                "Cannot Delete Master Drive",
+                "This volume is selected as the master drive for:\n\n"
+                f"{names}\n\nRemove those mirror relationships before deleting it.",
+            )
+            return
+        display_name = volume["drive_id"] or volume["name"]
         answer = QMessageBox.question(
             self,
             "Delete Volume",
-            f"Delete catalogue volume '{volume['name']}' and all indexed records?",
+            f"Delete {display_name}?\n\nThis will delete the volume and all indexed records.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -1539,7 +1939,7 @@ class MainWindow(QMainWindow):
         volume = self.selected_volume()
         if volume is None:
             return
-        if not Path(volume["source_path"]).exists():
+        if not source_path_exists(volume["source_path"]):
             QMessageBox.warning(self, "Volume Offline", "The source path is not currently connected.")
             return
 
@@ -1634,7 +2034,7 @@ class MainWindow(QMainWindow):
         volume = self.db.get_volume(volume_id)
         if volume is None:
             return
-        connected = Path(volume["source_path"]).exists()
+        connected = source_path_exists(volume["source_path"])
         self.offline_label.setText(
             "" if connected else "This volume is offline. Showing the saved catalogue."
         )
@@ -1983,6 +2383,8 @@ class MainWindow(QMainWindow):
         volume = self.db.get_volume(self.current_volume_id)
         if volume is None:
             return None
+        if not volume["source_path"]:
+            return None
         return self.real_path_for(volume, item.relative_path)
 
     def real_path_for(self, volume, relative_path: str) -> Path:
@@ -2034,7 +2436,7 @@ class MainWindow(QMainWindow):
                 modified_at=result["modified_at"],
                 missing=bool(result["missing"]),
                 source_path=result["source_path"],
-                connected=Path(result["source_path"]).exists(),
+                connected=source_path_exists(result["source_path"]),
             )
             for result in self.db.search(query)
         ]
@@ -2060,6 +2462,8 @@ class MainWindow(QMainWindow):
             return None
         volume = self.db.get_volume(item.volume_id)
         if volume is None:
+            return None
+        if not volume["source_path"]:
             return None
         return self.real_path_for(volume, item.relative_path)
 

@@ -56,6 +56,12 @@ class VolumeScanner:
         if volume is None:
             raise ValueError(f"Volume does not exist: {volume_id}")
 
+        if not volume["source_path"]:
+            message = "Source path is not set for this volume."
+            scan_id = self.db.start_scan(volume_id)
+            self.db.finish_scan(scan_id, "failed", 0, 0, 0, message)
+            return ScanResult("failed", 0, 0, 0, message)
+
         root = Path(volume["source_path"])
         scan_id = self.db.start_scan(volume_id)
         scanned_at = utc_now()
@@ -203,6 +209,7 @@ class VolumeScanner:
                         ),
                     )
                     self.db.refresh_volume_counts(volume_id, scanned_at)
+                    self.db.update_volume_content_dates_from_index(volume_id)
                 else:
                     self.db.refresh_volume_counts(volume_id)
 

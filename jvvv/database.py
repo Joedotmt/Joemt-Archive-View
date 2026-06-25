@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CATALOGUE_EXTENSION = ".jvvv"
+DRIVE_ID_RE = re.compile(r"^AID-\d{3,}$")
+ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
+VOLUME_CONDITIONS = ["New", "Good", "Fair", "Poor", "Damaged", "Failed", "Unknown"]
+CONNECTOR_OPTIONS = ["USB-B", "USB-Micro-B", "USB-Mini", "USB-C", "Network", "Other", "Unknown"]
 SQLITE_INTEGER_MIN = -(2**63)
 SQLITE_INTEGER_MAX = 2**63 - 1
 UINT64_MODULUS = 2**64
 UINT64_MAX = UINT64_MODULUS - 1
-REQUIRED_TABLES = {"volumes", "folders", "files", "scan_history", "scan_errors"}
+REQUIRED_TABLES = {"volumes", "volume_register", "folders", "files", "scan_history", "scan_errors"}
 REQUIRED_COLUMNS = {
     "volumes": {
         "id",
@@ -28,6 +33,23 @@ REQUIRED_COLUMNS = {
         "indexed_file_count",
         "indexed_folder_count",
         "last_scan_at",
+        "created_at",
+        "updated_at",
+    },
+    "volume_register": {
+        "volume_id",
+        "drive_id",
+        "is_mirror",
+        "status",
+        "condition",
+        "description",
+        "earliest_content_date",
+        "latest_content_date",
+        "connector",
+        "date_added",
+        "retired_date",
+        "mirror_date",
+        "master_volume_id",
         "created_at",
         "updated_at",
     },
@@ -119,6 +141,38 @@ def parse_db_time(value: str | None) -> datetime | None:
         return datetime.strptime(value, ISO_FORMAT)
     except ValueError:
         return None
+
+
+def is_valid_drive_id(value: str) -> bool:
+    return bool(DRIVE_ID_RE.fullmatch(value.strip()))
+
+
+def drive_id_sequence(value: str | None) -> int | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not is_valid_drive_id(text):
+        return None
+    return int(text[4:])
+
+
+def drive_id_sort_key(value: str | None) -> tuple[int, int, str]:
+    sequence = drive_id_sequence(value)
+    if sequence is None:
+        return (1, 0, (value or "").casefold())
+    return (0, sequence, value or "")
+
+
+def validate_iso_date(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"Invalid date: {text}") from exc
 
 
 def normalize_identity_integer(value: int | None) -> int | None:
@@ -216,6 +270,9 @@ class Database:
                 if version < 2:
                     self._apply_migration_2()
                     version = 2
+                if version < 3:
+                    self._apply_migration_3()
+                    version = 3
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
@@ -380,6 +437,56 @@ class Database:
         for statement in statements:
             self.connection.execute(statement)
 
+    def _apply_migration_3(self) -> None:
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS volume_register (
+                volume_id INTEGER PRIMARY KEY REFERENCES volumes(id) ON DELETE CASCADE,
+                drive_id TEXT UNIQUE COLLATE NOCASE,
+                is_mirror INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'Archive',
+                condition TEXT NOT NULL DEFAULT 'Unknown',
+                description TEXT NOT NULL DEFAULT '',
+                earliest_content_date TEXT,
+                latest_content_date TEXT,
+                connector TEXT NOT NULL DEFAULT 'Unknown',
+                date_added TEXT NOT NULL,
+                retired_date TEXT,
+                mirror_date TEXT,
+                master_volume_id INTEGER REFERENCES volumes(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (is_mirror IN (0, 1))
+            )
+            """
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_volume_register_status ON volume_register(status COLLATE NOCASE)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_volume_register_condition ON volume_register(condition COLLATE NOCASE)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_volume_register_connector ON volume_register(connector COLLATE NOCASE)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_volume_register_master ON volume_register(master_volume_id)"
+        )
+
+        existing = list(
+            self.connection.execute(
+                """
+                SELECT v.id
+                FROM volumes v
+                LEFT JOIN volume_register r ON r.volume_id = v.id
+                WHERE r.volume_id IS NULL
+                ORDER BY v.id
+                """
+            )
+        )
+        for row in existing:
+            self._insert_default_volume_register(self.connection, int(row["id"]))
+
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column not in self._column_names(table):
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -397,20 +504,275 @@ class Database:
             self.connection.rollback()
             raise
 
-    def create_volume(self, name: str, source_path: str) -> int:
+    def _normalize_source_path(self, source_path: str) -> str:
+        text = source_path.strip()
+        if not text:
+            return ""
+        return str(Path(text).expanduser())
+
+    def _volume_select_sql(self, where: str = "") -> str:
+        return f"""
+            SELECT
+                v.*,
+                r.drive_id,
+                r.is_mirror,
+                r.status AS register_status,
+                r.condition,
+                r.description,
+                r.earliest_content_date,
+                r.latest_content_date,
+                r.connector,
+                r.date_added,
+                r.retired_date,
+                r.mirror_date,
+                r.master_volume_id,
+                master.name AS master_name,
+                master_register.drive_id AS master_drive_id
+            FROM volumes v
+            JOIN volume_register r ON r.volume_id = v.id
+            LEFT JOIN volumes master ON master.id = r.master_volume_id
+            LEFT JOIN volume_register master_register ON master_register.volume_id = master.id
+            {where}
+        """
+
+    def next_drive_id(self, conn: sqlite3.Connection | None = None) -> str:
+        db = conn or self.connection
+        highest = 0
+        for row in db.execute("SELECT drive_id FROM volume_register WHERE drive_id IS NOT NULL"):
+            sequence = drive_id_sequence(row["drive_id"])
+            if sequence is not None:
+                highest = max(highest, sequence)
+        return f"AID-{highest + 1:03d}"
+
+    def _insert_default_volume_register(self, conn: sqlite3.Connection, volume_id: int) -> None:
         now = utc_now()
-        source = str(Path(source_path).expanduser())
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO volume_register (
+                volume_id, drive_id, status, condition, description, connector,
+                date_added, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, '', ?, ?, ?, ?)
+            """,
+            (
+                volume_id,
+                self.next_drive_id(conn),
+                ARCHIVE_STATUSES[0],
+                "Unknown",
+                "Unknown",
+                date.today().isoformat(),
+                now,
+                now,
+            ),
+        )
+
+    def _coerce_volume_register(
+        self,
+        conn: sqlite3.Connection,
+        register: dict[str, Any],
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "drive_id": self.next_drive_id(conn),
+            "is_mirror": False,
+            "status": ARCHIVE_STATUSES[0],
+            "condition": "Unknown",
+            "description": "",
+            "earliest_content_date": None,
+            "latest_content_date": None,
+            "connector": "Unknown",
+            "date_added": date.today().isoformat(),
+            "retired_date": None,
+            "mirror_date": None,
+            "master_volume_id": None,
+        }
+        data.update(register)
+
+        drive_id = str(data.get("drive_id") or "").strip()
+        if not is_valid_drive_id(drive_id):
+            raise ValueError("Drive ID must use the format AID- followed by at least three digits.")
+        data["drive_id"] = drive_id
+
+        status = str(data.get("status") or "").strip()
+        if status not in ARCHIVE_STATUSES:
+            raise ValueError(f"Unsupported volume status: {status}")
+        data["status"] = status
+
+        condition = str(data.get("condition") or "").strip()
+        if condition not in VOLUME_CONDITIONS:
+            raise ValueError(f"Unsupported volume condition: {condition}")
+        data["condition"] = condition
+
+        connector = str(data.get("connector") or "").strip() or "Unknown"
+        data["connector"] = connector
+        data["description"] = str(data.get("description") or "")
+
+        data["earliest_content_date"] = validate_iso_date(data.get("earliest_content_date"))
+        data["latest_content_date"] = validate_iso_date(data.get("latest_content_date"))
+        data["date_added"] = validate_iso_date(data.get("date_added")) or date.today().isoformat()
+        data["retired_date"] = validate_iso_date(data.get("retired_date"))
+        data["mirror_date"] = validate_iso_date(data.get("mirror_date"))
+
+        if (
+            data["earliest_content_date"] is not None
+            and data["latest_content_date"] is not None
+            and data["earliest_content_date"] > data["latest_content_date"]
+        ):
+            raise ValueError("Earliest Content Date cannot be after Latest Content Date.")
+        if data["retired_date"] is not None and data["retired_date"] < data["date_added"]:
+            raise ValueError("Retired Date cannot be before Date Added.")
+        if data["mirror_date"] is not None and data["mirror_date"] < data["date_added"]:
+            raise ValueError("Mirror Date cannot be before Date Added.")
+
+        data["is_mirror"] = 1 if bool(data.get("is_mirror")) else 0
+        if data["is_mirror"]:
+            master_volume_id = data.get("master_volume_id")
+            data["master_volume_id"] = int(master_volume_id) if master_volume_id is not None else None
+        else:
+            data["master_volume_id"] = None
+            data["mirror_date"] = None
+
+        return data
+
+    def _validate_volume_register(
+        self,
+        conn: sqlite3.Connection,
+        volume_id: int,
+        data: dict[str, Any],
+    ) -> None:
+        if data["is_mirror"]:
+            master_volume_id = data["master_volume_id"]
+            if master_volume_id is None:
+                raise ValueError("Mirror drives must have a master drive.")
+            if int(master_volume_id) == int(volume_id):
+                raise ValueError("A volume cannot mirror itself.")
+
+            master = conn.execute(
+                """
+                SELECT v.id, r.is_mirror
+                FROM volumes v
+                JOIN volume_register r ON r.volume_id = v.id
+                WHERE v.id = ?
+                """,
+                (master_volume_id,),
+            ).fetchone()
+            if master is None:
+                raise ValueError("The selected master drive does not exist.")
+            if bool(master["is_mirror"]):
+                raise ValueError("Mirror drives cannot be selected as master drives.")
+            if self._mirror_relationship_would_cycle(conn, volume_id, int(master_volume_id)):
+                raise ValueError("Circular mirror relationships are not allowed.")
+
+            dependents = self._list_mirror_dependents(conn, volume_id)
+            if dependents:
+                raise ValueError(
+                    "This volume is already a master drive. Remove its mirror relationships before marking it as a mirror."
+                )
+
+    def _mirror_relationship_would_cycle(
+        self,
+        conn: sqlite3.Connection,
+        volume_id: int,
+        master_volume_id: int,
+    ) -> bool:
+        seen = {int(volume_id)}
+        current = int(master_volume_id)
+        while current:
+            if current in seen:
+                return True
+            seen.add(current)
+            row = conn.execute(
+                "SELECT master_volume_id FROM volume_register WHERE volume_id = ?",
+                (current,),
+            ).fetchone()
+            if row is None or row["master_volume_id"] is None:
+                return False
+            current = int(row["master_volume_id"])
+        return False
+
+    def _upsert_volume_register(
+        self,
+        conn: sqlite3.Connection,
+        volume_id: int,
+        register: dict[str, Any],
+    ) -> None:
+        data = self._coerce_volume_register(conn, register)
+        self._validate_volume_register(conn, volume_id, data)
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO volume_register (
+                volume_id, drive_id, is_mirror, status, condition, description,
+                earliest_content_date, latest_content_date, connector, date_added,
+                retired_date, mirror_date, master_volume_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(volume_id) DO UPDATE SET
+                drive_id = excluded.drive_id,
+                is_mirror = excluded.is_mirror,
+                status = excluded.status,
+                condition = excluded.condition,
+                description = excluded.description,
+                earliest_content_date = excluded.earliest_content_date,
+                latest_content_date = excluded.latest_content_date,
+                connector = excluded.connector,
+                date_added = excluded.date_added,
+                retired_date = excluded.retired_date,
+                mirror_date = excluded.mirror_date,
+                master_volume_id = excluded.master_volume_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                volume_id,
+                data["drive_id"],
+                data["is_mirror"],
+                data["status"],
+                data["condition"],
+                data["description"],
+                data["earliest_content_date"],
+                data["latest_content_date"],
+                data["connector"],
+                data["date_added"],
+                data["retired_date"],
+                data["mirror_date"],
+                data["master_volume_id"],
+                now,
+                now,
+            ),
+        )
+
+    def create_volume(
+        self,
+        name: str,
+        source_path: str = "",
+        register: dict[str, Any] | None = None,
+    ) -> int:
+        now = utc_now()
+        source = self._normalize_source_path(source_path)
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Volume name is required.")
         with self.transaction() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO volumes (name, source_path, created_at, updated_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (name.strip(), source, now, now),
+                (clean_name, source, now, now),
             )
-            return int(cur.lastrowid)
+            volume_id = int(cur.lastrowid)
+            self._upsert_volume_register(conn, volume_id, register or {})
+            return volume_id
 
-    def update_volume(self, volume_id: int, name: str, source_path: str) -> None:
+    def update_volume(
+        self,
+        volume_id: int,
+        name: str,
+        source_path: str,
+        register: dict[str, Any] | None = None,
+    ) -> None:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Volume name is required.")
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -418,28 +780,126 @@ class Database:
                 SET name = ?, source_path = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (name.strip(), str(Path(source_path).expanduser()), utc_now(), volume_id),
+                (clean_name, self._normalize_source_path(source_path), utc_now(), volume_id),
             )
+            if register is not None:
+                self._upsert_volume_register(conn, volume_id, register)
 
     def delete_volume(self, volume_id: int) -> None:
         with self.transaction() as conn:
+            dependents = self._list_mirror_dependents(conn, volume_id)
+            if dependents:
+                names = ", ".join(self.volume_reference(row) for row in dependents)
+                raise CatalogueError(
+                    f"This volume is selected as the master drive for: {names}. "
+                    "Remove those mirror relationships before deleting it."
+                )
             conn.execute("DELETE FROM volumes WHERE id = ?", (volume_id,))
 
     def get_volume(self, volume_id: int) -> sqlite3.Row | None:
         return self.connection.execute(
-            "SELECT * FROM volumes WHERE id = ?", (volume_id,)
+            self._volume_select_sql("WHERE v.id = ?"),
+            (volume_id,),
         ).fetchone()
 
     def list_volumes(self) -> list[sqlite3.Row]:
         return list(
             self.connection.execute(
-                "SELECT * FROM volumes ORDER BY name COLLATE NOCASE"
+                self._volume_select_sql("ORDER BY v.name COLLATE NOCASE")
             )
         )
 
+    def upsert_volume_register(self, volume_id: int, register: dict[str, Any]) -> None:
+        with self.transaction() as conn:
+            self._upsert_volume_register(conn, volume_id, register)
+
+    def _list_mirror_dependents(
+        self,
+        conn: sqlite3.Connection,
+        volume_id: int,
+    ) -> list[sqlite3.Row]:
+        return list(
+            conn.execute(
+                """
+                SELECT v.id, v.name, r.drive_id
+                FROM volume_register r
+                JOIN volumes v ON v.id = r.volume_id
+                WHERE r.master_volume_id = ?
+                ORDER BY r.drive_id COLLATE NOCASE, v.name COLLATE NOCASE
+                """,
+                (volume_id,),
+            )
+        )
+
+    def list_mirror_dependents(self, volume_id: int) -> list[sqlite3.Row]:
+        return self._list_mirror_dependents(self.connection, volume_id)
+
+    def list_master_volume_options(self, current_volume_id: int | None = None) -> list[sqlite3.Row]:
+        params: tuple[object, ...]
+        where = "WHERE r.is_mirror = 0"
+        if current_volume_id is not None:
+            where += " AND v.id != ?"
+            params = (current_volume_id,)
+        else:
+            params = ()
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT v.id, v.name, r.drive_id
+                FROM volumes v
+                JOIN volume_register r ON r.volume_id = v.id
+                {where}
+                ORDER BY r.drive_id COLLATE NOCASE, v.name COLLATE NOCASE
+                """,
+                params,
+            )
+        )
+
+    def volume_reference(self, row: sqlite3.Row) -> str:
+        drive_id = row["drive_id"] if "drive_id" in row.keys() else None
+        name = row["name"] if "name" in row.keys() else row["volume_name"]
+        if drive_id and name:
+            return f"{drive_id} - {name}"
+        return drive_id or name or "Unnamed volume"
+
+    def update_volume_content_dates_from_index(self, volume_id: int) -> None:
+        row = self.connection.execute(
+            """
+            SELECT MIN(content_date) AS earliest, MAX(content_date) AS latest
+            FROM (
+                SELECT substr(modified_at, 1, 10) AS content_date
+                FROM files
+                WHERE volume_id = ?
+                  AND missing = 0
+                  AND modified_at IS NOT NULL
+                UNION ALL
+                SELECT substr(modified_at, 1, 10) AS content_date
+                FROM folders
+                WHERE volume_id = ?
+                  AND missing = 0
+                  AND modified_at IS NOT NULL
+            )
+            WHERE content_date IS NOT NULL
+            """,
+            (volume_id, volume_id),
+        ).fetchone()
+        if row is None:
+            return
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE volume_register
+                SET earliest_content_date = ?,
+                    latest_content_date = ?,
+                    updated_at = ?
+                WHERE volume_id = ?
+                """,
+                (row["earliest"], row["latest"], utc_now(), volume_id),
+            )
+
     def volume_is_connected(self, volume: sqlite3.Row | int) -> bool:
         row = self.get_volume(volume) if isinstance(volume, int) else volume
-        return bool(row and Path(row["source_path"]).exists())
+        return bool(row and row["source_path"] and Path(row["source_path"]).exists())
 
     def update_volume_storage(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import sqlite3
 
 import pytest
@@ -23,7 +24,8 @@ def test_database_initializes_schema(tmp_path):
             )
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert "volume_register" in tables
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 3
         folder_columns = {
             row["name"]
             for row in db.connection.execute("PRAGMA table_info(folders)")
@@ -36,6 +38,19 @@ def test_database_initializes_schema(tmp_path):
             "direct_subfolder_count",
             "stats_updated_at",
         } <= folder_columns
+        register_columns = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA table_info(volume_register)")
+        }
+        assert {
+            "drive_id",
+            "status",
+            "condition",
+            "description",
+            "connector",
+            "date_added",
+            "master_volume_id",
+        } <= register_columns
     finally:
         db.close()
 
@@ -72,15 +87,27 @@ def test_volume_crud(tmp_path):
         assert volume is not None
         assert volume["name"] == "Archive"
         assert volume["source_path"] == str(tmp_path)
+        assert volume["drive_id"] == "AID-001"
+        assert volume["register_status"] == "Archive"
+        assert volume["date_added"] == date.today().isoformat()
 
-        db.update_volume(volume_id, "Renamed", str(tmp_path / "other"))
+        db.update_volume(
+            volume_id,
+            "Renamed",
+            str(tmp_path / "other"),
+            {"drive_id": "AID-042", "status": "Maintenance", "condition": "Good"},
+        )
         volume = db.get_volume(volume_id)
         assert volume["name"] == "Renamed"
         assert volume["source_path"] == str(tmp_path / "other")
+        assert volume["drive_id"] == "AID-042"
+        assert volume["register_status"] == "Maintenance"
+        assert volume["condition"] == "Good"
 
         db.delete_volume(volume_id)
         assert db.get_volume(volume_id) is None
         assert count_rows(db, "volumes") == 0
+        assert count_rows(db, "volume_register") == 0
     finally:
         db.close()
 
@@ -95,6 +122,59 @@ def test_duplicate_volume_names_are_rejected(tmp_path):
         db.close()
 
 
+def test_next_drive_id_uses_highest_existing_aid_sequence(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        db.create_volume("First", str(tmp_path), {"drive_id": "AID-001"})
+        db.create_volume("Large", str(tmp_path), {"drive_id": "AID-1250"})
+        assert db.next_drive_id() == "AID-1251"
+
+        volume_id = db.create_volume("Next", str(tmp_path))
+        volume = db.get_volume(volume_id)
+        assert volume["drive_id"] == "AID-1251"
+    finally:
+        db.close()
+
+
+def test_mirror_relationships_are_validated_and_block_master_deletion(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        master_id = db.create_volume("Master", str(tmp_path), {"drive_id": "AID-001"})
+        mirror_id = db.create_volume(
+            "Mirror",
+            str(tmp_path),
+            {
+                "drive_id": "AID-002",
+                "is_mirror": True,
+                "master_volume_id": master_id,
+                "mirror_date": "2026-06-25",
+            },
+        )
+
+        mirror = db.get_volume(mirror_id)
+        assert mirror["is_mirror"] == 1
+        assert mirror["master_volume_id"] == master_id
+        assert mirror["master_drive_id"] == "AID-001"
+
+        with pytest.raises(ValueError):
+            db.upsert_volume_register(
+                master_id,
+                {"drive_id": "AID-001", "is_mirror": True, "master_volume_id": mirror_id},
+            )
+
+        with pytest.raises(Exception):
+            db.delete_volume(master_id)
+
+        db.upsert_volume_register(
+            mirror_id,
+            {"drive_id": "AID-002", "is_mirror": False, "status": "Archive", "condition": "Unknown"},
+        )
+        db.delete_volume(master_id)
+        assert db.get_volume(master_id) is None
+    finally:
+        db.close()
+
+
 def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
     path = tmp_path / "catalogue.jvvv"
     db = Database(path, initialize=False)
@@ -102,7 +182,14 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
         with db.transaction() as conn:
             db._apply_migration_1()
             conn.execute("PRAGMA user_version = 1")
-            volume_id = db.create_volume("Archive", str(tmp_path))
+            now = "2026-06-25T12:00:00.000000+0000"
+            volume_id = conn.execute(
+                """
+                INSERT INTO volumes (name, source_path, created_at, updated_at)
+                VALUES ('Archive', ?, ?, ?)
+                """,
+                (str(tmp_path), now, now),
+            ).lastrowid
             folder_id = db.ensure_folder(
                 volume_id=volume_id,
                 parent_id=None,
@@ -125,7 +212,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 3
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
