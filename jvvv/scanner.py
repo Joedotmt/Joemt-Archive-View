@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import os
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from .database import Database, format_timestamp, utc_now
+
+
+ProgressCallback = Callable[[int, int, str], None]
+CancelCallback = Callable[[], bool]
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    status: str
+    files_seen: int
+    folders_seen: int
+    errors_count: int
+    message: str | None = None
+
+
+class ScanCancelled(Exception):
+    pass
+
+
+def normalize_relative_path(path: Path) -> str:
+    text = path.as_posix()
+    return "" if text == "." else text
+
+
+def get_storage_stats(path: Path) -> tuple[int, int, int]:
+    usage = shutil.disk_usage(path)
+    used = usage.total - usage.free
+    return usage.total, used, usage.free
+
+
+class VolumeScanner:
+    def __init__(
+        self,
+        db: Database,
+        progress_callback: ProgressCallback | None = None,
+        cancel_callback: CancelCallback | None = None,
+        batch_size: int = 500,
+    ) -> None:
+        self.db = db
+        self.progress_callback = progress_callback
+        self.cancel_callback = cancel_callback
+        self.batch_size = batch_size
+
+    def scan(self, volume_id: int, remove_deleted: bool = True) -> ScanResult:
+        volume = self.db.get_volume(volume_id)
+        if volume is None:
+            raise ValueError(f"Volume does not exist: {volume_id}")
+
+        root = Path(volume["source_path"])
+        scan_id = self.db.start_scan(volume_id)
+        scanned_at = utc_now()
+        files_seen = 0
+        folders_seen = 0
+        errors_count = 0
+        status = "completed"
+        message: str | None = None
+
+        if not root.exists():
+            message = f"Source path is not connected: {root}"
+            self.db.finish_scan(scan_id, "failed", 0, 0, 0, message)
+            return ScanResult("failed", 0, 0, 0, message)
+
+        try:
+            capacity, used, free = get_storage_stats(root)
+        except OSError:
+            capacity = used = free = 0
+
+        folder_ids: dict[str, int] = {}
+
+        try:
+            def on_walk_error(exc: OSError) -> None:
+                nonlocal errors_count
+                errors_count += 1
+                error_path = getattr(exc, "filename", "") or str(root)
+                try:
+                    relative = normalize_relative_path(Path(error_path).relative_to(root))
+                except ValueError:
+                    relative = str(error_path)
+                self.db.add_scan_error(scan_id, volume_id, relative, str(exc))
+
+            with self.db.transaction():
+                self.db.update_volume_storage(volume_id, capacity, used, free)
+                root_modified = self._modified_at(root)
+                root_id = self.db.ensure_folder(
+                    volume_id=volume_id,
+                    parent_id=None,
+                    name=root.name or str(root),
+                    relative_path="",
+                    scanned_at=scanned_at,
+                    modified_at=root_modified,
+                )
+                folder_ids[""] = root_id
+                folders_seen = 1
+                self._emit_progress(files_seen, folders_seen, str(root))
+
+                for current_root, dir_names, file_names in os.walk(root, topdown=True, onerror=on_walk_error):
+                    if self._cancelled():
+                        status = "cancelled"
+                        message = "Scan cancelled."
+                        break
+
+                    current_path = Path(current_root)
+                    rel_current = normalize_relative_path(current_path.relative_to(root))
+                    parent_folder_id = folder_ids.get(rel_current)
+                    if parent_folder_id is None:
+                        parent_rel = normalize_relative_path(current_path.parent.relative_to(root))
+                        parent_folder_id = folder_ids.get(parent_rel, root_id)
+
+                    accessible_dirs: list[str] = []
+                    for directory in sorted(dir_names, key=str.casefold):
+                        if self._cancelled():
+                            status = "cancelled"
+                            message = "Scan cancelled."
+                            break
+                        full_path = current_path / directory
+                        rel_path = normalize_relative_path(full_path.relative_to(root))
+                        try:
+                            stat = full_path.stat()
+                        except OSError as exc:
+                            errors_count += 1
+                            self.db.add_scan_error(scan_id, volume_id, rel_path, str(exc))
+                            continue
+
+                        folder_id = self.db.ensure_folder(
+                            volume_id=volume_id,
+                            parent_id=parent_folder_id,
+                            name=directory,
+                            relative_path=rel_path,
+                            scanned_at=scanned_at,
+                            modified_at=format_timestamp(stat.st_mtime),
+                        )
+                        folder_ids[rel_path] = folder_id
+                        folders_seen += 1
+                        accessible_dirs.append(directory)
+
+                    dir_names[:] = accessible_dirs
+
+                    if status == "cancelled":
+                        break
+
+                    for file_name in sorted(file_names, key=str.casefold):
+                        if self._cancelled():
+                            status = "cancelled"
+                            message = "Scan cancelled."
+                            break
+                        full_path = current_path / file_name
+                        rel_path = normalize_relative_path(full_path.relative_to(root))
+                        try:
+                            stat = full_path.stat()
+                        except OSError as exc:
+                            errors_count += 1
+                            self.db.add_scan_error(scan_id, volume_id, rel_path, str(exc))
+                            continue
+
+                        extension = full_path.suffix[1:].lower() if full_path.suffix else ""
+                        self.db.upsert_file(
+                            volume_id=volume_id,
+                            folder_id=parent_folder_id,
+                            name=file_name,
+                            relative_path=rel_path,
+                            extension=extension,
+                            size_bytes=stat.st_size,
+                            modified_at=format_timestamp(stat.st_mtime),
+                            scanned_at=scanned_at,
+                        )
+                        files_seen += 1
+                        if files_seen % self.batch_size == 0:
+                            self._emit_progress(files_seen, folders_seen, rel_path)
+
+                    self._emit_progress(files_seen, folders_seen, rel_current)
+
+                if status == "cancelled":
+                    raise ScanCancelled(message or "Scan cancelled.")
+
+                if status == "completed":
+                    self.db.finalize_scan_items(volume_id, scanned_at, remove_deleted)
+                    self.db.refresh_volume_counts(volume_id, scanned_at)
+                else:
+                    self.db.refresh_volume_counts(volume_id)
+
+            self.db.finish_scan(scan_id, status, files_seen, folders_seen, errors_count, message)
+            return ScanResult(status, files_seen, folders_seen, errors_count, message)
+        except ScanCancelled as exc:
+            self.db.finish_scan(scan_id, "cancelled", files_seen, folders_seen, errors_count, str(exc))
+            return ScanResult("cancelled", files_seen, folders_seen, errors_count, str(exc))
+        except Exception as exc:
+            self.db.finish_scan(scan_id, "failed", files_seen, folders_seen, errors_count, str(exc))
+            raise
+
+    def _modified_at(self, path: Path) -> str | None:
+        try:
+            return format_timestamp(path.stat().st_mtime)
+        except OSError:
+            return None
+
+    def _cancelled(self) -> bool:
+        return bool(self.cancel_callback and self.cancel_callback())
+
+    def _emit_progress(self, files_seen: int, folders_seen: int, current_path: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(files_seen, folders_seen, current_path)
