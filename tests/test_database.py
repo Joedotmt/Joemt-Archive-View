@@ -165,13 +165,14 @@ def test_mirror_relationships_are_validated_and_block_master_deletion(tmp_path):
         mirror_id = db.create_volume(
             "Mirror",
             str(tmp_path),
-            {
-                "drive_id": "AID-002",
-                "is_mirror": True,
-                "master_volume_id": master_id,
-                "mirror_date": "2026-06-25",
-            },
-        )
+                {
+                    "drive_id": "AID-002",
+                    "is_mirror": True,
+                    "master_volume_id": master_id,
+                    "date_added": "2026-06-01",
+                    "mirror_date": "2026-06-25",
+                },
+            )
 
         mirror = db.get_volume(mirror_id)
         assert mirror["is_mirror"] == 1

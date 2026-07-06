@@ -1080,8 +1080,9 @@ class HelpDialog(QDialog):
             ("1. Create a catalogue",
              "Choose <b>File → New Catalogue</b>, select a location, and save the "
              "<code>.jvvv</code> file. It is a portable SQLite catalogue."),
-            ("2. Add and scan a volume",
-             "Choose <b>New Volume</b>, select a drive or folder, then scan it. "
+            ("2. Add a volume",
+             "Choose <b>New Volume</b>, select a connected drive or folder, "
+             "and it scans automatically. "
              "Rescan later to record changes and mark missing items."),
             ("3. Browse offline",
              "Select a saved volume to explore its folder tree, even when the "
@@ -1102,7 +1103,7 @@ class HelpDialog(QDialog):
             a {{ text-decoration: none; }}
         </style>
         <h1>Quick start</h1>
-        <p><b>New Catalogue → New Volume → Scan → Browse or Search</b></p>
+        <p><b>New Catalogue → New Volume → Browse or Search</b></p>
         {section_html}
         <hr>
         <p><b>About</b><br>{APP_NAME} is GPLv3 open-source software by Joemt.<br>
@@ -1154,6 +1155,36 @@ class ScanWorker(QObject):
         self.cancel_requested = True
 
 
+class DeleteVolumeWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(int)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, volume_id: int) -> None:
+        super().__init__()
+        self.db_path = db_path
+        self.volume_id = volume_id
+
+    @Slot()
+    def run(self) -> None:
+        db: Database | None = None
+        error_details: str | None = None
+        try:
+            db = Database(self.db_path)
+            self.progress.emit("Deleting indexed records...")
+            db.delete_volume(self.volume_id)
+        except Exception:
+            error_details = traceback.format_exc()
+        finally:
+            if db is not None:
+                db.close()
+
+        if error_details is None:
+            self.finished.emit(self.volume_id)
+        else:
+            self.failed.emit(error_details)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1164,6 +1195,8 @@ class MainWindow(QMainWindow):
         self.current_folder_id: int | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: ScanWorker | None = None
+        self.delete_thread: QThread | None = None
+        self.delete_worker: DeleteVolumeWorker | None = None
         self.browser_shortcuts: list[QShortcut] = []
         self.browser_icons = CatalogueIconProvider()
         self.volume_model = VolumeTableModel(self)
@@ -1668,6 +1701,14 @@ class MainWindow(QMainWindow):
             self._set_catalogue_open(False)
             return True
 
+        if self.delete_worker is not None:
+            QMessageBox.information(
+                self,
+                "Volume Deleting",
+                "Wait for the current volume delete to finish before closing the catalogue.",
+            )
+            return False
+
         if not self._stop_scan_for_catalogue_close():
             return False
 
@@ -1759,6 +1800,37 @@ class MainWindow(QMainWindow):
             "Cancellation has been requested. Close the catalogue after the scan stops.",
         )
         return False
+
+    def _catalogue_job_running(self) -> bool:
+        return self.scan_worker is not None or self.delete_worker is not None
+
+    def _show_catalogue_job_running_message(self) -> None:
+        if self.delete_worker is not None:
+            QMessageBox.information(
+                self,
+                "Volume Deleting",
+                "Wait for the current volume delete to finish.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Scan Running",
+                "Wait for the current scan to finish or cancel it.",
+            )
+
+    def _set_catalogue_busy(self, busy: bool) -> None:
+        enabled = self.db is not None and not busy
+        for action in self.catalogue_actions:
+            action.setEnabled(enabled)
+        for widget in self.catalogue_widgets:
+            widget.setEnabled(enabled)
+        for shortcut in self.browser_shortcuts:
+            shortcut.setEnabled(enabled)
+
+        if hasattr(self, "volume_table"):
+            self.volume_table.setEnabled(enabled)
+        if hasattr(self, "tabs"):
+            self.tabs.setEnabled(enabled)
 
     def _set_catalogue_open(self, is_open: bool) -> None:
         if hasattr(self, "stack"):
@@ -1870,10 +1942,12 @@ class MainWindow(QMainWindow):
             return
         index = self.volume_table.indexAt(point)
         menu = QMenu(self)
+        busy = self._catalogue_job_running()
 
         if not index.isValid():
             new_action = menu.addAction("New Volume")
             new_action.triggered.connect(self.add_volume)
+            new_action.setEnabled(not busy)
             menu.exec(self.volume_table.viewport().mapToGlobal(point))
             return
 
@@ -1884,24 +1958,25 @@ class MainWindow(QMainWindow):
 
         new_action = menu.addAction("New Volume")
         new_action.triggered.connect(self.add_volume)
+        new_action.setEnabled(not busy)
         menu.addSeparator()
 
         edit_action = menu.addAction("Edit Volume")
         edit_action.triggered.connect(self.edit_volume)
-        edit_action.setEnabled(not scan_running)
+        edit_action.setEnabled(not busy)
 
         delete_action = menu.addAction("Delete Volume")
         delete_action.triggered.connect(self.delete_volume)
-        delete_action.setEnabled(not scan_running)
+        delete_action.setEnabled(not busy)
 
         menu.addSeparator()
         scan_action = menu.addAction("Scan")
         scan_action.triggered.connect(lambda: self.start_scan(remove_deleted=True, is_rescan=False))
-        scan_action.setEnabled(not scan_running)
+        scan_action.setEnabled(not busy)
 
         rescan_action = menu.addAction("Rescan")
         rescan_action.triggered.connect(self.start_rescan)
-        rescan_action.setEnabled(not scan_running)
+        rescan_action.setEnabled(not busy)
 
         cancel_action = menu.addAction("Cancel Scan")
         cancel_action.triggered.connect(self.cancel_scan)
@@ -1964,6 +2039,9 @@ class MainWindow(QMainWindow):
     def add_volume(self) -> None:
         if self.db is None:
             return
+        if self._catalogue_job_running():
+            self._show_catalogue_job_running_message()
+            return
         dialog = VolumeDialog(
             self,
             "New Volume",
@@ -1988,15 +2066,23 @@ class MainWindow(QMainWindow):
                     pass
             self.current_volume_id = volume_id
             self.refresh_volumes()
-            self.statusBar().showMessage("Volume added.", 4000)
+            if source_path:
+                self.start_scan(
+                    remove_deleted=True,
+                    is_rescan=False,
+                    volume_id=volume_id,
+                    source_path=source_path,
+                )
+            else:
+                self.statusBar().showMessage("Volume added.", 4000)
         except Exception as exc:
             QMessageBox.critical(self, "New Volume Failed", str(exc))
 
     def edit_volume(self) -> None:
         if self.db is None:
             return
-        if self.scan_worker is not None:
-            QMessageBox.information(self, "Scan Running", "Wait for the current scan to finish or cancel it.")
+        if self._catalogue_job_running():
+            self._show_catalogue_job_running_message()
             return
         volume = self.selected_volume()
         if volume is None:
@@ -2032,6 +2118,9 @@ class MainWindow(QMainWindow):
     def delete_volume(self) -> None:
         if self.db is None:
             return
+        if self._catalogue_job_running():
+            self._show_catalogue_job_running_message()
+            return
         volume = self.selected_volume()
         if volume is None:
             return
@@ -2054,10 +2143,31 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.db.delete_volume(volume["id"])
-        self.current_volume_id = None
-        self.refresh_volumes()
-        self.statusBar().showMessage("Volume deleted.", 4000)
+        self.start_delete_volume(volume["id"], display_name or "volume")
+
+    def start_delete_volume(self, volume_id: int, display_name: str) -> None:
+        if self.db is None:
+            return
+
+        self._set_catalogue_busy(True)
+        self.scan_progress.setRange(0, 0)
+        self.scan_progress.setFormat(f"Deleting {display_name}...")
+        self.statusBar().showMessage(f"Deleting {display_name}...")
+
+        self.delete_thread = QThread(self)
+        self.delete_worker = DeleteVolumeWorker(self.db.path, volume_id)
+        self.delete_worker.moveToThread(self.delete_thread)
+        self.delete_thread.started.connect(self.delete_worker.run)
+        self.delete_worker.progress.connect(self.on_delete_progress)
+        self.delete_worker.finished.connect(self.on_delete_finished)
+        self.delete_worker.failed.connect(self.on_delete_failed)
+        self.delete_worker.finished.connect(self.delete_thread.quit)
+        self.delete_worker.failed.connect(self.delete_thread.quit)
+        self.delete_worker.finished.connect(self.delete_worker.deleteLater)
+        self.delete_worker.failed.connect(self.delete_worker.deleteLater)
+        self.delete_thread.finished.connect(self.delete_thread.deleteLater)
+        self.delete_thread.finished.connect(self.clear_delete_worker)
+        self.delete_thread.start()
 
     def start_rescan(self) -> None:
         volume = self.selected_volume()
@@ -2076,19 +2186,26 @@ class MainWindow(QMainWindow):
         elif clicked == mark_button:
             self.start_scan(remove_deleted=False, is_rescan=True)
 
-    def start_scan(self, remove_deleted: bool, is_rescan: bool) -> None:
+    def start_scan(
+        self,
+        remove_deleted: bool,
+        is_rescan: bool,
+        volume_id: int | None = None,
+        source_path: str | None = None,
+    ) -> None:
         if self.db is None:
             return
-        if self.scan_worker is not None:
-            QMessageBox.information(self, "Scan Running", "Wait for the current scan to finish or cancel it.")
+        if self._catalogue_job_running():
+            self._show_catalogue_job_running_message()
             return
-        volume = self.selected_volume()
+        volume = self.db.get_volume(volume_id) if volume_id is not None else self.selected_volume()
         if volume is None:
             return
 
-        source_path = self.choose_scan_location(volume, is_rescan)
         if source_path is None:
-            return
+            source_path = self.choose_scan_location(volume, is_rescan)
+            if source_path is None:
+                return
         try:
             self.db.update_volume(volume["id"], volume["name"], source_path)
         except Exception as exc:
@@ -2142,7 +2259,7 @@ class MainWindow(QMainWindow):
             f"{result.get('folders_seen', 0)} folders, {result.get('errors_count', 0)} errors.",
             8000,
         )
-        self.refresh_after_scan()
+        self.refresh_after_catalogue_write()
 
     @Slot(str)
     def on_scan_failed(self, details: str) -> None:
@@ -2150,14 +2267,40 @@ class MainWindow(QMainWindow):
         self.scan_progress.setValue(0)
         self.scan_progress.setFormat("Scan failed")
         QMessageBox.critical(self, "Scan Failed", details)
-        self.refresh_after_scan()
+        self.refresh_after_catalogue_write()
 
     @Slot()
     def clear_scan_worker(self) -> None:
         self.scan_worker = None
         self.scan_thread = None
 
-    def refresh_after_scan(self) -> None:
+    @Slot(str)
+    def on_delete_progress(self, message: str) -> None:
+        self.scan_progress.setFormat(message)
+
+    @Slot(int)
+    def on_delete_finished(self, volume_id: int) -> None:
+        self.current_volume_id = None
+        self.refresh_after_catalogue_write()
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_progress.setFormat("Deleted")
+        self.statusBar().showMessage("Volume deleted.", 4000)
+
+    @Slot(str)
+    def on_delete_failed(self, details: str) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Delete failed")
+        QMessageBox.critical(self, "Delete Volume Failed", details)
+
+    @Slot()
+    def clear_delete_worker(self) -> None:
+        self.delete_worker = None
+        self.delete_thread = None
+        self._set_catalogue_busy(False)
+
+    def refresh_after_catalogue_write(self) -> None:
         if self.db is None:
             return
         path = self.db.path

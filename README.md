@@ -49,11 +49,11 @@ is a valid SQLite database and contains the full catalogue.
 
 1. Choose **File > New Catalogue** and save a `.jvvv` file.
 2. Click **New Volume**.
-3. Enter a volume name and choose a connected drive or folder.
-4. Select the new volume and click **Scan**.
-5. Browse the saved folder tree and file list after the scan completes.
-6. Use the search bar to search across all indexed volumes.
-7. Use **Rescan** to refresh an existing catalogue.
+3. Enter a volume name and choose a connected drive or folder. JVVV starts
+   scanning when the volume is added.
+4. Browse the saved folder tree and file list after the scan completes.
+5. Use the search bar to search across all indexed volumes.
+6. Use **Rescan** to refresh an existing catalogue.
 
 When rescanning, the app asks whether removed files should be deleted from the
 catalogue or marked as missing.
