@@ -762,11 +762,13 @@ class VolumeDialog(QDialog):
         master_options: list[Any] | None = None,
         mirror_dependents: list[Any] | None = None,
         existing_volumes: list[Any] | None = None,
+        show_source_path: bool = True,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(680)
         self.current_volume_id = int(volume["id"]) if volume is not None else None
+        self.show_source_path = show_source_path
         self.master_options = master_options or []
         self.mirror_dependents = mirror_dependents or []
         self.existing_names = {
@@ -849,7 +851,8 @@ class VolumeDialog(QDialog):
         form = QFormLayout()
         form.addRow("Drive ID", self.drive_id_edit)
         form.addRow("Name", self.name_edit)
-        form.addRow("Drive or folder", path_row)
+        if self.show_source_path:
+            form.addRow("Drive or folder", path_row)
         form.addRow("Status", self.status_combo)
         form.addRow("Condition", self.condition_combo)
         form.addRow("Connector", self.connector_combo)
@@ -1189,6 +1192,12 @@ class MainWindow(QMainWindow):
 
     def _build_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
+
+        self.new_volume_action = QAction("New Volume\u2026", self)
+        self.new_volume_action.triggered.connect(self.add_volume)
+        file_menu.addAction(self.new_volume_action)
+
+        file_menu.addSeparator()
 
         self.new_catalogue_action = QAction("New Catalogue\u2026", self)
         self.new_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.New))
@@ -1578,7 +1587,7 @@ class MainWindow(QMainWindow):
         self.refresh_action.setShortcut("F5")
         self.refresh_action.triggered.connect(self.refresh_volumes)
         self.addAction(self.refresh_action)
-        self.catalogue_actions = [self.close_catalogue_action, self.refresh_action]
+        self.catalogue_actions = [self.close_catalogue_action, self.new_volume_action, self.refresh_action]
         self.catalogue_widgets = [self.add_button, self.volume_filter_edit, self.search_edit, self.search_button]
 
         self.add_browser_shortcut(QKeySequence("Backspace"), self.navigate_parent_folder)
@@ -1871,7 +1880,6 @@ class MainWindow(QMainWindow):
         self.volume_table.selectRow(index.row())
         self.volume_table.setCurrentIndex(self.volume_model.index(index.row(), 0))
         volume = self.selected_volume()
-        connected = bool(volume and source_path_exists(volume["source_path"]))
         scan_running = self.scan_worker is not None
 
         new_action = menu.addAction("New Volume")
@@ -1889,11 +1897,11 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         scan_action = menu.addAction("Scan")
         scan_action.triggered.connect(lambda: self.start_scan(remove_deleted=True, is_rescan=False))
-        scan_action.setEnabled(connected and not scan_running)
+        scan_action.setEnabled(not scan_running)
 
         rescan_action = menu.addAction("Rescan")
         rescan_action.triggered.connect(self.start_rescan)
-        rescan_action.setEnabled(connected and not scan_running)
+        rescan_action.setEnabled(not scan_running)
 
         cancel_action = menu.addAction("Cancel Scan")
         cancel_action.triggered.connect(self.cancel_scan)
@@ -2000,6 +2008,7 @@ class MainWindow(QMainWindow):
             master_options=self.db.list_master_volume_options(volume["id"]),
             mirror_dependents=self.db.list_mirror_dependents(volume["id"]),
             existing_volumes=self.db.list_volumes(),
+            show_source_path=False,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2076,8 +2085,14 @@ class MainWindow(QMainWindow):
         volume = self.selected_volume()
         if volume is None:
             return
-        if not source_path_exists(volume["source_path"]):
-            QMessageBox.warning(self, "Volume Offline", "The source path is not currently connected.")
+
+        source_path = self.choose_scan_location(volume, is_rescan)
+        if source_path is None:
+            return
+        try:
+            self.db.update_volume(volume["id"], volume["name"], source_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Scan Location Failed", str(exc))
             return
 
         self.scan_progress.setRange(0, 0)
@@ -2098,6 +2113,13 @@ class MainWindow(QMainWindow):
         self.scan_thread.finished.connect(self.scan_thread.deleteLater)
         self.scan_thread.finished.connect(self.clear_scan_worker)
         self.scan_thread.start()
+
+    def choose_scan_location(self, volume, is_rescan: bool) -> str | None:
+        current_path = volume["source_path"] or ""
+        initial_dir = current_path if source_path_exists(current_path) else str(Path.home())
+        title = "Choose Rescan Location" if is_rescan else "Choose Scan Location"
+        directory = QFileDialog.getExistingDirectory(self, title, initial_dir)
+        return directory or None
 
     def cancel_scan(self) -> None:
         if self.scan_worker is not None:
