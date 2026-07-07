@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 CATALOGUE_EXTENSION = ".jvvv"
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
@@ -289,6 +289,9 @@ class Database:
                 if version < 5:
                     self._apply_migration_5()
                     version = 5
+                if version < 6:
+                    self._apply_migration_6()
+                    version = 6
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
@@ -567,17 +570,27 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_volumes_identity ON volumes(identity_kind, identity_token)"
         )
 
+    def _apply_migration_6(self) -> None:
+        statements = [
+            "CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_scan_history_volume ON scan_history(volume_id)",
+            "CREATE INDEX IF NOT EXISTS idx_scan_errors_volume ON scan_errors(volume_id)",
+        ]
+        for statement in statements:
+            self.connection.execute(statement)
+
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column not in self._column_names(table):
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         if self.connection.in_transaction:
             yield self.connection
             return
         try:
-            self.connection.execute("BEGIN")
+            self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield self.connection
             self.connection.commit()
         except Exception:
@@ -939,7 +952,7 @@ class Database:
             )
 
     def delete_volume(self, volume_id: int) -> None:
-        with self.transaction() as conn:
+        with self.transaction(immediate=True) as conn:
             dependents = self._list_mirror_dependents(conn, volume_id)
             if dependents:
                 names = ", ".join(self.volume_reference(row) for row in dependents)
@@ -947,6 +960,11 @@ class Database:
                     f"This volume is selected as the master drive for: {names}. "
                     "Remove those mirror relationships before deleting it."
                 )
+            conn.execute("DELETE FROM scan_errors WHERE volume_id = ?", (volume_id,))
+            conn.execute("DELETE FROM scan_history WHERE volume_id = ?", (volume_id,))
+            conn.execute("DELETE FROM files WHERE volume_id = ?", (volume_id,))
+            conn.execute("DELETE FROM folders WHERE volume_id = ?", (volume_id,))
+            conn.execute("DELETE FROM volume_register WHERE volume_id = ?", (volume_id,))
             conn.execute("DELETE FROM volumes WHERE id = ?", (volume_id,))
 
     def get_volume(self, volume_id: int) -> sqlite3.Row | None:

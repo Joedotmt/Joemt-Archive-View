@@ -25,7 +25,27 @@ def test_database_initializes_schema(tmp_path):
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
         assert "volume_register" in tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        folder_indexes = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA index_list(folders)")
+        }
+        file_indexes = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA index_list(files)")
+        }
+        scan_history_indexes = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA index_list(scan_history)")
+        }
+        scan_error_indexes = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA index_list(scan_errors)")
+        }
+        assert "idx_folders_parent" in folder_indexes
+        assert "idx_files_folder" in file_indexes
+        assert "idx_scan_history_volume" in scan_history_indexes
+        assert "idx_scan_errors_volume" in scan_error_indexes
         volume_columns = {
             row["name"]: row
             for row in db.connection.execute("PRAGMA table_info(volumes)")
@@ -123,6 +143,71 @@ def test_volume_crud(tmp_path):
         assert db.get_volume(volume_id) is None
         assert count_rows(db, "volumes") == 0
         assert count_rows(db, "volume_register") == 0
+    finally:
+        db.close()
+
+
+def test_delete_volume_removes_indexed_records_for_only_that_volume(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        scanned_at = "2026-06-25T12:00:00.000000+0000"
+        deleted_volume_id = db.create_volume("Delete Me", str(tmp_path / "deleted"))
+        kept_volume_id = db.create_volume("Keep Me", str(tmp_path / "kept"))
+
+        for volume_id, name in [(deleted_volume_id, "deleted"), (kept_volume_id, "kept")]:
+            with db.transaction() as conn:
+                root_id = db.ensure_folder(
+                    volume_id=volume_id,
+                    parent_id=None,
+                    name=name,
+                    relative_path="",
+                    scanned_at=scanned_at,
+                )
+                child_id = db.ensure_folder(
+                    volume_id=volume_id,
+                    parent_id=root_id,
+                    name="child",
+                    relative_path="child",
+                    scanned_at=scanned_at,
+                )
+                db.upsert_file(
+                    volume_id=volume_id,
+                    folder_id=child_id,
+                    name="file.txt",
+                    relative_path="child/file.txt",
+                    extension="txt",
+                    size_bytes=123,
+                    modified_at=None,
+                    scanned_at=scanned_at,
+                )
+                scan_id = conn.execute(
+                    """
+                    INSERT INTO scan_history (volume_id, started_at, status)
+                    VALUES (?, ?, 'completed')
+                    """,
+                    (volume_id, scanned_at),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO scan_errors (scan_id, volume_id, path, message, created_at)
+                    VALUES (?, ?, 'child/file.txt', 'problem', ?)
+                    """,
+                    (scan_id, volume_id, scanned_at),
+                )
+
+        db.delete_volume(deleted_volume_id)
+
+        assert db.get_volume(deleted_volume_id) is None
+        assert db.get_volume(kept_volume_id) is not None
+        for table in ("folders", "files", "scan_history", "scan_errors"):
+            assert db.connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE volume_id = ?",
+                (deleted_volume_id,),
+            ).fetchone()[0] == 0
+            assert db.connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE volume_id = ?",
+                (kept_volume_id,),
+            ).fetchone()[0] > 0
     finally:
         db.close()
 
@@ -280,7 +365,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 6
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
