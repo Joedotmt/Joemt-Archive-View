@@ -81,7 +81,17 @@ from .database import (
     parse_db_time,
 )
 from .scanner import VolumeScanner, get_storage_stats
-from .utils import eject_volume, eject_volume_supported, format_size, open_in_file_manager, percentage_full, relative_path_for_display
+from .utils import (
+    ConnectedVolumeResolver,
+    capture_volume_snapshot,
+    eject_volume,
+    eject_volume_supported,
+    format_size,
+    open_in_file_manager,
+    percentage_full,
+    relative_path_for_display,
+    resolve_volume_source_path,
+)
 
 
 ROLE_VOLUME_ID = Qt.ItemDataRole.UserRole
@@ -1910,6 +1920,7 @@ class MainWindow(QMainWindow):
             return
         selected_id = self.selected_volume_id() or self.current_volume_id
         volumes = self.db.list_volumes()
+        resolver = ConnectedVolumeResolver()
         all_items = [
             VolumeItem(
                 id=volume["id"],
@@ -1935,7 +1946,7 @@ class MainWindow(QMainWindow):
                 indexed_file_count=volume["indexed_file_count"],
                 indexed_folder_count=volume["indexed_folder_count"],
                 last_scan_at=volume["last_scan_at"],
-                connected=source_path_exists(volume["source_path"]),
+                connected=self.current_source_path_for_volume(volume, resolver) is not None,
                 percent_full=percentage_full(volume["used_bytes"], volume["capacity_bytes"]),
             )
             for volume in volumes
@@ -1962,6 +1973,13 @@ class MainWindow(QMainWindow):
         volume_id = self.selected_volume_id()
         return self.db.get_volume(volume_id) if volume_id is not None else None
 
+    def current_source_path_for_volume(self, volume, resolver: ConnectedVolumeResolver | None = None) -> str | None:
+        if volume is None:
+            return None
+        if resolver is not None:
+            return resolver.resolve(volume)
+        return resolve_volume_source_path(volume)
+
     def show_volume_context_menu(self, point: QPoint) -> None:
         if self.db is None:
             return
@@ -1980,8 +1998,9 @@ class MainWindow(QMainWindow):
         self.volume_table.setCurrentIndex(self.volume_model.index(index.row(), 0))
         volume = self.selected_volume()
         scan_running = self.scan_worker is not None
-        volume_connected = volume is not None and source_path_exists(volume["source_path"])
-        volume_ejectable = volume is not None and eject_volume_supported(volume["source_path"])
+        current_source_path = self.current_source_path_for_volume(volume)
+        volume_connected = current_source_path is not None
+        volume_ejectable = current_source_path is not None and eject_volume_supported(current_source_path)
 
         new_action = menu.addAction("New Volume")
         new_action.triggered.connect(self.add_volume)
@@ -2037,12 +2056,13 @@ class MainWindow(QMainWindow):
             self.detail_full.setValue(0)
             return
 
-        connected = source_path_exists(volume["source_path"])
+        current_source_path = self.current_source_path_for_volume(volume)
+        connected = current_source_path is not None
         full = percentage_full(volume["used_bytes"], volume["capacity_bytes"])
         values = {
             "drive_id": volume["drive_id"] or "-",
             "name": display_volume_name(volume["name"]),
-            "path": volume["source_path"] or "-",
+            "path": current_source_path or volume["source_path"] or "-",
             "connection": "Connected" if connected else "Offline",
             "register_status": volume["register_status"],
             "condition": volume["condition"],
@@ -2088,7 +2108,15 @@ class MainWindow(QMainWindow):
             dialog.apply_content_date_guess(source_path)
             name, source_path, register = dialog.values()
         try:
-            volume_id = self.db.create_volume(name, source_path, register)
+            snapshot = capture_volume_snapshot(source_path) if source_path else None
+            if snapshot is not None:
+                source_path = snapshot.source_path
+            volume_id = self.db.create_volume(
+                name,
+                source_path,
+                register,
+                snapshot.as_db_fields() if snapshot is not None else None,
+            )
             path = Path(source_path) if source_path else None
             if path is not None and path.exists():
                 try:
@@ -2212,8 +2240,8 @@ class MainWindow(QMainWindow):
         if volume is None:
             return
 
-        source_path = volume["source_path"] or ""
-        if not source_path_exists(source_path):
+        source_path = self.current_source_path_for_volume(volume)
+        if source_path is None:
             QMessageBox.information(
                 self,
                 "Volume Offline",
@@ -2291,7 +2319,14 @@ class MainWindow(QMainWindow):
             if source_path is None:
                 return
         try:
-            self.db.update_volume(volume["id"], volume["name"], source_path)
+            snapshot = capture_volume_snapshot(source_path)
+            if snapshot is not None:
+                source_path = snapshot.source_path
+            self.db.update_volume_location(
+                volume["id"],
+                source_path,
+                snapshot.as_db_fields() if snapshot is not None else None,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Scan Location Failed", str(exc))
             return
@@ -2316,7 +2351,7 @@ class MainWindow(QMainWindow):
         self.scan_thread.start()
 
     def choose_scan_location(self, volume, is_rescan: bool) -> str | None:
-        current_path = volume["source_path"] or ""
+        current_path = self.current_source_path_for_volume(volume) or volume["source_path"] or ""
         initial_dir = current_path if source_path_exists(current_path) else str(Path.home())
         title = "Choose Rescan Location" if is_rescan else "Choose Scan Location"
         directory = QFileDialog.getExistingDirectory(self, title, initial_dir)
@@ -2442,7 +2477,7 @@ class MainWindow(QMainWindow):
         volume = self.db.get_volume(volume_id)
         if volume is None:
             return
-        connected = source_path_exists(volume["source_path"])
+        connected = self.current_source_path_for_volume(volume) is not None
         self.offline_label.setText(
             "" if connected else "This volume is offline. Showing the saved catalogue."
         )
@@ -2701,9 +2736,10 @@ class MainWindow(QMainWindow):
     def catalogue_item_property_rows(self, record) -> list[tuple[str, str]]:
         item_type = record["item_type"]
         relative_path = record["relative_path"] or ""
-        source_path = record["source_path"] or ""
+        volume = self.db.get_volume(record["volume_id"]) if self.db is not None else None
+        source_path = self.current_source_path_for_volume(volume)
         physical_path = self.physical_path_for_source(source_path, relative_path) if source_path else None
-        volume_connected = bool(source_path and Path(source_path).exists())
+        volume_connected = source_path is not None
         item_exists = self.current_item_exists_text(physical_path, volume_connected)
 
         properties = [
@@ -2791,12 +2827,13 @@ class MainWindow(QMainWindow):
         volume = self.db.get_volume(self.current_volume_id)
         if volume is None:
             return None
-        if not volume["source_path"]:
-            return None
         return self.real_path_for(volume, item.relative_path)
 
-    def real_path_for(self, volume, relative_path: str) -> Path:
-        return self.physical_path_for_source(volume["source_path"], relative_path)
+    def real_path_for(self, volume, relative_path: str) -> Path | None:
+        source_path = self.current_source_path_for_volume(volume)
+        if source_path is None:
+            return None
+        return self.physical_path_for_source(source_path, relative_path)
 
     def physical_path_for_source(self, source_path: str, relative_path: str) -> Path:
         path = Path(source_path)
@@ -2832,6 +2869,7 @@ class MainWindow(QMainWindow):
             self.on_search_selection_changed()
             return
 
+        resolver = ConnectedVolumeResolver()
         items = [
             SearchResultItem(
                 item_type=result["item_type"],
@@ -2844,7 +2882,7 @@ class MainWindow(QMainWindow):
                 modified_at=result["modified_at"],
                 missing=bool(result["missing"]),
                 source_path=result["source_path"],
-                connected=source_path_exists(result["source_path"]),
+                connected=resolver.resolve(result) is not None,
             )
             for result in self.db.search(query)
         ]
@@ -2870,8 +2908,6 @@ class MainWindow(QMainWindow):
             return None
         volume = self.db.get_volume(item.volume_id)
         if volume is None:
-            return None
-        if not volume["source_path"]:
             return None
         return self.real_path_for(volume, item.relative_path)
 

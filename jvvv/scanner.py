@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from .database import Database, format_timestamp, utc_now
+from .utils import capture_volume_snapshot, resolve_volume_source_path, volume_identity_known
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -62,7 +63,17 @@ class VolumeScanner:
             self.db.finish_scan(scan_id, "failed", 0, 0, 0, message)
             return ScanResult("failed", 0, 0, 0, message)
 
-        root = Path(volume["source_path"])
+        identity_known = volume_identity_known(volume)
+        resolved_source_path = resolve_volume_source_path(volume)
+        if resolved_source_path is None and identity_known:
+            message = f"Identified volume is not connected: {volume['source_path']}"
+            scan_id = self.db.start_scan(volume_id)
+            self.db.finish_scan(scan_id, "failed", 0, 0, 0, message)
+            return ScanResult("failed", 0, 0, 0, message)
+        if resolved_source_path is None:
+            resolved_source_path = volume["source_path"]
+
+        root = Path(resolved_source_path)
         scan_id = self.db.start_scan(volume_id)
         scanned_at = utc_now()
         files_seen = 0
@@ -75,6 +86,10 @@ class VolumeScanner:
             message = f"Source path is not connected: {root}"
             self.db.finish_scan(scan_id, "failed", 0, 0, 0, message)
             return ScanResult("failed", 0, 0, 0, message)
+
+        snapshot = capture_volume_snapshot(root)
+        if snapshot is not None:
+            self.db.update_volume_location(volume_id, snapshot.source_path, snapshot.as_db_fields())
 
         try:
             capacity, used, free = get_storage_stats(root)

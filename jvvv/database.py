@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 CATALOGUE_EXTENSION = ".jvvv"
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
@@ -27,6 +27,12 @@ REQUIRED_COLUMNS = {
         "id",
         "name",
         "source_path",
+        "identity_kind",
+        "identity_token",
+        "identity_label",
+        "identity_serial",
+        "identity_filesystem",
+        "source_relative_path",
         "capacity_bytes",
         "used_bytes",
         "free_bytes",
@@ -280,6 +286,9 @@ class Database:
                 if version < 4:
                     self._apply_migration_4()
                     version = 4
+                if version < 5:
+                    self._apply_migration_5()
+                    version = 5
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
@@ -511,6 +520,12 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE COLLATE NOCASE,
                 source_path TEXT NOT NULL,
+                identity_kind TEXT NOT NULL DEFAULT '',
+                identity_token TEXT NOT NULL DEFAULT '',
+                identity_label TEXT NOT NULL DEFAULT '',
+                identity_serial TEXT NOT NULL DEFAULT '',
+                identity_filesystem TEXT NOT NULL DEFAULT '',
+                source_relative_path TEXT NOT NULL DEFAULT '',
                 capacity_bytes INTEGER NOT NULL DEFAULT 0,
                 used_bytes INTEGER NOT NULL DEFAULT 0,
                 free_bytes INTEGER NOT NULL DEFAULT 0,
@@ -537,6 +552,21 @@ class Database:
         self.connection.execute("DROP TABLE volumes")
         self.connection.execute("ALTER TABLE volumes_new RENAME TO volumes")
 
+    def _apply_migration_5(self) -> None:
+        volume_columns = {
+            "identity_kind": "TEXT NOT NULL DEFAULT ''",
+            "identity_token": "TEXT NOT NULL DEFAULT ''",
+            "identity_label": "TEXT NOT NULL DEFAULT ''",
+            "identity_serial": "TEXT NOT NULL DEFAULT ''",
+            "identity_filesystem": "TEXT NOT NULL DEFAULT ''",
+            "source_relative_path": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in volume_columns.items():
+            self._add_column_if_missing("volumes", column, definition)
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_volumes_identity ON volumes(identity_kind, identity_token)"
+        )
+
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column not in self._column_names(table):
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -559,6 +589,25 @@ class Database:
         if not text:
             return ""
         return str(Path(text).expanduser())
+
+    def _normalize_volume_location(self, location: dict[str, Any] | None) -> dict[str, str]:
+        data = {
+            "identity_kind": "",
+            "identity_token": "",
+            "identity_label": "",
+            "identity_serial": "",
+            "identity_filesystem": "",
+            "source_relative_path": "",
+        }
+        if location:
+            for key in data:
+                data[key] = str(location.get(key) or "")
+            data["identity_kind"] = data["identity_kind"].strip()
+            data["identity_token"] = data["identity_token"].strip()
+        if not data["identity_kind"] or not data["identity_token"]:
+            data["identity_kind"] = ""
+            data["identity_token"] = ""
+        return data
 
     def _normalize_volume_name(self, name: str | None) -> str | None:
         if name is None:
@@ -801,17 +850,34 @@ class Database:
         name: str | None,
         source_path: str = "",
         register: dict[str, Any] | None = None,
+        location: dict[str, Any] | None = None,
     ) -> int:
         now = utc_now()
         source = self._normalize_source_path(source_path)
         clean_name = self._normalize_volume_name(name)
+        location_data = self._normalize_volume_location(location)
         with self.transaction() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO volumes (name, source_path, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO volumes (
+                    name, source_path, identity_kind, identity_token,
+                    identity_label, identity_serial, identity_filesystem,
+                    source_relative_path, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (clean_name, source, now, now),
+                (
+                    clean_name,
+                    source,
+                    location_data["identity_kind"],
+                    location_data["identity_token"],
+                    location_data["identity_label"],
+                    location_data["identity_serial"],
+                    location_data["identity_filesystem"],
+                    location_data["source_relative_path"],
+                    now,
+                    now,
+                ),
             )
             volume_id = int(cur.lastrowid)
             self._upsert_volume_register(conn, volume_id, register or {})
@@ -836,6 +902,41 @@ class Database:
             )
             if register is not None:
                 self._upsert_volume_register(conn, volume_id, register)
+
+    def update_volume_location(
+        self,
+        volume_id: int,
+        source_path: str,
+        location: dict[str, Any] | None,
+    ) -> None:
+        source = self._normalize_source_path(source_path)
+        location_data = self._normalize_volume_location(location)
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE volumes
+                SET source_path = ?,
+                    identity_kind = ?,
+                    identity_token = ?,
+                    identity_label = ?,
+                    identity_serial = ?,
+                    identity_filesystem = ?,
+                    source_relative_path = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    source,
+                    location_data["identity_kind"],
+                    location_data["identity_token"],
+                    location_data["identity_label"],
+                    location_data["identity_serial"],
+                    location_data["identity_filesystem"],
+                    location_data["source_relative_path"],
+                    utc_now(),
+                    volume_id,
+                ),
+            )
 
     def delete_volume(self, volume_id: int) -> None:
         with self.transaction() as conn:
@@ -951,7 +1052,11 @@ class Database:
 
     def volume_is_connected(self, volume: sqlite3.Row | int) -> bool:
         row = self.get_volume(volume) if isinstance(volume, int) else volume
-        return bool(row and row["source_path"] and Path(row["source_path"]).exists())
+        if not row:
+            return False
+        from .utils import resolve_volume_source_path
+
+        return resolve_volume_source_path(row) is not None
 
     def update_volume_storage(
         self,
@@ -1545,6 +1650,9 @@ class Database:
                     f.modified_at,
                     f.missing,
                     v.source_path,
+                    v.identity_kind,
+                    v.identity_token,
+                    v.source_relative_path,
                     CASE WHEN f.missing = 0 THEN 0 ELSE 1 END AS missing_rank
                 FROM files f
                 JOIN volumes v ON v.id = f.volume_id
@@ -1561,6 +1669,9 @@ class Database:
                     fo.modified_at,
                     fo.missing,
                     v.source_path,
+                    v.identity_kind,
+                    v.identity_token,
+                    v.source_relative_path,
                     CASE WHEN fo.missing = 0 THEN 0 ELSE 1 END AS missing_rank
                 FROM folders fo
                 JOIN volumes v ON v.id = fo.volume_id

@@ -25,12 +25,20 @@ def test_database_initializes_schema(tmp_path):
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
         assert "volume_register" in tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 5
         volume_columns = {
             row["name"]: row
             for row in db.connection.execute("PRAGMA table_info(volumes)")
         }
         assert volume_columns["name"]["notnull"] == 0
+        assert {
+            "identity_kind",
+            "identity_token",
+            "identity_label",
+            "identity_serial",
+            "identity_filesystem",
+            "source_relative_path",
+        } <= set(volume_columns)
         folder_columns = {
             row["name"]
             for row in db.connection.execute("PRAGMA table_info(folders)")
@@ -92,6 +100,8 @@ def test_volume_crud(tmp_path):
         assert volume is not None
         assert volume["name"] == "Archive"
         assert volume["source_path"] == str(tmp_path)
+        assert volume["identity_kind"] == ""
+        assert volume["identity_token"] == ""
         assert volume["drive_id"] == "AID-001"
         assert volume["register_status"] == "Archive"
         assert volume["date_added"] == date.today().isoformat()
@@ -113,6 +123,41 @@ def test_volume_crud(tmp_path):
         assert db.get_volume(volume_id) is None
         assert count_rows(db, "volumes") == 0
         assert count_rows(db, "volume_register") == 0
+    finally:
+        db.close()
+
+
+def test_volume_location_identity_can_be_updated_and_cleared(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        db.update_volume_location(
+            volume_id,
+            str(tmp_path / "Drive"),
+            {
+                "identity_kind": "windows-volume-guid",
+                "identity_token": "\\\\?\\volume{abc}\\",
+                "identity_label": "Archive",
+                "identity_serial": "1234ABCD",
+                "identity_filesystem": "NTFS",
+                "source_relative_path": "Archive/Subfolder",
+            },
+        )
+
+        volume = db.get_volume(volume_id)
+        assert volume["source_path"] == str(tmp_path / "Drive")
+        assert volume["identity_kind"] == "windows-volume-guid"
+        assert volume["identity_token"] == "\\\\?\\volume{abc}\\"
+        assert volume["identity_label"] == "Archive"
+        assert volume["identity_serial"] == "1234ABCD"
+        assert volume["identity_filesystem"] == "NTFS"
+        assert volume["source_relative_path"] == "Archive/Subfolder"
+
+        db.update_volume_location(volume_id, str(tmp_path / "Other"), None)
+        volume = db.get_volume(volume_id)
+        assert volume["source_path"] == str(tmp_path / "Other")
+        assert volume["identity_kind"] == ""
+        assert volume["identity_token"] == ""
     finally:
         db.close()
 
@@ -235,7 +280,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 5
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
