@@ -5,8 +5,9 @@ from datetime import datetime
 import os
 import sys
 import traceback
+from time import monotonic
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from PySide6.QtCore import (
     QAbstractTableModel,
@@ -83,10 +84,12 @@ from .database import (
 from .scanner import VolumeScanner, get_storage_stats
 from .utils import (
     ConnectedVolumeResolver,
+    VolumeSnapshot,
     capture_volume_snapshot,
     eject_volume,
     eject_volume_supported,
     format_size,
+    list_connected_volume_snapshots,
     open_in_file_manager,
     percentage_full,
     relative_path_for_display,
@@ -105,6 +108,10 @@ PROGRESS_BAR_HEIGHT = 16
 UI_ZOOM_STEP = 0.1
 MIN_UI_ZOOM = 0.8
 MAX_UI_ZOOM = 1.6
+CONTENT_DATE_GUESS_ITEM_BUDGET = 500
+CONTENT_DATE_GUESS_TIME_BUDGET_SECONDS = 0.025
+VOLUME_CONNECTION_POLL_INTERVAL_MS = 1500
+VOLUME_CONNECTION_REFRESH_DELAY_MS = 250
 
 
 def progress_bar_style(height: int) -> str:
@@ -668,6 +675,64 @@ def volume_matches_filter(item: VolumeItem, query: str) -> bool:
     return all(term in haystack for term in text.split())
 
 
+def connected_volume_signature(snapshots: list[VolumeSnapshot]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                snapshot.identity_kind.casefold(),
+                snapshot.identity_token.casefold(),
+                snapshot.mount_root.casefold(),
+            )
+            for snapshot in snapshots
+            if snapshot.identity_kind and snapshot.identity_token
+        )
+    )
+
+
+def include_content_timestamp(
+    earliest: str | None,
+    latest: str | None,
+    timestamp: float,
+) -> tuple[str | None, str | None]:
+    try:
+        value = datetime.fromtimestamp(timestamp).date().isoformat()
+    except (OSError, OverflowError, ValueError):
+        return earliest, latest
+    earliest = value if earliest is None or value < earliest else earliest
+    latest = value if latest is None or value > latest else latest
+    return earliest, latest
+
+
+def iter_content_date_timestamps(root: Path) -> Iterator[float]:
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            yield current.stat().st_mtime
+        except OSError:
+            pass
+        try:
+            if not current.is_dir():
+                continue
+        except OSError:
+            continue
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        stat_result = entry.stat(follow_symlinks=False)
+                        yield stat_result.st_mtime
+                    except OSError:
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+
 def guess_content_dates_from_path(source_path: str) -> tuple[str | None, str | None]:
     if not source_path:
         return None, None
@@ -677,35 +742,8 @@ def guess_content_dates_from_path(source_path: str) -> tuple[str | None, str | N
 
     earliest: str | None = None
     latest: str | None = None
-
-    def include_timestamp(timestamp: float) -> None:
-        nonlocal earliest, latest
-        value = datetime.fromtimestamp(timestamp).date().isoformat()
-        earliest = value if earliest is None or value < earliest else earliest
-        latest = value if latest is None or value > latest else latest
-
-    stack = [root]
-    while stack:
-        current = stack.pop()
-        try:
-            include_timestamp(current.stat().st_mtime)
-        except OSError:
-            pass
-        if not current.is_dir():
-            continue
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        stat_result = entry.stat(follow_symlinks=False)
-                        include_timestamp(stat_result.st_mtime)
-                    except OSError:
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(Path(entry.path))
-        except OSError:
-            continue
-
+    for timestamp in iter_content_date_timestamps(root):
+        earliest, latest = include_content_timestamp(earliest, latest, timestamp)
     return earliest, latest
 
 
@@ -797,6 +835,19 @@ class VolumeDialog(QDialog):
         self.path_edit = QLineEdit(volume["source_path"] if volume is not None else "")
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.browse)
+        self.date_guess_progress = QProgressBar()
+        self.date_guess_progress.setRange(0, 0)
+        self.date_guess_progress.setFormat("Checking content dates...")
+        self.date_guess_progress.setTextVisible(True)
+        self.date_guess_progress.setVisible(False)
+        configure_progress_bar(self.date_guess_progress)
+        self.date_guess_timer = QTimer(self)
+        self.date_guess_timer.timeout.connect(self.process_content_date_guess)
+        self.date_guess_iterator: Iterator[float] | None = None
+        self.date_guess_source_path: str | None = None
+        self.date_guess_earliest: str | None = None
+        self.date_guess_latest: str | None = None
+        self.date_guess_items_seen = 0
 
         path_row = QHBoxLayout()
         path_row.addWidget(self.path_edit, 1)
@@ -863,6 +914,7 @@ class VolumeDialog(QDialog):
         form.addRow("Name", self.name_edit)
         if self.show_source_path:
             form.addRow("Drive or folder", path_row)
+            form.addRow("", self.date_guess_progress)
         form.addRow("Status", self.status_combo)
         form.addRow("Condition", self.condition_combo)
         form.addRow("Connector", self.connector_combo)
@@ -888,6 +940,7 @@ class VolumeDialog(QDialog):
 
         self.status_combo.currentTextChanged.connect(self.on_status_changed)
         self.mirror_check.toggled.connect(self.on_mirror_toggled)
+        self.path_edit.editingFinished.connect(self.on_path_editing_finished)
         self.on_status_changed(self.status_combo.currentText())
         self.on_mirror_toggled(self.mirror_check.isChecked())
 
@@ -895,12 +948,88 @@ class VolumeDialog(QDialog):
         directory = QFileDialog.getExistingDirectory(self, "Choose Drive or Folder", self.path_edit.text())
         if directory:
             self.path_edit.setText(directory)
-            self.apply_content_date_guess(directory)
+            self.start_content_date_guess(directory)
 
-    def apply_content_date_guess(self, source_path: str | None = None) -> None:
-        earliest, latest = guess_content_dates_from_path(source_path or self.path_edit.text().strip())
+    def on_path_editing_finished(self) -> None:
+        if self.show_source_path:
+            self.start_content_date_guess(self.path_edit.text().strip())
+
+    def start_content_date_guess(self, source_path: str) -> None:
+        self.stop_content_date_guess()
+        if not source_path:
+            return
+        root = Path(source_path)
+        if not root.exists():
+            return
+        if self.earliest_date_edit.value() and self.latest_date_edit.value():
+            return
+
+        self.date_guess_source_path = source_path
+        self.date_guess_iterator = iter_content_date_timestamps(root)
+        self.date_guess_earliest = None
+        self.date_guess_latest = None
+        self.date_guess_items_seen = 0
+        self.date_guess_progress.setRange(0, 0)
+        self.date_guess_progress.setValue(0)
+        self.date_guess_progress.setFormat("Checking content dates...")
+        self.date_guess_progress.setVisible(True)
+        self.date_guess_timer.start(0)
+
+    def stop_content_date_guess(self, hide_progress: bool = True) -> None:
+        self.date_guess_timer.stop()
+        self.date_guess_iterator = None
+        self.date_guess_source_path = None
+        self.date_guess_earliest = None
+        self.date_guess_latest = None
+        self.date_guess_items_seen = 0
+        if hide_progress:
+            self.date_guess_progress.setVisible(False)
+
+    def process_content_date_guess(self) -> None:
+        if self.date_guess_iterator is None:
+            self.date_guess_timer.stop()
+            return
+
+        deadline = monotonic() + CONTENT_DATE_GUESS_TIME_BUDGET_SECONDS
+        processed = 0
+        while processed < CONTENT_DATE_GUESS_ITEM_BUDGET and monotonic() < deadline:
+            try:
+                timestamp = next(self.date_guess_iterator)
+            except StopIteration:
+                self.finish_content_date_guess()
+                return
+            self.date_guess_earliest, self.date_guess_latest = include_content_timestamp(
+                self.date_guess_earliest,
+                self.date_guess_latest,
+                timestamp,
+            )
+            processed += 1
+            self.date_guess_items_seen += 1
+
+        if processed:
+            self.date_guess_progress.setFormat(
+                f"Checking content dates... {self.date_guess_items_seen} items"
+            )
+
+    def finish_content_date_guess(self) -> None:
+        source_path = self.date_guess_source_path
+        earliest = self.date_guess_earliest
+        latest = self.date_guess_latest
+        items_seen = self.date_guess_items_seen
+        self.stop_content_date_guess(hide_progress=False)
+
+        if source_path != self.path_edit.text().strip():
+            self.date_guess_progress.setVisible(False)
+            return
+
         self.earliest_date_edit.set_value_if_empty(earliest)
         self.latest_date_edit.set_value_if_empty(latest)
+        if items_seen:
+            self.date_guess_progress.setRange(0, 1)
+            self.date_guess_progress.setValue(1)
+            self.date_guess_progress.setFormat("Content dates checked")
+        else:
+            self.date_guess_progress.setVisible(False)
 
     def set_master_volume_id(self, volume_id: int) -> None:
         for index in range(self.master_combo.count()):
@@ -984,6 +1113,10 @@ class VolumeDialog(QDialog):
             self.validation_label.setText(message)
             return
         super().accept()
+
+    def done(self, result: int) -> None:
+        self.stop_content_date_guess()
+        super().done(result)
 
 
 class ItemPropertiesDialog(QDialog):
@@ -1236,6 +1369,14 @@ class MainWindow(QMainWindow):
         self.catalogue_widgets: list[QWidget] = []
         self.base_ui_font = QFont(QApplication.font())
         self.ui_zoom = 1.0
+        self._connected_volume_signature: tuple[tuple[str, str, str], ...] = ()
+        self.volume_connection_timer = QTimer(self)
+        self.volume_connection_timer.setInterval(VOLUME_CONNECTION_POLL_INTERVAL_MS)
+        self.volume_connection_timer.timeout.connect(self.check_connected_volumes)
+        self.volume_connection_refresh_timer = QTimer(self)
+        self.volume_connection_refresh_timer.setSingleShot(True)
+        self.volume_connection_refresh_timer.setInterval(VOLUME_CONNECTION_REFRESH_DELAY_MS)
+        self.volume_connection_refresh_timer.timeout.connect(self.refresh_after_connected_volumes_changed)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1180, 760)
@@ -1798,7 +1939,42 @@ class MainWindow(QMainWindow):
         self.catalogue_path = path
         self.catalogue_lock = lock
         self._set_catalogue_open(True)
+        self.start_connected_volume_monitor()
         self.refresh_volumes()
+
+    def current_connected_volume_signature(self) -> tuple[tuple[str, str, str], ...]:
+        return connected_volume_signature(list_connected_volume_snapshots())
+
+    def start_connected_volume_monitor(self) -> None:
+        self._connected_volume_signature = self.current_connected_volume_signature()
+        self.volume_connection_refresh_timer.stop()
+        self.volume_connection_timer.start()
+
+    def stop_connected_volume_monitor(self) -> None:
+        self.volume_connection_timer.stop()
+        self.volume_connection_refresh_timer.stop()
+        self._connected_volume_signature = ()
+
+    @Slot()
+    def check_connected_volumes(self) -> None:
+        if self.db is None:
+            return
+        signature = self.current_connected_volume_signature()
+        if signature == self._connected_volume_signature:
+            return
+        self._connected_volume_signature = signature
+        self.volume_connection_refresh_timer.start()
+
+    @Slot()
+    def refresh_after_connected_volumes_changed(self) -> None:
+        if self.db is None:
+            return
+        self.refresh_volumes()
+        if self.search_edit.text().strip():
+            self.perform_search()
+        else:
+            self.on_search_selection_changed()
+        self.statusBar().showMessage("Connected volumes updated.", 3000)
 
     def _stop_scan_for_catalogue_close(self) -> bool:
         if self.scan_worker is None:
@@ -1879,6 +2055,7 @@ class MainWindow(QMainWindow):
             shortcut.setEnabled(is_open)
 
         if not is_open:
+            self.stop_connected_volume_monitor()
             self._clear_catalogue_views()
         self._update_window_title()
 
@@ -2104,9 +2281,6 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         name, source_path, register = dialog.values()
-        if source_path and (not register["earliest_content_date"] or not register["latest_content_date"]):
-            dialog.apply_content_date_guess(source_path)
-            name, source_path, register = dialog.values()
         try:
             snapshot = capture_volume_snapshot(source_path) if source_path else None
             if snapshot is not None:
