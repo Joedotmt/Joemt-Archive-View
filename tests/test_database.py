@@ -88,6 +88,52 @@ def test_database_initializes_schema(tmp_path):
         db.close()
 
 
+def test_reads_remain_available_during_writer_transaction(tmp_path):
+    path = tmp_path / "catalogue.sqlite3"
+    scanned_at = "2026-06-25T12:00:00.000000+0000"
+    writer = Database(path)
+    reader: Database | None = None
+    try:
+        assert writer.connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        volume_id = writer.create_volume("Archive", str(tmp_path))
+        with writer.transaction():
+            root_id = writer.ensure_folder(
+                volume_id=volume_id,
+                parent_id=None,
+                name="Archive",
+                relative_path="",
+                scanned_at=scanned_at,
+            )
+            writer.ensure_folder(
+                volume_id=volume_id,
+                parent_id=root_id,
+                name="Existing",
+                relative_path="Existing",
+                scanned_at=scanned_at,
+            )
+
+        reader = Database(path, initialize=False, create=False, busy_timeout_ms=50)
+        writer.connection.execute("BEGIN EXCLUSIVE")
+        try:
+            writer.ensure_folder(
+                volume_id=volume_id,
+                parent_id=root_id,
+                name="Scanning",
+                relative_path="Scanning",
+                scanned_at="2026-06-25T13:00:00.000000+0000",
+            )
+
+            children = reader.list_child_folders(volume_id, root_id)
+        finally:
+            writer.connection.rollback()
+
+        assert [row["name"] for row in children] == ["Existing"]
+    finally:
+        if reader is not None:
+            reader.close()
+        writer.close()
+
+
 def test_create_catalogue_appends_extension_and_reopens(tmp_path):
     db = create_catalogue(tmp_path / "Archive")
     try:

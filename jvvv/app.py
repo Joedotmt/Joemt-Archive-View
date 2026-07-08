@@ -1449,6 +1449,8 @@ class MainWindow(QMainWindow):
         self.volume_full_delegate = VolumeFullDelegate(self)
         self.catalogue_actions: list[QAction] = []
         self.catalogue_widgets: list[QWidget] = []
+        self.scan_blocked_actions: list[QAction] = []
+        self.scan_blocked_widgets: list[QWidget] = []
         self.base_ui_font = QFont(QApplication.font())
         self.ui_zoom = 1.0
         self._connected_volume_signature: tuple[tuple[str, str, str], ...] = ()
@@ -1884,6 +1886,8 @@ class MainWindow(QMainWindow):
             self.refresh_action,
         ]
         self.catalogue_widgets = [self.add_button, self.volume_filter_edit, self.search_edit, self.search_button]
+        self.scan_blocked_actions = [self.new_volume_action]
+        self.scan_blocked_widgets = [self.add_button]
 
         self.add_browser_shortcut(QKeySequence("Backspace"), self.navigate_parent_folder)
         self.add_browser_shortcut(QKeySequence("Alt+Up"), self.navigate_parent_folder)
@@ -2178,6 +2182,13 @@ class MainWindow(QMainWindow):
             self.volume_table.setEnabled(enabled)
         if hasattr(self, "tabs"):
             self.tabs.setEnabled(enabled)
+
+    def _set_scan_running_ui(self, running: bool) -> None:
+        enabled = self.db is not None and not running
+        for action in self.scan_blocked_actions:
+            action.setEnabled(enabled)
+        for widget in self.scan_blocked_widgets:
+            widget.setEnabled(enabled)
 
     def _set_catalogue_open(self, is_open: bool) -> None:
         if hasattr(self, "stack"):
@@ -2668,6 +2679,7 @@ class MainWindow(QMainWindow):
         self.scan_progress.setFormat("Starting scan...")
         self.statusBar().showMessage("Rescanning..." if is_rescan else "Scanning...")
         self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
+        self._set_scan_running_ui(True)
 
         self.scan_thread = QThread(self)
         self.scan_worker = ScanWorker(self.db.path, volume["id"], remove_deleted)
@@ -2729,6 +2741,7 @@ class MainWindow(QMainWindow):
     def clear_scan_worker(self) -> None:
         self.scan_worker = None
         self.scan_thread = None
+        self._set_scan_running_ui(False)
         if self.post_scan_edit_volume_id is not None:
             volume_id = self.post_scan_edit_volume_id
             self.post_scan_edit_volume_id = None

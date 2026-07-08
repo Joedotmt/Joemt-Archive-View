@@ -21,6 +21,8 @@ SQLITE_INTEGER_MIN = -(2**63)
 SQLITE_INTEGER_MAX = 2**63 - 1
 UINT64_MODULUS = 2**64
 UINT64_MAX = UINT64_MODULUS - 1
+DEFAULT_BUSY_TIMEOUT_MS = 2000
+INTERACTIVE_BUSY_TIMEOUT_MS = 250
 REQUIRED_TABLES = {"volumes", "volume_register", "folders", "files", "scan_history", "scan_errors"}
 REQUIRED_COLUMNS = {
     "volumes": {
@@ -202,8 +204,10 @@ class Database:
         *,
         initialize: bool = True,
         create: bool = True,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     ) -> None:
         self.path = Path(path).expanduser()
+        self.busy_timeout_ms = busy_timeout_ms
         if create:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connect_target = str(self.path)
@@ -215,7 +219,11 @@ class Database:
             use_uri = True
 
         try:
-            self.connection = sqlite3.connect(connect_target, timeout=2.0, uri=use_uri)
+            self.connection = sqlite3.connect(
+                connect_target,
+                timeout=max(self.busy_timeout_ms, 0) / 1000,
+                uri=use_uri,
+            )
             self.connection.row_factory = sqlite3.Row
             self._configure_connection()
             if initialize:
@@ -242,8 +250,8 @@ class Database:
 
     def _configure_connection(self) -> None:
         self.connection.execute("PRAGMA foreign_keys = ON")
-        self.connection.execute("PRAGMA busy_timeout = 2000")
-        self.connection.execute("PRAGMA journal_mode = DELETE")
+        self.connection.execute(f"PRAGMA busy_timeout = {max(self.busy_timeout_ms, 0)}")
+        self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA synchronous = NORMAL")
 
     def _catalogue_error(self, exc: sqlite3.Error) -> CatalogueError:
@@ -1801,8 +1809,13 @@ def create_catalogue(path: str | Path, *, overwrite: bool = False) -> Database:
         raise
 
 
-def open_catalogue(path: str | Path) -> Database:
-    db = Database(catalogue_path_with_extension(path), initialize=False, create=False)
+def open_catalogue(path: str | Path, *, busy_timeout_ms: int = INTERACTIVE_BUSY_TIMEOUT_MS) -> Database:
+    db = Database(
+        catalogue_path_with_extension(path),
+        initialize=False,
+        create=False,
+        busy_timeout_ms=busy_timeout_ms,
+    )
     try:
         db.validate_catalogue()
         return db
