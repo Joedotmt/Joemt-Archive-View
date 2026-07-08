@@ -980,6 +980,40 @@ class Database:
             )
         )
 
+    def get_catalogue_info(self) -> sqlite3.Row:
+        return self.connection.execute(
+            """
+            WITH volume_stats AS (
+                SELECT
+                    COUNT(*) AS volume_count,
+                    COALESCE(SUM(capacity_bytes), 0) AS total_capacity_bytes,
+                    COALESCE(SUM(used_bytes), 0) AS total_used_bytes,
+                    COALESCE(SUM(free_bytes), 0) AS total_free_bytes,
+                    MAX(last_scan_at) AS latest_scan_at
+                FROM volumes
+            ),
+            file_stats AS (
+                SELECT
+                    COALESCE(SUM(CASE WHEN missing = 0 THEN 1 ELSE 0 END), 0) AS file_count,
+                    COALESCE(SUM(CASE WHEN missing = 0 THEN size_bytes ELSE 0 END), 0) AS indexed_size_bytes,
+                    COALESCE(SUM(CASE WHEN missing != 0 THEN 1 ELSE 0 END), 0) AS missing_file_count
+                FROM files
+            ),
+            folder_stats AS (
+                SELECT
+                    COALESCE(SUM(CASE WHEN missing = 0 THEN 1 ELSE 0 END), 0) AS folder_count,
+                    COALESCE(SUM(CASE WHEN missing != 0 THEN 1 ELSE 0 END), 0) AS missing_folder_count
+                FROM folders
+            ),
+            scan_stats AS (
+                SELECT COUNT(*) AS scan_count
+                FROM scan_history
+            )
+            SELECT *
+            FROM volume_stats, file_stats, folder_stats, scan_stats
+            """
+        ).fetchone()
+
     def upsert_volume_register(self, volume_id: int, register: dict[str, Any]) -> None:
         with self.transaction() as conn:
             self._upsert_volume_register(conn, volume_id, register)

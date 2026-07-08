@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import os
+import re
 import sys
 import traceback
 from time import monotonic
@@ -81,7 +82,7 @@ from .database import (
     open_catalogue,
     parse_db_time,
 )
-from .scanner import VolumeScanner, get_storage_stats
+from .scanner import VolumeScanner
 from .utils import (
     ConnectedVolumeResolver,
     VolumeSnapshot,
@@ -112,6 +113,7 @@ CONTENT_DATE_GUESS_ITEM_BUDGET = 500
 CONTENT_DATE_GUESS_TIME_BUDGET_SECONDS = 0.025
 VOLUME_CONNECTION_POLL_INTERVAL_MS = 1500
 VOLUME_CONNECTION_REFRESH_DELAY_MS = 250
+AID_VOLUME_LABEL_RE = re.compile(r"^AID-\d{3,}$", re.IGNORECASE)
 
 
 def progress_bar_style(height: int) -> str:
@@ -658,6 +660,13 @@ def display_volume_name(name: str | None) -> str:
     return name or "-"
 
 
+def suggested_new_volume_drive_id(volume_label: str | None, fallback_drive_id: str) -> str:
+    label = (volume_label or "").strip()
+    if AID_VOLUME_LABEL_RE.fullmatch(label):
+        return label.upper()
+    return fallback_drive_id
+
+
 def volume_matches_filter(item: VolumeItem, query: str) -> bool:
     text = query.strip().casefold()
     if not text:
@@ -798,6 +807,78 @@ class OptionalDateEdit(QWidget):
 
     def clear(self) -> None:
         self.set_value(None)
+
+
+class DriveIdDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        suggested_drive_id: str,
+        source_path: str,
+        volume_label: str = "",
+        existing_volumes: list[Any] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Confirm Drive ID")
+        self.setMinimumWidth(480)
+        self.existing_drive_ids = {
+            str(row["drive_id"]).casefold()
+            for row in existing_volumes or []
+            if row["drive_id"]
+        }
+
+        self.drive_id_edit = QLineEdit(suggested_drive_id)
+        self.drive_id_edit.selectAll()
+        self.validation_label = QLabel("")
+        self.validation_label.setWordWrap(True)
+        self.validation_label.setStyleSheet("color: #b91c1c;")
+
+        path_label = QLabel(source_path)
+        path_label.setWordWrap(True)
+        path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+
+        form = QFormLayout()
+        form.addRow("Drive or folder", path_label)
+        if volume_label:
+            label_widget = QLabel(volume_label)
+            label_widget.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            form.addRow("Volume Label", label_widget)
+        form.addRow("Drive ID", self.drive_id_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.validation_label)
+        layout.addWidget(buttons)
+
+    def value(self) -> str:
+        return self.drive_id_edit.text().strip()
+
+    def validate_form(self) -> str | None:
+        drive_id = self.value()
+        if not is_valid_drive_id(drive_id):
+            return "Enter a Drive ID."
+        if drive_id.casefold() in self.existing_drive_ids:
+            return "Drive IDs must be unique within the catalogue."
+        return None
+
+    def accept(self) -> None:
+        message = self.validate_form()
+        if message is not None:
+            self.validation_label.setText(message)
+            return
+        super().accept()
 
 
 class VolumeDialog(QDialog):
@@ -1355,6 +1436,7 @@ class MainWindow(QMainWindow):
         self.current_folder_id: int | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: ScanWorker | None = None
+        self.post_scan_edit_volume_id: int | None = None
         self.delete_thread: QThread | None = None
         self.delete_worker: DeleteVolumeWorker | None = None
         self.eject_thread: QThread | None = None
@@ -1424,6 +1506,11 @@ class MainWindow(QMainWindow):
         self.exit_action.setMenuRole(QAction.MenuRole.QuitRole)
         self.exit_action.triggered.connect(QApplication.instance().quit)
         file_menu.addAction(self.exit_action)
+
+        catalogue_menu = self.menuBar().addMenu("&Catalogue")
+        self.catalogue_info_action = QAction("Catalogue Info\u2026", self)
+        self.catalogue_info_action.triggered.connect(self.show_catalogue_info)
+        catalogue_menu.addAction(self.catalogue_info_action)
 
         view_menu = self.menuBar().addMenu("&View")
         self.zoom_in_action = QAction("Zoom In", self)
@@ -1790,7 +1877,12 @@ class MainWindow(QMainWindow):
         self.refresh_action.setShortcut("F5")
         self.refresh_action.triggered.connect(self.refresh_volumes)
         self.addAction(self.refresh_action)
-        self.catalogue_actions = [self.close_catalogue_action, self.new_volume_action, self.refresh_action]
+        self.catalogue_actions = [
+            self.close_catalogue_action,
+            self.new_volume_action,
+            self.catalogue_info_action,
+            self.refresh_action,
+        ]
         self.catalogue_widgets = [self.add_button, self.volume_filter_edit, self.search_edit, self.search_button]
 
         self.add_browser_shortcut(QKeySequence("Backspace"), self.navigate_parent_folder)
@@ -1809,6 +1901,50 @@ class MainWindow(QMainWindow):
 
     def show_help(self) -> None:
         dialog = HelpDialog(self)
+        dialog.exec()
+
+    def show_catalogue_info(self) -> None:
+        if self.db is None:
+            return
+
+        info = self.db.get_catalogue_info()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Catalogue Info")
+        dialog.setMinimumWidth(self.scaled_ui_value(460))
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        def add_row(label: str, value: str, *, wrap: bool = False) -> None:
+            value_label = QLabel(value)
+            value_label.setWordWrap(wrap)
+            value_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            form.addRow(label, value_label)
+
+        add_row("Catalogue", self.catalogue_path.name if self.catalogue_path is not None else "-")
+        add_row("Location", str(self.catalogue_path) if self.catalogue_path is not None else "-", wrap=True)
+        add_row("Volumes", self._display_optional_count(info["volume_count"]))
+        add_row("Total Data Used", format_size(info["total_used_bytes"]))
+        add_row("Total Capacity", format_size(info["total_capacity_bytes"]))
+        add_row("Total Free", format_size(info["total_free_bytes"]))
+        add_row("Total Indexed Size", format_size(info["indexed_size_bytes"]))
+        add_row("Files", self._display_optional_count(info["file_count"]))
+        add_row("Folders", self._display_optional_count(info["folder_count"]))
+        add_row("Missing Files", self._display_optional_count(info["missing_file_count"]))
+        add_row("Missing Folders", self._display_optional_count(info["missing_folder_count"]))
+        add_row("Scans", self._display_optional_count(info["scan_count"]))
+        add_row("Latest Scan", self._display_time(info["latest_scan_at"]))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dialog.accept)
+
+        layout = QVBoxLayout(dialog)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
         dialog.exec()
 
     def new_catalogue(self) -> None:
@@ -2062,6 +2198,7 @@ class MainWindow(QMainWindow):
     def _clear_catalogue_views(self) -> None:
         self.current_volume_id = None
         self.current_folder_id = None
+        self.post_scan_edit_volume_id = None
         self.volume_model.set_items([])
         self.browser_model.set_items([])
         self.search_model.set_items([])
@@ -2271,46 +2408,53 @@ class MainWindow(QMainWindow):
         if self._catalogue_job_running():
             self._show_catalogue_job_running_message()
             return
-        dialog = VolumeDialog(
-            self,
-            "New Volume",
-            suggested_drive_id=self.db.next_drive_id(),
-            master_options=self.db.list_master_volume_options(),
-            existing_volumes=self.db.list_volumes(),
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        source_path = self.choose_new_volume_location()
+        if source_path is None:
             return
-        name, source_path, register = dialog.values()
         try:
             snapshot = capture_volume_snapshot(source_path) if source_path else None
             if snapshot is not None:
                 source_path = snapshot.source_path
+            drive_id = self.choose_new_volume_drive_id(source_path, snapshot)
+            if drive_id is None:
+                return
             volume_id = self.db.create_volume(
-                name,
+                "",
                 source_path,
-                register,
-                snapshot.as_db_fields() if snapshot is not None else None,
+                {"drive_id": drive_id},
+                location=snapshot.as_db_fields() if snapshot is not None else None,
             )
-            path = Path(source_path) if source_path else None
-            if path is not None and path.exists():
-                try:
-                    capacity, used, free = get_storage_stats(path)
-                    self.db.update_volume_storage(volume_id, capacity, used, free)
-                except OSError:
-                    pass
             self.current_volume_id = volume_id
             self.refresh_volumes()
-            if source_path:
-                self.start_scan(
-                    remove_deleted=True,
-                    is_rescan=False,
-                    volume_id=volume_id,
-                    source_path=source_path,
-                )
-            else:
-                self.statusBar().showMessage("Volume added.", 4000)
+            self.start_scan(
+                remove_deleted=True,
+                is_rescan=False,
+                volume_id=volume_id,
+                source_path=source_path,
+                edit_after_success=True,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "New Volume Failed", str(exc))
+
+    def choose_new_volume_location(self) -> str | None:
+        directory = QFileDialog.getExistingDirectory(self, "Choose Volume to Scan", str(Path.home()))
+        return directory or None
+
+    def choose_new_volume_drive_id(self, source_path: str, snapshot: VolumeSnapshot | None) -> str | None:
+        if self.db is None:
+            return None
+        volume_label = snapshot.identity_label if snapshot is not None else ""
+        suggested_drive_id = suggested_new_volume_drive_id(volume_label, self.db.next_drive_id())
+        dialog = DriveIdDialog(
+            self,
+            suggested_drive_id=suggested_drive_id,
+            source_path=source_path,
+            volume_label=volume_label,
+            existing_volumes=self.db.list_volumes(),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.value()
 
     def edit_volume(self) -> None:
         if self.db is None:
@@ -2320,6 +2464,11 @@ class MainWindow(QMainWindow):
             return
         volume = self.selected_volume()
         if volume is None:
+            return
+        self.edit_volume_record(volume)
+
+    def edit_volume_record(self, volume) -> None:
+        if self.db is None:
             return
         dialog = VolumeDialog(
             self,
@@ -2339,6 +2488,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Volume updated.", 4000)
         except Exception as exc:
             QMessageBox.critical(self, "Edit Volume Failed", str(exc))
+
+    def edit_volume_by_id(self, volume_id: int) -> None:
+        if self.db is None:
+            return
+        volume = self.db.get_volume(volume_id)
+        if volume is None:
+            return
+        self.select_volume(volume_id)
+        self.edit_volume_record(volume)
 
     def edit_volume_index(self, index: QModelIndex) -> None:
         if self.db is None or not index.isValid():
@@ -2478,6 +2636,7 @@ class MainWindow(QMainWindow):
         is_rescan: bool,
         volume_id: int | None = None,
         source_path: str | None = None,
+        edit_after_success: bool = False,
     ) -> None:
         if self.db is None:
             return
@@ -2508,6 +2667,7 @@ class MainWindow(QMainWindow):
         self.scan_progress.setRange(0, 0)
         self.scan_progress.setFormat("Starting scan...")
         self.statusBar().showMessage("Rescanning..." if is_rescan else "Scanning...")
+        self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
 
         self.scan_thread = QThread(self)
         self.scan_worker = ScanWorker(self.db.path, volume["id"], remove_deleted)
@@ -2546,6 +2706,8 @@ class MainWindow(QMainWindow):
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(1)
         status = result.get("status", "completed")
+        if status != "completed":
+            self.post_scan_edit_volume_id = None
         self.scan_progress.setFormat(status.title())
         self.statusBar().showMessage(
             f"Scan {status}: {result.get('files_seen', 0)} files, "
@@ -2556,6 +2718,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def on_scan_failed(self, details: str) -> None:
+        self.post_scan_edit_volume_id = None
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(0)
         self.scan_progress.setFormat("Scan failed")
@@ -2566,6 +2729,10 @@ class MainWindow(QMainWindow):
     def clear_scan_worker(self) -> None:
         self.scan_worker = None
         self.scan_thread = None
+        if self.post_scan_edit_volume_id is not None:
+            volume_id = self.post_scan_edit_volume_id
+            self.post_scan_edit_volume_id = None
+            QTimer.singleShot(0, lambda volume_id=volume_id: self.edit_volume_by_id(volume_id))
 
     @Slot(str)
     def on_delete_progress(self, message: str) -> None:

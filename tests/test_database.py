@@ -212,6 +212,99 @@ def test_delete_volume_removes_indexed_records_for_only_that_volume(tmp_path):
         db.close()
 
 
+def test_catalogue_info_summarizes_storage_and_index_counts(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        scanned_at = "2026-06-25T12:00:00.000000+0000"
+        later_scan = "2026-06-25T13:00:00.000000+0000"
+        first_volume_id = db.create_volume("First", str(tmp_path / "first"))
+        second_volume_id = db.create_volume("Second", str(tmp_path / "second"))
+
+        db.update_volume_storage(first_volume_id, 1000, 600, 400, scanned_at)
+        db.update_volume_storage(second_volume_id, 2000, 800, 1200, later_scan)
+
+        first_root_id = db.ensure_folder(
+            volume_id=first_volume_id,
+            parent_id=None,
+            name="First",
+            relative_path="",
+            scanned_at=scanned_at,
+        )
+        child_id = db.ensure_folder(
+            volume_id=first_volume_id,
+            parent_id=first_root_id,
+            name="child",
+            relative_path="child",
+            scanned_at=scanned_at,
+        )
+        old_folder_id = db.ensure_folder(
+            volume_id=first_volume_id,
+            parent_id=first_root_id,
+            name="old",
+            relative_path="old",
+            scanned_at=scanned_at,
+        )
+        db.ensure_folder(
+            volume_id=second_volume_id,
+            parent_id=None,
+            name="Second",
+            relative_path="",
+            scanned_at=later_scan,
+        )
+
+        db.upsert_file(
+            volume_id=first_volume_id,
+            folder_id=child_id,
+            name="one.bin",
+            relative_path="child/one.bin",
+            extension="bin",
+            size_bytes=100,
+            modified_at=None,
+            scanned_at=scanned_at,
+        )
+        db.upsert_file(
+            volume_id=first_volume_id,
+            folder_id=child_id,
+            name="two.bin",
+            relative_path="child/two.bin",
+            extension="bin",
+            size_bytes=150,
+            modified_at=None,
+            scanned_at=scanned_at,
+        )
+        missing_file_id = db.upsert_file(
+            volume_id=first_volume_id,
+            folder_id=old_folder_id,
+            name="gone.bin",
+            relative_path="old/gone.bin",
+            extension="bin",
+            size_bytes=25,
+            modified_at=None,
+            scanned_at=scanned_at,
+        )
+        db.connection.execute("UPDATE folders SET missing = 1 WHERE id = ?", (old_folder_id,))
+        db.connection.execute("UPDATE files SET missing = 1 WHERE id = ?", (missing_file_id,))
+
+        scan_id = db.start_scan(first_volume_id)
+        db.finish_scan(scan_id, "completed", 2, 3, 0)
+
+        info = db.get_catalogue_info()
+
+        assert info["volume_count"] == 2
+        assert info["total_capacity_bytes"] == 3000
+        assert info["total_used_bytes"] == 1400
+        assert info["total_free_bytes"] == 1600
+        assert info["indexed_size_bytes"] == 250
+        assert info["file_count"] == 2
+        assert info["folder_count"] == 3
+        assert info["missing_file_count"] == 1
+        assert info["missing_folder_count"] == 1
+        assert info["scan_count"] == 1
+        assert info["latest_scan_at"] == later_scan
+    finally:
+        db.close()
+
+
 def test_volume_location_identity_can_be_updated_and_cleared(tmp_path):
     db = Database(tmp_path / "catalogue.sqlite3")
     try:
