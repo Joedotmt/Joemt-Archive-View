@@ -87,8 +87,6 @@ from .utils import (
     ConnectedVolumeResolver,
     VolumeSnapshot,
     capture_volume_snapshot,
-    eject_volume,
-    eject_volume_supported,
     format_size,
     list_connected_volume_snapshots,
     open_in_file_manager,
@@ -1409,23 +1407,6 @@ class DeleteVolumeWorker(QObject):
             self.failed.emit(error_details)
 
 
-class EjectVolumeWorker(QObject):
-    finished = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, source_path: str) -> None:
-        super().__init__()
-        self.source_path = source_path
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            drive_root = eject_volume(self.source_path)
-            self.finished.emit(drive_root)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1439,8 +1420,6 @@ class MainWindow(QMainWindow):
         self.post_scan_edit_volume_id: int | None = None
         self.delete_thread: QThread | None = None
         self.delete_worker: DeleteVolumeWorker | None = None
-        self.eject_thread: QThread | None = None
-        self.eject_worker: EjectVolumeWorker | None = None
         self.browser_shortcuts: list[QShortcut] = []
         self.browser_icons = CatalogueIconProvider()
         self.volume_model = VolumeTableModel(self)
@@ -2147,7 +2126,7 @@ class MainWindow(QMainWindow):
         return False
 
     def _catalogue_job_running(self) -> bool:
-        return self.scan_worker is not None or self.delete_worker is not None or self.eject_worker is not None
+        return self.scan_worker is not None or self.delete_worker is not None
 
     def _show_catalogue_job_running_message(self) -> None:
         if self.delete_worker is not None:
@@ -2155,12 +2134,6 @@ class MainWindow(QMainWindow):
                 self,
                 "Volume Deleting",
                 "Wait for the current volume delete to finish.",
-            )
-        elif self.eject_worker is not None:
-            QMessageBox.information(
-                self,
-                "Volume Ejecting",
-                "Wait for the current volume eject to finish.",
             )
         else:
             QMessageBox.information(
@@ -2321,11 +2294,7 @@ class MainWindow(QMainWindow):
 
         self.volume_table.selectRow(index.row())
         self.volume_table.setCurrentIndex(self.volume_model.index(index.row(), 0))
-        volume = self.selected_volume()
         scan_running = self.scan_worker is not None
-        current_source_path = self.current_source_path_for_volume(volume)
-        volume_connected = current_source_path is not None
-        volume_ejectable = current_source_path is not None and eject_volume_supported(current_source_path)
 
         new_action = menu.addAction("New Volume")
         new_action.triggered.connect(self.add_volume)
@@ -2348,11 +2317,6 @@ class MainWindow(QMainWindow):
         rescan_action = menu.addAction("Rescan")
         rescan_action.triggered.connect(self.start_rescan)
         rescan_action.setEnabled(not busy)
-
-        if volume_connected and volume_ejectable:
-            eject_action = menu.addAction("Eject Volume")
-            eject_action.triggered.connect(self.eject_selected_volume)
-            eject_action.setEnabled(not busy)
 
         cancel_action = menu.addAction("Cancel Scan")
         cancel_action.triggered.connect(self.cancel_scan)
@@ -2572,58 +2536,6 @@ class MainWindow(QMainWindow):
         self.delete_thread.finished.connect(self.clear_delete_worker)
         self.delete_thread.start()
 
-    def eject_selected_volume(self) -> None:
-        if self.db is None:
-            return
-        if self._catalogue_job_running():
-            self._show_catalogue_job_running_message()
-            return
-
-        volume = self.selected_volume()
-        if volume is None:
-            return
-
-        source_path = self.current_source_path_for_volume(volume)
-        if source_path is None:
-            QMessageBox.information(
-                self,
-                "Volume Offline",
-                "This volume is not currently connected.",
-            )
-            self.refresh_volumes()
-            return
-
-        if not eject_volume_supported(source_path):
-            QMessageBox.information(
-                self,
-                "Eject Unavailable",
-                "JVVV can only eject non-system Windows drive-letter volumes.",
-            )
-            return
-
-        display_name = volume["drive_id"] or display_volume_name(volume["name"])
-        self.start_eject_volume(source_path, display_name)
-
-    def start_eject_volume(self, source_path: str, display_name: str) -> None:
-        self._set_catalogue_busy(True)
-        self.scan_progress.setRange(0, 0)
-        self.scan_progress.setFormat(f"Ejecting {display_name}...")
-        self.statusBar().showMessage(f"Ejecting {display_name}...")
-
-        self.eject_thread = QThread(self)
-        self.eject_worker = EjectVolumeWorker(source_path)
-        self.eject_worker.moveToThread(self.eject_thread)
-        self.eject_thread.started.connect(self.eject_worker.run)
-        self.eject_worker.finished.connect(self.on_eject_finished)
-        self.eject_worker.failed.connect(self.on_eject_failed)
-        self.eject_worker.finished.connect(self.eject_thread.quit)
-        self.eject_worker.failed.connect(self.eject_thread.quit)
-        self.eject_worker.finished.connect(self.eject_worker.deleteLater)
-        self.eject_worker.failed.connect(self.eject_worker.deleteLater)
-        self.eject_thread.finished.connect(self.eject_thread.deleteLater)
-        self.eject_thread.finished.connect(self.clear_eject_worker)
-        self.eject_thread.start()
-
     def start_rescan(self) -> None:
         volume = self.selected_volume()
         if volume is None:
@@ -2771,28 +2683,6 @@ class MainWindow(QMainWindow):
     def clear_delete_worker(self) -> None:
         self.delete_worker = None
         self.delete_thread = None
-        self._set_catalogue_busy(False)
-
-    @Slot(str)
-    def on_eject_finished(self, drive_root: str) -> None:
-        self.scan_progress.setRange(0, 1)
-        self.scan_progress.setValue(1)
-        self.scan_progress.setFormat("Ejected")
-        self.statusBar().showMessage(f"Ejected {drive_root}.", 4000)
-        self.refresh_volumes()
-
-    @Slot(str)
-    def on_eject_failed(self, details: str) -> None:
-        self.scan_progress.setRange(0, 1)
-        self.scan_progress.setValue(0)
-        self.scan_progress.setFormat("Eject failed")
-        QMessageBox.warning(self, "Eject Volume Failed", details)
-        self.refresh_volumes()
-
-    @Slot()
-    def clear_eject_worker(self) -> None:
-        self.eject_worker = None
-        self.eject_thread = None
         self._set_catalogue_busy(False)
 
     def refresh_after_catalogue_write(self) -> None:
