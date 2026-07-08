@@ -139,7 +139,10 @@ def utc_now() -> str:
 def format_timestamp(value: float | int | None) -> str | None:
     if value is None:
         return None
-    return datetime.fromtimestamp(value, timezone.utc).strftime(ISO_FORMAT)
+    try:
+        return datetime.fromtimestamp(value, timezone.utc).strftime(ISO_FORMAT)
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def parse_db_time(value: str | None) -> datetime | None:

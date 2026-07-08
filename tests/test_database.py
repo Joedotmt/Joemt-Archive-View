@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+from jvvv import database as database_module
 from jvvv.database import (
     Database,
     InvalidCatalogueError,
@@ -12,6 +13,17 @@ from jvvv.database import (
     create_catalogue,
     open_catalogue,
 )
+
+
+def test_format_timestamp_returns_none_for_unrepresentable_os_timestamp(monkeypatch):
+    class UnrepresentableDateTime:
+        @staticmethod
+        def fromtimestamp(value, tz):
+            raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(database_module, "datetime", UnrepresentableDateTime)
+
+    assert database_module.format_timestamp(123) is None
 
 
 def test_database_initializes_schema(tmp_path):
