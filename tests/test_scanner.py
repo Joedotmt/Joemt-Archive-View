@@ -59,6 +59,29 @@ def test_scan_indexes_files_and_folders(tmp_path):
         db.close()
 
 
+def test_scan_reports_folder_statistics_progress(tmp_path):
+    source = tmp_path / "drive"
+    source.mkdir()
+    make_tree(source)
+    db = Database(tmp_path / "catalogue.sqlite3")
+    progress_events = []
+    try:
+        volume_id = db.create_volume("Drive", str(source))
+        result = VolumeScanner(
+            db,
+            stats_progress_callback=lambda files, folders, message, done, total: progress_events.append(
+                (files, folders, message, done, total)
+            ),
+        ).scan(volume_id)
+
+        assert result.status == "completed"
+        assert progress_events[0] == (3, 3, "Preparing folder statistics", 0, 3)
+        assert (3, 3, "Calculating folder statistics", 3, 3) in progress_events
+        assert progress_events[-1] == (3, 3, "Folder statistics updated", 3, 3)
+    finally:
+        db.close()
+
+
 def test_rescan_removes_deleted_and_updates_changed_files(tmp_path):
     source = tmp_path / "drive"
     source.mkdir()

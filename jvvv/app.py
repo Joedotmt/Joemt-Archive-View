@@ -1449,6 +1449,7 @@ class HelpDialog(QDialog):
 
 class ScanWorker(QObject):
     progress = Signal(int, int, str)
+    stats_progress = Signal(int, int, str, int, int)
     finished = Signal(dict)
     failed = Signal(str)
 
@@ -1467,6 +1468,13 @@ class ScanWorker(QObject):
             scanner = VolumeScanner(
                 db,
                 progress_callback=lambda files, folders, path: self.progress.emit(files, folders, path),
+                stats_progress_callback=lambda files, folders, message, done, total: self.stats_progress.emit(
+                    files,
+                    folders,
+                    message,
+                    done,
+                    total,
+                ),
                 cancel_callback=lambda: self.cancel_requested,
             )
             result = scanner.scan(self.volume_id, remove_deleted=self.remove_deleted)
@@ -2828,6 +2836,7 @@ class MainWindow(QMainWindow):
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.progress.connect(self.on_scan_progress)
+        self.scan_worker.stats_progress.connect(self.on_scan_stats_progress)
         self.scan_worker.finished.connect(self.on_scan_finished)
         self.scan_worker.failed.connect(self.on_scan_failed)
         self.scan_worker.finished.connect(self.scan_thread.quit)
@@ -2853,7 +2862,43 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int, str)
     def on_scan_progress(self, files_seen: int, folders_seen: int, current_path: str) -> None:
-        self.scan_progress.setFormat(f"{files_seen} files, {folders_seen} folders - {current_path}")
+        if self.scan_progress.maximum() != 0:
+            self.scan_progress.setRange(0, 0)
+        self.scan_progress.setFormat(
+            f"Scanning... {files_seen:,} files, {folders_seen:,} folders - {current_path}"
+        )
+
+    @Slot(int, int, str, int, int)
+    def on_scan_stats_progress(
+        self,
+        files_seen: int,
+        folders_seen: int,
+        message: str,
+        done: int,
+        total: int,
+    ) -> None:
+        label = self.scan_stats_progress_label(message)
+        if total > 0:
+            value = min(max(done, 0), total)
+            if self.scan_progress.minimum() != 0 or self.scan_progress.maximum() != total:
+                self.scan_progress.setRange(0, total)
+            self.scan_progress.setValue(value)
+            self.scan_progress.setFormat(f"{label}: %p% ({value:,}/{total:,} folders)")
+        else:
+            if self.scan_progress.maximum() != 0:
+                self.scan_progress.setRange(0, 0)
+            self.scan_progress.setFormat(f"{label}...")
+        self.statusBar().showMessage(
+            f"Finalizing scan: {files_seen:,} files, {folders_seen:,} folders."
+        )
+
+    def scan_stats_progress_label(self, message: str) -> str:
+        labels = {
+            "Preparing folder statistics": "Preparing folder sizes",
+            "Calculating folder statistics": "Calculating folder sizes",
+            "Folder statistics updated": "Folder sizes calculated",
+        }
+        return labels.get(message, message)
 
     @Slot(dict)
     def on_scan_finished(self, result: dict) -> None:

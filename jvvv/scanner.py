@@ -12,6 +12,7 @@ from .utils import capture_volume_snapshot, resolve_volume_source_path, volume_i
 
 
 ProgressCallback = Callable[[int, int, str], None]
+StatsProgressCallback = Callable[[int, int, str, int, int], None]
 CancelCallback = Callable[[], bool]
 
 
@@ -44,11 +45,13 @@ class VolumeScanner:
         self,
         db: Database,
         progress_callback: ProgressCallback | None = None,
+        stats_progress_callback: StatsProgressCallback | None = None,
         cancel_callback: CancelCallback | None = None,
         batch_size: int = 500,
     ) -> None:
         self.db = db
         self.progress_callback = progress_callback
+        self.stats_progress_callback = stats_progress_callback
         self.cancel_callback = cancel_callback
         self.batch_size = batch_size
 
@@ -211,7 +214,7 @@ class VolumeScanner:
 
                 if status == "completed":
                     self.db.finalize_scan_items(volume_id, scanned_at, remove_deleted)
-                    self._emit_progress(files_seen, folders_seen, "Calculating folder sizes...")
+                    self._emit_progress(files_seen, folders_seen, "Preparing folder sizes...")
                     self.db.rebuild_folder_statistics(
                         volume_id,
                         stats_updated_at=scanned_at,
@@ -260,7 +263,9 @@ class VolumeScanner:
     ) -> None:
         if self._cancelled():
             raise ScanCancelled("Scan cancelled.")
-        if total:
+        if self.stats_progress_callback:
+            self.stats_progress_callback(files_seen, folders_seen, message, done, total)
+        elif total:
             self._emit_progress(files_seen, folders_seen, f"{message} ({done}/{total})")
         else:
             self._emit_progress(files_seen, folders_seen, message)
