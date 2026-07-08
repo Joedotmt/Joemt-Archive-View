@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterator
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QByteArray,
     QDate,
     QEventLoop,
     QFileInfo,
@@ -23,6 +24,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QLocale,
+    QSettings,
     QThread,
     QTimer,
     Signal,
@@ -52,6 +54,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStatusBar,
     QStyle,
@@ -102,6 +105,8 @@ ROLE_RELATIVE_PATH = Qt.ItemDataRole.UserRole + 2
 ROLE_ITEM_TYPE = Qt.ItemDataRole.UserRole + 3
 ROLE_ITEM_ID = Qt.ItemDataRole.UserRole + 4
 ROLE_PERCENT_FULL = Qt.ItemDataRole.UserRole + 5
+VOLUME_FULL_COLUMN = 18
+LAST_CATALOGUE_PATH_SETTING = "catalogues/lastPath"
 CATALOGUE_FILE_FILTER = "Joemt Archive View Files (*.jvvv)"
 PROGRESS_BAR_HEIGHT = 16
 UI_ZOOM_STEP = 0.1
@@ -440,6 +445,7 @@ class SearchResultItem:
     item_id: int
     name: str
     volume_id: int
+    drive_id: str | None
     volume_name: str | None
     relative_path: str
     size_bytes: int | None
@@ -498,15 +504,61 @@ class VolumeTableModel(StandardTableModel):
                     sort_key=lambda item: drive_id_sort_key(item.drive_id),
                 ),
                 TableColumn("Name", lambda item: display_volume_name(item.name)),
+                TableColumn("Source Path", lambda item: item.source_path or "-"),
                 TableColumn("Status", lambda item: item.register_status),
                 TableColumn("Condition", lambda item: item.condition),
+                TableColumn("Description", lambda item: item.description or "-"),
                 TableColumn("Connector", lambda item: item.connector),
                 TableColumn("Connection", lambda item: "Connected" if item.connected else "Offline"),
+                TableColumn("Mirror", lambda item: "Yes" if item.is_mirror else "No", sort_key=lambda item: item.is_mirror),
+                TableColumn(
+                    "Master Drive",
+                    lambda item: volume_reference(item.master_drive_id, item.master_name)
+                    if item.master_volume_id is not None
+                    else "-",
+                ),
+                TableColumn("Date Added", lambda item: display_db_date(item.date_added), sort_key=lambda item: item.date_added or ""),
+                TableColumn(
+                    "Earliest Content",
+                    lambda item: display_db_date(item.earliest_content_date),
+                    sort_key=lambda item: item.earliest_content_date or "",
+                ),
+                TableColumn(
+                    "Latest Content",
+                    lambda item: display_db_date(item.latest_content_date),
+                    sort_key=lambda item: item.latest_content_date or "",
+                ),
+                TableColumn("Retired Date", lambda item: display_db_date(item.retired_date), sort_key=lambda item: item.retired_date or ""),
+                TableColumn("Mirror Date", lambda item: display_db_date(item.mirror_date), sort_key=lambda item: item.mirror_date or ""),
+                TableColumn(
+                    "Capacity",
+                    lambda item: format_size(item.capacity_bytes),
+                    sort_key=lambda item: item.capacity_bytes,
+                    alignment=Qt.AlignmentFlag.AlignRight,
+                ),
+                TableColumn(
+                    "Used",
+                    lambda item: format_size(item.used_bytes),
+                    sort_key=lambda item: item.used_bytes,
+                    alignment=Qt.AlignmentFlag.AlignRight,
+                ),
+                TableColumn(
+                    "Free",
+                    lambda item: format_size(item.free_bytes),
+                    sort_key=lambda item: item.free_bytes,
+                    alignment=Qt.AlignmentFlag.AlignRight,
+                ),
                 TableColumn("Full", lambda item: f"{item.percent_full}%", sort_key=lambda item: item.percent_full),
                 TableColumn(
                     "Files",
-                    lambda item: str(item.indexed_file_count),
+                    lambda item: f"{item.indexed_file_count:,}",
                     sort_key=lambda item: item.indexed_file_count,
+                    alignment=Qt.AlignmentFlag.AlignRight,
+                ),
+                TableColumn(
+                    "Folders",
+                    lambda item: f"{item.indexed_folder_count:,}",
+                    sort_key=lambda item: item.indexed_folder_count,
                     alignment=Qt.AlignmentFlag.AlignRight,
                 ),
                 TableColumn("Last Scan", lambda item: display_db_time(item.last_scan_at), sort_key=lambda item: item.last_scan_at or ""),
@@ -530,6 +582,11 @@ class SearchResultsTableModel(StandardTableModel):
                 TableColumn("Name", lambda item: item.name, decoration=self.icon_for),
                 TableColumn("Kind", lambda item: item.item_type.title()),
                 TableColumn("Volume", lambda item: display_volume_name(item.volume_name)),
+                TableColumn(
+                    "Drive ID",
+                    lambda item: item.drive_id or "-",
+                    sort_key=lambda item: drive_id_sort_key(item.drive_id),
+                ),
                 TableColumn("Relative Path", lambda item: relative_path_for_display(item.relative_path)),
                 TableColumn(
                     "Size",
@@ -673,10 +730,22 @@ def volume_matches_filter(item: VolumeItem, query: str) -> bool:
         [
             item.drive_id or "",
             item.name or "",
+            item.source_path or "",
             item.register_status,
             item.condition,
             item.description,
             item.connector,
+            "mirror" if item.is_mirror else "",
+            volume_reference(item.master_drive_id, item.master_name)
+            if item.master_volume_id is not None
+            else "",
+            item.date_added or "",
+            item.earliest_content_date or "",
+            item.latest_content_date or "",
+            item.retired_date or "",
+            item.mirror_date or "",
+            str(item.indexed_file_count),
+            str(item.indexed_folder_count),
         ]
     ).casefold()
     return all(term in haystack for term in text.split())
@@ -893,7 +962,8 @@ class VolumeDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumWidth(680)
+        self.setMinimumWidth(760)
+        self.resize(820, 620)
         self.current_volume_id = int(volume["id"]) if volume is not None else None
         self.show_source_path = show_source_path
         self.master_options = master_options or []
@@ -912,6 +982,7 @@ class VolumeDialog(QDialog):
         self.drive_id_edit = QLineEdit(volume["drive_id"] if volume is not None else suggested_drive_id)
         self.name_edit = QLineEdit((volume["name"] or "") if volume is not None else "")
         self.path_edit = QLineEdit(volume["source_path"] if volume is not None else "")
+        self.path_display_label = self._read_only_value_label(self.path_edit.text() or "-")
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.browse)
         self.date_guess_progress = QProgressBar()
@@ -988,23 +1059,48 @@ class VolumeDialog(QDialog):
         self.validation_label.setWordWrap(True)
         self.validation_label.setStyleSheet("color: #b91c1c;")
 
-        form = QFormLayout()
-        form.addRow("Drive ID", self.drive_id_edit)
-        form.addRow("Name", self.name_edit)
+        identity_box, identity_form = self._dialog_section("Identity")
+        identity_form.addRow("Drive ID", self.drive_id_edit)
+        identity_form.addRow("Name", self.name_edit)
         if self.show_source_path:
-            form.addRow("Drive or folder", path_row)
-            form.addRow("", self.date_guess_progress)
-        form.addRow("Status", self.status_combo)
-        form.addRow("Condition", self.condition_combo)
-        form.addRow("Connector", self.connector_combo)
-        form.addRow("Date Added", self.date_added_edit)
-        form.addRow("Earliest Content Date", self.earliest_date_edit)
-        form.addRow("Latest Content Date", self.latest_date_edit)
-        form.addRow("Retired Date", self.retired_date_edit)
-        form.addRow("", self.mirror_check)
-        form.addRow("Master Drive", self.master_combo)
-        form.addRow("Mirror Date", self.mirror_date_edit)
-        form.addRow("Description", self.description_edit)
+            identity_form.addRow("Drive or folder", path_row)
+            identity_form.addRow("", self.date_guess_progress)
+        else:
+            identity_form.addRow("Scan Path", self.path_display_label)
+
+        register_box, register_form = self._dialog_section("Register")
+        register_form.addRow("Status", self.status_combo)
+        register_form.addRow("Condition", self.condition_combo)
+        register_form.addRow("Connector", self.connector_combo)
+
+        dates_box, dates_form = self._dialog_section("Dates")
+        dates_form.addRow("Date Added", self.date_added_edit)
+        dates_form.addRow("Earliest Content", self.earliest_date_edit)
+        dates_form.addRow("Latest Content", self.latest_date_edit)
+        dates_form.addRow("Retired Date", self.retired_date_edit)
+
+        mirror_box, mirror_form = self._dialog_section("Mirror")
+        mirror_form.addRow("", self.mirror_check)
+        mirror_form.addRow("Master Drive", self.master_combo)
+        mirror_form.addRow("Mirror Date", self.mirror_date_edit)
+
+        notes_box = QGroupBox("Notes")
+        notes_layout = QVBoxLayout(notes_box)
+        notes_layout.addWidget(self.description_edit)
+
+        content = QWidget()
+        content_layout = QGridLayout(content)
+        content_layout.setColumnStretch(0, 1)
+        content_layout.setColumnStretch(1, 1)
+        content_layout.addWidget(identity_box, 0, 0)
+        content_layout.addWidget(register_box, 0, 1)
+        content_layout.addWidget(dates_box, 1, 0)
+        content_layout.addWidget(mirror_box, 1, 1)
+        content_layout.addWidget(notes_box, 2, 0, 1, 2)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1013,7 +1109,7 @@ class VolumeDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
+        layout.addWidget(scroll, 1)
         layout.addWidget(self.validation_label)
         layout.addWidget(buttons)
 
@@ -1022,6 +1118,21 @@ class VolumeDialog(QDialog):
         self.path_edit.editingFinished.connect(self.on_path_editing_finished)
         self.on_status_changed(self.status_combo.currentText())
         self.on_mirror_toggled(self.mirror_check.isChecked())
+
+    def _read_only_value_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        return label
+
+    def _dialog_section(self, title: str) -> tuple[QGroupBox, QFormLayout]:
+        box = QGroupBox(title)
+        form = QFormLayout(box)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        return box, form
 
     def browse(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Choose Drive or Folder", self.path_edit.text())
@@ -1410,6 +1521,7 @@ class DeleteVolumeWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.settings = QSettings("JVVV", APP_NAME)
         self.db: Database | None = None
         self.catalogue_path: Path | None = None
         self.catalogue_lock: QLockFile | None = None
@@ -1449,11 +1561,14 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._set_catalogue_open(False)
+        QTimer.singleShot(0, self.open_last_catalogue)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.save_all_table_header_states()
         if not self.close_catalogue(show_status=False):
             event.ignore()
             return
+        self.settings.sync()
         super().closeEvent(event)
 
     def _build_menu_bar(self) -> None:
@@ -1560,8 +1675,8 @@ class MainWindow(QMainWindow):
             configure_progress_bar(self.scan_progress, self.ui_zoom)
         if hasattr(self, "detail_full"):
             configure_progress_bar(self.detail_full, self.ui_zoom)
-        if hasattr(self, "detail_description"):
-            self.detail_description.setMaximumHeight(self.scaled_ui_value(76))
+        if hasattr(self, "details_box"):
+            self.details_box.setMaximumHeight(self.scaled_ui_value(150))
 
     def scaled_ui_value(self, value: int) -> int:
         return max(1, round(value * self.ui_zoom))
@@ -1606,31 +1721,49 @@ class MainWindow(QMainWindow):
 
     def _build_catalogue_workspace(self) -> QWidget:
         self.volume_table = QTableView()
+        self.volume_table.setObjectName("volumeTable")
         self.volume_table.setModel(self.volume_model)
         self.configure_table_view(self.volume_table)
-        self.volume_table.setItemDelegateForColumn(6, self.volume_full_delegate)
+        self.volume_table.setItemDelegateForColumn(VOLUME_FULL_COLUMN, self.volume_full_delegate)
         self.volume_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.volume_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         QTimer.singleShot(
             0,
             lambda: self.apply_table_default_columns(
                 self.volume_table,
-                {1: 150, 2: 105, 3: 95, 4: 110, 5: 95, 6: 80, 7: 80, 8: 145},
+                {
+                    0: 110,
+                    1: 145,
+                    3: 105,
+                    4: 100,
+                    5: 220,
+                    6: 110,
+                    7: 100,
+                    8: 80,
+                    9: 160,
+                    10: 100,
+                    11: 120,
+                    12: 120,
+                    13: 105,
+                    14: 105,
+                    15: 95,
+                    16: 95,
+                    17: 95,
+                    VOLUME_FULL_COLUMN: 80,
+                    19: 80,
+                    20: 85,
+                    21: 145,
+                },
+                stretch_column=2,
             ),
         )
 
         self.volume_filter_edit = QLineEdit()
-        self.volume_filter_edit.setPlaceholderText("Filter volumes by ID, name, status, condition, description, or connector")
-        self.add_button = QPushButton("New Volume")
+        self.volume_filter_edit.setPlaceholderText("Filter volumes by any visible field")
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 2, 0)
-        volume_header = QHBoxLayout()
-        volume_header.addWidget(QLabel("Volumes"))
-        volume_header.addStretch(1)
-        volume_header.addWidget(self.add_button)
-        left_layout.addLayout(volume_header)
         left_layout.addWidget(self.volume_filter_edit)
         left_layout.addWidget(self.volume_table, 1)
 
@@ -1665,58 +1798,51 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 2)
         return splitter
 
+    def _detail_value_label(self, key: str, word_wrap: bool = False) -> QLabel:
+        widget = QLabel("-")
+        widget.setWordWrap(word_wrap)
+        widget.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.detail_labels[key] = widget
+        return widget
+
     def _build_details_box(self) -> QGroupBox:
-        box = QGroupBox("Volume Details")
+        box = QGroupBox("Selected Volume")
+        box.setMaximumHeight(self.scaled_ui_value(150))
         self.detail_labels: dict[str, QLabel] = {}
         self.detail_full = QProgressBar()
         self.detail_full.setRange(0, 100)
         self.detail_full.setFormat("%p% full")
         configure_progress_bar(self.detail_full)
-        self.detail_description = QPlainTextEdit()
-        self.detail_description.setReadOnly(True)
-        self.detail_description.setMaximumHeight(self.scaled_ui_value(76))
 
         grid = QGridLayout(box)
-        labels = [
-            ("drive_id", "Drive ID"),
-            ("name", "Name"),
-            ("path", "Scan Path"),
-            ("connection", "Connection"),
-            ("register_status", "Status"),
-            ("condition", "Condition"),
-            ("connector", "Connector"),
-            ("mirror", "Mirror Drive"),
-            ("master", "Master Drive"),
-            ("date_added", "Date Added"),
-            ("earliest_content_date", "Earliest Content"),
-            ("latest_content_date", "Latest Content"),
-            ("retired_date", "Retired Date"),
-            ("mirror_date", "Mirror Date"),
-            ("capacity", "Capacity"),
-            ("used", "Used"),
-            ("free", "Free"),
-            ("files", "Files"),
-            ("folders", "Folders"),
-            ("last_scan", "Last Scan"),
+        grid.setHorizontalSpacing(self.scaled_ui_value(12))
+        grid.setVerticalSpacing(self.scaled_ui_value(4))
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(5, 1)
+
+        summary_rows = [
+            (0, 0, "Drive ID", "drive_id"),
+            (0, 2, "Name", "name"),
+            (0, 4, "Connection", "connection"),
+            (1, 0, "Status", "register_status"),
+            (1, 2, "Condition", "condition"),
+            (1, 4, "Last Scan", "last_scan"),
         ]
-        for index, (key, label) in enumerate(labels):
-            widget = QLabel("-")
-            widget.setWordWrap(key in {"path", "master"})
-            widget.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-                | Qt.TextInteractionFlag.TextSelectableByKeyboard
-            )
-            self.detail_labels[key] = widget
-            row = index // 2
-            col = (index % 2) * 2
-            grid.addWidget(QLabel(label), row, col)
-            grid.addWidget(widget, row, col + 1)
-        full_row = (len(labels) + 1) // 2
+        for row, column, label, key in summary_rows:
+            grid.addWidget(QLabel(label), row, column)
+            grid.addWidget(self._detail_value_label(key), row, column + 1)
+
+        path_row = 2
+        grid.addWidget(QLabel("Scan Path"), path_row, 0)
+        grid.addWidget(self._detail_value_label("path"), path_row, 1, 1, 5)
+
+        full_row = 3
         grid.addWidget(QLabel("Full"), full_row, 0)
-        grid.addWidget(self.detail_full, full_row, 1, 1, 3)
-        description_row = full_row + 1
-        grid.addWidget(QLabel("Description"), description_row, 0)
-        grid.addWidget(self.detail_description, description_row, 1, 1, 3)
+        grid.addWidget(self.detail_full, full_row, 1, 1, 5)
         return box
 
     def _build_browser_tab(self) -> QWidget:
@@ -1735,6 +1861,7 @@ class MainWindow(QMainWindow):
         path_row.addWidget(self.current_path_label, 1)
 
         self.file_table = QTableView()
+        self.file_table.setObjectName("fileTable")
         self.file_table.setModel(self.browser_model)
         self.configure_table_view(self.file_table)
         self.file_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
@@ -1766,6 +1893,7 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setAlternatingRowColors(True)
+        self.configure_table_palette(table)
         table.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
         table.setWordWrap(False)
         table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -1773,10 +1901,18 @@ class MainWindow(QMainWindow):
         table.verticalHeader().setDefaultSectionSize(self.scaled_ui_value(24))
 
         header = table.horizontalHeader()
-        header.setSectionsMovable(False)
+        header.setSectionsMovable(True)
+        header.setFirstSectionMovable(True)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(False)
         header.setSortIndicatorShown(True)
+
+    def configure_table_palette(self, table: QTableView) -> None:
+        palette = table.palette()
+        base_color = palette.color(QPalette.ColorRole.Base)
+        alternate_color = base_color.lighter(112) if base_color.lightness() < 128 else base_color.darker(104)
+        palette.setColor(QPalette.ColorRole.AlternateBase, alternate_color)
+        table.setPalette(palette)
 
     def apply_table_default_columns(
         self,
@@ -1785,13 +1921,88 @@ class MainWindow(QMainWindow):
         stretch_column: int = 0,
         only_if_empty: bool = False,
     ) -> None:
-        if only_if_empty and table.columnWidth(stretch_column) > 0:
+        if table.property("headerLayoutApplied"):
             return
 
-        remaining = table.viewport().width() - sum(default_widths.values()) - 24
-        table.setColumnWidth(stretch_column, max(220, remaining))
-        for column, width in default_widths.items():
-            table.setColumnWidth(column, width)
+        if self.restore_table_header_state(table):
+            table.setProperty("headerLayoutApplied", True)
+            self.install_table_header_persistence(table)
+            return
+
+        if only_if_empty and table.columnWidth(stretch_column) > 0:
+            table.setProperty("headerLayoutApplied", True)
+            self.install_table_header_persistence(table)
+            return
+
+        table.setProperty("suppressHeaderSave", True)
+        try:
+            remaining = table.viewport().width() - sum(default_widths.values()) - 24
+            table.setColumnWidth(stretch_column, max(220, remaining))
+            for column, width in default_widths.items():
+                table.setColumnWidth(column, width)
+        finally:
+            table.setProperty("suppressHeaderSave", False)
+
+        table.setProperty("headerLayoutApplied", True)
+        self.install_table_header_persistence(table)
+
+    def table_header_settings_key(self, table: QTableView, suffix: str) -> str | None:
+        name = table.objectName()
+        if not name:
+            return None
+        return f"tableHeaders/{name}/{suffix}"
+
+    def restore_table_header_state(self, table: QTableView) -> bool:
+        state_key = self.table_header_settings_key(table, "state")
+        count_key = self.table_header_settings_key(table, "columnCount")
+        if state_key is None or count_key is None or table.model() is None:
+            return False
+
+        expected_columns = table.model().columnCount()
+        saved_columns = self.settings.value(count_key, -1, type=int)
+        state = self.settings.value(state_key)
+        if saved_columns != expected_columns or state is None:
+            return False
+
+        if not isinstance(state, QByteArray):
+            try:
+                state = QByteArray(state)
+            except TypeError:
+                return False
+
+        table.setProperty("suppressHeaderSave", True)
+        try:
+            return table.horizontalHeader().restoreState(state)
+        finally:
+            table.setProperty("suppressHeaderSave", False)
+
+    def install_table_header_persistence(self, table: QTableView) -> None:
+        if table.property("headerPersistenceInstalled"):
+            return
+
+        header = table.horizontalHeader()
+        header.sectionMoved.connect(lambda *_args, table=table: self.save_table_header_state(table))
+        header.sectionResized.connect(lambda *_args, table=table: self.save_table_header_state(table))
+        header.sortIndicatorChanged.connect(lambda *_args, table=table: self.save_table_header_state(table))
+        table.setProperty("headerPersistenceInstalled", True)
+
+    def save_table_header_state(self, table: QTableView) -> None:
+        if table.property("suppressHeaderSave") or table.model() is None:
+            return
+
+        state_key = self.table_header_settings_key(table, "state")
+        count_key = self.table_header_settings_key(table, "columnCount")
+        if state_key is None or count_key is None:
+            return
+
+        self.settings.setValue(state_key, table.horizontalHeader().saveState())
+        self.settings.setValue(count_key, table.model().columnCount())
+
+    def save_all_table_header_states(self) -> None:
+        for table_name in ("volume_table", "file_table", "search_table"):
+            table = getattr(self, table_name, None)
+            if table is not None:
+                self.save_table_header_state(table)
 
     def _build_search_tab(self) -> QWidget:
         self.search_edit = QLineEdit()
@@ -1809,6 +2020,7 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.reveal_file_button)
 
         self.search_table = QTableView()
+        self.search_table.setObjectName("searchTable")
         self.search_table.setModel(self.search_model)
         self.configure_table_view(self.search_table)
         self.search_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
@@ -1816,7 +2028,7 @@ class MainWindow(QMainWindow):
             0,
             lambda: self.apply_table_default_columns(
                 self.search_table,
-                {1: 80, 2: 150, 3: 280, 4: 95, 5: 155, 6: 120},
+                {1: 80, 2: 150, 3: 85, 4: 280, 5: 95, 6: 155, 7: 120},
             ),
         )
 
@@ -1837,7 +2049,6 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.welcome_new_button.clicked.connect(self.new_catalogue)
         self.welcome_open_button.clicked.connect(self.open_catalogue_from_dialog)
-        self.add_button.clicked.connect(self.add_volume)
         self.volume_filter_edit.textChanged.connect(lambda _text: self.refresh_volumes())
         self.volume_table.selectionModel().selectionChanged.connect(self.on_volume_selection_changed)
         self.volume_table.customContextMenuRequested.connect(self.show_volume_context_menu)
@@ -1864,9 +2075,9 @@ class MainWindow(QMainWindow):
             self.catalogue_info_action,
             self.refresh_action,
         ]
-        self.catalogue_widgets = [self.add_button, self.volume_filter_edit, self.search_edit, self.search_button]
+        self.catalogue_widgets = [self.volume_filter_edit, self.search_edit, self.search_button]
         self.scan_blocked_actions = [self.new_volume_action]
-        self.scan_blocked_widgets = [self.add_button]
+        self.scan_blocked_widgets = []
 
         self.add_browser_shortcut(QKeySequence("Backspace"), self.navigate_parent_folder)
         self.add_browser_shortcut(QKeySequence("Alt+Up"), self.navigate_parent_folder)
@@ -1964,7 +2175,21 @@ class MainWindow(QMainWindow):
             return
         self.open_catalogue_path(catalogue_path_with_extension(path_text))
 
-    def open_catalogue_path(self, path: str | Path) -> None:
+    def open_last_catalogue(self) -> None:
+        if self.db is not None:
+            return
+        path_text = self.settings.value(LAST_CATALOGUE_PATH_SETTING, "", type=str)
+        if not path_text:
+            return
+
+        path = catalogue_path_with_extension(path_text)
+        if not path.is_file():
+            self.settings.remove(LAST_CATALOGUE_PATH_SETTING)
+            return
+
+        self.open_catalogue_path(path, status_message="Last catalogue opened.")
+
+    def open_catalogue_path(self, path: str | Path, status_message: str = "Catalogue opened.") -> None:
         path = catalogue_path_with_extension(path)
         if self.db is not None and not self.close_catalogue(show_status=False):
             return
@@ -1983,7 +2208,7 @@ class MainWindow(QMainWindow):
             return
 
         self._open_catalogue_in_window(db, path, lock)
-        self.statusBar().showMessage("Catalogue opened.", 4000)
+        self.statusBar().showMessage(status_message, 4000)
 
     def close_catalogue(self, show_status: bool = True) -> bool:
         if self.db is None:
@@ -2057,6 +2282,7 @@ class MainWindow(QMainWindow):
         self.db = db
         self.catalogue_path = path
         self.catalogue_lock = lock
+        self.settings.setValue(LAST_CATALOGUE_PATH_SETTING, str(path.resolve(strict=False)))
         self._set_catalogue_open(True)
         self.start_connected_volume_monitor()
         self.refresh_volumes()
@@ -2341,7 +2567,6 @@ class MainWindow(QMainWindow):
         if volume is None:
             for widget in self.detail_labels.values():
                 widget.setText("-")
-            self.detail_description.clear()
             self.detail_full.setValue(0)
             return
 
@@ -2355,26 +2580,10 @@ class MainWindow(QMainWindow):
             "connection": "Connected" if connected else "Offline",
             "register_status": volume["register_status"],
             "condition": volume["condition"],
-            "connector": volume["connector"],
-            "mirror": "Yes" if volume["is_mirror"] else "No",
-            "master": volume_reference(volume["master_drive_id"], volume["master_name"])
-            if volume["master_volume_id"] is not None
-            else "-",
-            "date_added": display_db_date(volume["date_added"]),
-            "earliest_content_date": display_db_date(volume["earliest_content_date"]),
-            "latest_content_date": display_db_date(volume["latest_content_date"]),
-            "retired_date": display_db_date(volume["retired_date"]),
-            "mirror_date": display_db_date(volume["mirror_date"]),
-            "capacity": format_size(volume["capacity_bytes"]),
-            "used": format_size(volume["used_bytes"]),
-            "free": format_size(volume["free_bytes"]),
-            "files": str(volume["indexed_file_count"]),
-            "folders": str(volume["indexed_folder_count"]),
             "last_scan": self._display_time(volume["last_scan_at"]),
         }
         for key, value in values.items():
             self.detail_labels[key].setText(value)
-        self.detail_description.setPlainText(volume["description"] or "")
         self.detail_full.setValue(full)
 
     def add_volume(self) -> None:
@@ -3120,6 +3329,7 @@ class MainWindow(QMainWindow):
                 item_id=result["item_id"],
                 name=result["name"],
                 volume_id=result["volume_id"],
+                drive_id=result["drive_id"],
                 volume_name=result["volume_name"],
                 relative_path=result["relative_path"],
                 size_bytes=result["size_bytes"],
@@ -3243,6 +3453,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("JVVV")
     app.setOrganizationName("JVVV")
     window = MainWindow()

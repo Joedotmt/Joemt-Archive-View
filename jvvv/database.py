@@ -1707,6 +1707,7 @@ class Database:
                     f.id AS item_id,
                     f.name,
                     v.id AS volume_id,
+                    r.drive_id AS drive_id,
                     v.name AS volume_name,
                     f.relative_path,
                     f.size_bytes,
@@ -1719,6 +1720,7 @@ class Database:
                     CASE WHEN f.missing = 0 THEN 0 ELSE 1 END AS missing_rank
                 FROM files f
                 JOIN volumes v ON v.id = f.volume_id
+                JOIN volume_register r ON r.volume_id = v.id
                 WHERE {file_clause}
                 UNION ALL
                 SELECT
@@ -1726,6 +1728,7 @@ class Database:
                     fo.id AS item_id,
                     fo.name,
                     v.id AS volume_id,
+                    r.drive_id AS drive_id,
                     v.name AS volume_name,
                     fo.relative_path,
                     fo.recursive_size_bytes AS size_bytes,
@@ -1738,6 +1741,7 @@ class Database:
                     CASE WHEN fo.missing = 0 THEN 0 ELSE 1 END AS missing_rank
                 FROM folders fo
                 JOIN volumes v ON v.id = fo.volume_id
+                JOIN volume_register r ON r.volume_id = v.id
                 WHERE fo.relative_path != ''
                   AND (
                       fo.name LIKE ? COLLATE NOCASE
