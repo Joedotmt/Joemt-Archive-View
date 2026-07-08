@@ -3,6 +3,12 @@ from __future__ import annotations
 from jvvv import utils
 
 
+def test_format_size_uses_decimal_units_for_drive_labels():
+    assert utils.format_size(999) == "999 B"
+    assert utils.format_size(1_000) == "1.0 KB"
+    assert utils.format_size(1_000_000_000_000) == "1.0 TB"
+
+
 def test_connected_volume_resolver_matches_identity_not_saved_path(tmp_path):
     mounted = tmp_path / "current-drive"
     mounted.mkdir()

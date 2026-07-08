@@ -61,11 +61,11 @@ def format_size(num_bytes: int | None) -> str:
     value = float(num_bytes or 0)
     units = ["B", "KB", "MB", "GB", "TB"]
     for unit in units:
-        if value < 1024 or unit == units[-1]:
+        if value < 1000 or unit == units[-1]:
             if unit == "B":
                 return f"{int(value)} B"
             return f"{value:.1f} {unit}"
-        value /= 1024
+        value /= 1000
     return f"{value:.1f} TB"
 
 

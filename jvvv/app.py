@@ -14,8 +14,10 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QByteArray,
     QDate,
+    QEvent,
     QEventLoop,
     QFileInfo,
+    QItemSelectionModel,
     QLockFile,
     QModelIndex,
     QObject,
@@ -1563,6 +1565,17 @@ class MainWindow(QMainWindow):
         self._set_catalogue_open(False)
         QTimer.singleShot(0, self.open_last_catalogue)
 
+    def eventFilter(self, source: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if (
+            source is self.volume_table.viewport()
+            and event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if not self.volume_table.indexAt(point).isValid():
+                self.clear_volume_selection()
+        return super().eventFilter(source, event)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.save_all_table_header_states()
         if not self.close_catalogue(show_status=False):
@@ -1727,6 +1740,7 @@ class MainWindow(QMainWindow):
         self.volume_table.setItemDelegateForColumn(VOLUME_FULL_COLUMN, self.volume_full_delegate)
         self.volume_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.volume_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.volume_table.viewport().installEventFilter(self)
         QTimer.singleShot(
             0,
             lambda: self.apply_table_default_columns(
@@ -2479,13 +2493,11 @@ class MainWindow(QMainWindow):
         items = [item for item in all_items if volume_matches_filter(item, filter_text)]
         self.volume_model.set_items(items)
 
-        if items:
-            visible_ids = {item.id for item in self.volume_model.items}
-            target_id = selected_id if selected_id in visible_ids else self.volume_model.items[0].id
-            if self.select_volume(target_id):
-                self.show_selected_volume(target_id)
+        visible_ids = {item.id for item in self.volume_model.items}
+        if selected_id in visible_ids and self.select_volume(selected_id):
+            self.show_selected_volume(selected_id)
         else:
-            self.show_selected_volume(None)
+            self.clear_volume_selection()
 
     def selected_volume_id(self) -> int | None:
         item = self.volume_model.item_at(self.volume_table.currentIndex())
@@ -2555,6 +2567,15 @@ class MainWindow(QMainWindow):
             return
         volume_id = self.selected_volume_id()
         self.show_selected_volume(volume_id)
+
+    def clear_volume_selection(self) -> None:
+        selection_model = self.volume_table.selectionModel()
+        if selection_model is not None:
+            selection_model.setCurrentIndex(QModelIndex(), QItemSelectionModel.SelectionFlag.NoUpdate)
+            selection_model.clearSelection()
+        else:
+            self.volume_table.setCurrentIndex(QModelIndex())
+        self.show_selected_volume(None)
 
     def show_selected_volume(self, volume_id: int | None) -> None:
         self.current_volume_id = volume_id
