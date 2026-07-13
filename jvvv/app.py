@@ -576,6 +576,16 @@ class VolumeTableModel(StandardTableModel):
         return None
 
 
+class VolumeTableView(QTableView):
+    """A table that can scroll half a viewport beyond its final row."""
+
+    def updateGeometries(self) -> None:  # type: ignore[override]
+        super().updateGeometries()
+        scroll_bar = self.verticalScrollBar()
+        trailing_space = max(0, self.viewport().height() // 2)
+        scroll_bar.setMaximum(scroll_bar.maximum() + trailing_space)
+
+
 class SearchResultsTableModel(StandardTableModel):
     def __init__(self, icons: CatalogueIconProvider, parent: QObject | None = None) -> None:
         self.icons = icons
@@ -1741,10 +1751,11 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_catalogue_workspace(self) -> QWidget:
-        self.volume_table = QTableView()
+        self.volume_table = VolumeTableView()
         self.volume_table.setObjectName("volumeTable")
         self.volume_table.setModel(self.volume_model)
         self.configure_table_view(self.volume_table)
+        self.volume_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.volume_table.setItemDelegateForColumn(VOLUME_FULL_COLUMN, self.volume_full_delegate)
         self.volume_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.volume_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
