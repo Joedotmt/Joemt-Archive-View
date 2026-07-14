@@ -1795,20 +1795,30 @@ class Database:
         text = query.strip()
         if not text:
             return []
+        needle = f"%{text}%"
+        params: dict[str, object] = {
+            "text": text,
+            "needle": needle,
+            "limit": limit,
+        }
         if text.startswith("."):
-            extension = text[1:].lower()
-            file_clause = "f.extension = ?"
-            file_params: tuple[object, ...] = (extension,)
+            params["extension"] = text[1:].lower()
+            file_clause = "f.extension = :extension"
+            file_match_rank = "0"
         else:
-            needle = f"%{text}%"
             file_clause = """
-                f.name LIKE ? COLLATE NOCASE
-                OR f.relative_path LIKE ? COLLATE NOCASE
-                OR f.extension LIKE ? COLLATE NOCASE
+                f.name LIKE :needle COLLATE NOCASE
+                OR f.relative_path LIKE :needle COLLATE NOCASE
+                OR f.extension LIKE :needle COLLATE NOCASE
             """
-            file_params = (needle, needle, needle)
+            file_match_rank = """
+                CASE
+                    WHEN f.name = :text COLLATE NOCASE THEN 0
+                    WHEN f.name LIKE :needle COLLATE NOCASE THEN 2
+                    ELSE 4
+                END
+            """
 
-        folder_needle = f"%{text}%"
         sql = f"""
             SELECT *
             FROM (
@@ -1827,7 +1837,8 @@ class Database:
                     v.identity_kind,
                     v.identity_token,
                     v.source_relative_path,
-                    CASE WHEN f.missing = 0 THEN 0 ELSE 1 END AS missing_rank
+                    CASE WHEN f.missing = 0 THEN 0 ELSE 1 END AS missing_rank,
+                    {file_match_rank} AS match_rank
                 FROM files f
                 JOIN volumes v ON v.id = f.volume_id
                 JOIN volume_register r ON r.volume_id = v.id
@@ -1848,23 +1859,29 @@ class Database:
                     v.identity_kind,
                     v.identity_token,
                     v.source_relative_path,
-                    CASE WHEN fo.missing = 0 THEN 0 ELSE 1 END AS missing_rank
+                    CASE WHEN fo.missing = 0 THEN 0 ELSE 1 END AS missing_rank,
+                    CASE
+                        WHEN fo.name = :text COLLATE NOCASE THEN 0
+                        WHEN fo.name LIKE :needle COLLATE NOCASE THEN 1
+                        ELSE 3
+                    END AS match_rank
                 FROM folders fo
                 JOIN volumes v ON v.id = fo.volume_id
                 JOIN volume_register r ON r.volume_id = v.id
-                WHERE fo.relative_path != ''
-                  AND (
-                      fo.name LIKE ? COLLATE NOCASE
-                      OR fo.relative_path LIKE ? COLLATE NOCASE
-                  )
+                WHERE fo.name LIKE :needle COLLATE NOCASE
+                   OR fo.relative_path LIKE :needle COLLATE NOCASE
             )
-            ORDER BY missing_rank, name COLLATE NOCASE
-            LIMIT ?
+            ORDER BY
+                match_rank,
+                missing_rank,
+                CASE WHEN item_type = 'folder' THEN 0 ELSE 1 END,
+                name COLLATE NOCASE
+            LIMIT :limit
         """
         return list(
             self.connection.execute(
                 sql,
-                (*file_params, folder_needle, folder_needle, limit),
+                params,
             )
         )
 

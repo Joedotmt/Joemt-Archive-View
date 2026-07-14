@@ -1554,6 +1554,76 @@ class DeleteVolumeWorker(QObject):
             self.failed.emit(error_details)
 
 
+class SearchWorker(QObject):
+    finished = Signal(int, list)
+    cancelled = Signal(int)
+    failed = Signal(int, str)
+
+    def __init__(self, db_path: Path, query: str, request_id: int) -> None:
+        super().__init__()
+        self.db_path = db_path
+        self.query = query
+        self.request_id = request_id
+        self.cancel_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        db: Database | None = None
+        items: list[SearchResultItem] = []
+        error_details: str | None = None
+        try:
+            db = Database(self.db_path, initialize=False, create=False)
+            db.connection.set_progress_handler(
+                lambda: 1 if self.cancel_requested else 0,
+                1000,
+            )
+            results = db.search(self.query)
+            if not self.cancel_requested:
+                resolver = ConnectedVolumeResolver()
+                connected_by_volume: dict[int, bool] = {}
+                for result in results:
+                    if self.cancel_requested:
+                        break
+                    volume_id = result["volume_id"]
+                    connected = connected_by_volume.get(volume_id)
+                    if connected is None:
+                        connected = resolver.resolve(result) is not None
+                        connected_by_volume[volume_id] = connected
+                    items.append(
+                        SearchResultItem(
+                            item_type=result["item_type"],
+                            item_id=result["item_id"],
+                            name=result["name"],
+                            volume_id=volume_id,
+                            drive_id=result["drive_id"],
+                            volume_name=result["volume_name"],
+                            relative_path=result["relative_path"],
+                            size_bytes=result["size_bytes"],
+                            modified_at=result["modified_at"],
+                            missing=bool(result["missing"]),
+                            source_path=result["source_path"],
+                            connected=connected,
+                        )
+                    )
+        except Exception:
+            if not self.cancel_requested:
+                error_details = traceback.format_exc()
+        finally:
+            if db is not None:
+                db.connection.set_progress_handler(None, 0)
+                db.close()
+
+        if self.cancel_requested:
+            self.cancelled.emit(self.request_id)
+        elif error_details is not None:
+            self.failed.emit(self.request_id, error_details)
+        else:
+            self.finished.emit(self.request_id, items)
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1568,6 +1638,10 @@ class MainWindow(QMainWindow):
         self.post_scan_edit_volume_id: int | None = None
         self.delete_thread: QThread | None = None
         self.delete_worker: DeleteVolumeWorker | None = None
+        self.search_thread: QThread | None = None
+        self.search_worker: SearchWorker | None = None
+        self.pending_search_request: tuple[int, Path, str] | None = None
+        self.search_request_id = 0
         self.browser_shortcuts: list[QShortcut] = []
         self.browser_icons = CatalogueIconProvider()
         self.volume_model = VolumeTableModel(self)
@@ -2274,6 +2348,8 @@ class MainWindow(QMainWindow):
 
         if not self._stop_scan_for_catalogue_close():
             return False
+        if not self._stop_search_for_catalogue_close():
+            return False
 
         db = self.db
         lock = self.catalogue_lock
@@ -2397,6 +2473,32 @@ class MainWindow(QMainWindow):
             self,
             "Scan Cancelling",
             "Cancellation has been requested. Close the catalogue after the scan stops.",
+        )
+        return False
+
+    def _stop_search_for_catalogue_close(self) -> bool:
+        self.pending_search_request = None
+        self.search_request_id += 1
+        if (
+            self.search_worker is None
+            or self.search_thread is None
+            or not self.search_thread.isRunning()
+        ):
+            return True
+
+        self.search_worker.cancel()
+        self.statusBar().showMessage("Cancelling search...")
+
+        for _ in range(50):
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+            if self.search_thread is None or not self.search_thread.isRunning():
+                return True
+            self.search_thread.wait(100)
+
+        QMessageBox.information(
+            self,
+            "Search Cancelling",
+            "Cancellation has been requested. Close the catalogue after the search stops.",
         )
         return False
 
@@ -2621,6 +2723,12 @@ class MainWindow(QMainWindow):
 
     def show_selected_volume(self, volume_id: int | None) -> None:
         self.current_volume_id = volume_id
+        self.clear_browser()
+        # Resolving a volume and loading its root directory can block the UI.
+        # Paint the empty model now so rows from the previous volume are never
+        # displayed alongside the newly selected volume's details.
+        self.folder_tree.viewport().repaint()
+        self.file_table.viewport().repaint()
         volume = self.db.get_volume(volume_id) if self.db is not None and volume_id is not None else None
         self.show_volume_details(volume)
         self.load_volume_browser(volume_id)
@@ -3412,37 +3520,102 @@ class MainWindow(QMainWindow):
         return False
 
     def perform_search(self) -> None:
+        self.search_request_id += 1
+        request_id = self.search_request_id
         if self.db is None:
+            self.pending_search_request = None
+            if (
+                self.search_worker is not None
+                and self.search_thread is not None
+                and self.search_thread.isRunning()
+            ):
+                self.search_worker.cancel()
             self.search_model.set_items([])
             self.on_search_selection_changed()
+            self.statusBar().clearMessage()
             return
         query = self.search_edit.text().strip()
         if not query:
+            self.pending_search_request = None
+            if (
+                self.search_worker is not None
+                and self.search_thread is not None
+                and self.search_thread.isRunning()
+            ):
+                self.search_worker.cancel()
             self.search_model.set_items([])
             self.on_search_selection_changed()
+            self.statusBar().clearMessage()
             return
 
-        resolver = ConnectedVolumeResolver()
-        items = [
-            SearchResultItem(
-                item_type=result["item_type"],
-                item_id=result["item_id"],
-                name=result["name"],
-                volume_id=result["volume_id"],
-                drive_id=result["drive_id"],
-                volume_name=result["volume_name"],
-                relative_path=result["relative_path"],
-                size_bytes=result["size_bytes"],
-                modified_at=result["modified_at"],
-                missing=bool(result["missing"]),
-                source_path=result["source_path"],
-                connected=resolver.resolve(result) is not None,
-            )
-            for result in self.db.search(query)
-        ]
+        request = (request_id, self.db.path, query)
+        if self.search_thread is not None:
+            self.pending_search_request = request
+            if self.search_thread.isRunning() and self.search_worker is not None:
+                self.search_worker.cancel()
+            self.search_button.setText("Searching...")
+            self.statusBar().showMessage(f'Searching for "{query}"...')
+            return
+
+        self._start_search(request)
+
+    def _start_search(self, request: tuple[int, Path, str]) -> None:
+        request_id, db_path, query = request
+        self.search_button.setText("Searching...")
+        self.statusBar().showMessage(f'Searching for "{query}"...')
+
+        self.search_thread = QThread(self)
+        self.search_worker = SearchWorker(db_path, query, request_id)
+        self.search_worker.moveToThread(self.search_thread)
+        self.search_thread.started.connect(self.search_worker.run)
+        self.search_worker.finished.connect(self.on_search_finished)
+        self.search_worker.cancelled.connect(self.on_search_cancelled)
+        self.search_worker.failed.connect(self.on_search_failed)
+        self.search_worker.finished.connect(self.search_thread.quit)
+        self.search_worker.cancelled.connect(self.search_thread.quit)
+        self.search_worker.failed.connect(self.search_thread.quit)
+        self.search_worker.finished.connect(self.search_worker.deleteLater)
+        self.search_worker.cancelled.connect(self.search_worker.deleteLater)
+        self.search_worker.failed.connect(self.search_worker.deleteLater)
+        self.search_thread.finished.connect(self.search_thread.deleteLater)
+        self.search_thread.finished.connect(self.clear_search_worker)
+        self.search_thread.start()
+
+    @Slot(int, list)
+    def on_search_finished(self, request_id: int, items: list[SearchResultItem]) -> None:
+        if request_id != self.search_request_id or self.db is None:
+            return
         self.search_model.set_items(items)
         self.on_search_selection_changed()
         self.statusBar().showMessage(f"{len(items)} search results.", 4000)
+
+    @Slot(int)
+    def on_search_cancelled(self, request_id: int) -> None:
+        if request_id == self.search_request_id and self.pending_search_request is None:
+            self.statusBar().showMessage("Search cancelled.", 2000)
+
+    @Slot(int, str)
+    def on_search_failed(self, request_id: int, details: str) -> None:
+        if request_id != self.search_request_id or self.db is None:
+            return
+        self.statusBar().showMessage("Search failed.", 4000)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setWindowTitle("Search Failed")
+        dialog.setText("The catalogue could not be searched.")
+        dialog.setDetailedText(details)
+        dialog.exec()
+
+    @Slot()
+    def clear_search_worker(self) -> None:
+        self.search_worker = None
+        self.search_thread = None
+        pending = self.pending_search_request
+        self.pending_search_request = None
+        if pending is not None and pending[0] == self.search_request_id and self.db is not None:
+            self._start_search(pending)
+        else:
+            self.search_button.setText("Search")
 
     def on_search_selection_changed(self, selected=None, deselected=None) -> None:
         item = self.selected_search_item()

@@ -39,3 +39,47 @@ def test_search_across_multiple_volumes(tmp_path):
         assert folder_results[0]["drive_id"] == "AID-001"
     finally:
         db.close()
+
+
+def test_search_returns_matching_root_folder(tmp_path):
+    source = tmp_path / "Hal Far Site 301118"
+    source.mkdir()
+    (source / "report.txt").write_text("report")
+
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id = db.create_volume("Site archive", str(source))
+        VolumeScanner(db).scan(volume_id)
+
+        folder_results = [
+            row
+            for row in db.search("Hal Far Site 301118")
+            if row["item_type"] == "folder"
+        ]
+
+        assert len(folder_results) == 1
+        assert folder_results[0]["name"] == "Hal Far Site 301118"
+        assert folder_results[0]["relative_path"] == ""
+    finally:
+        db.close()
+
+
+def test_search_prioritizes_folder_name_over_descendant_paths(tmp_path):
+    source = tmp_path / "drive"
+    target = source / "Hal Far Site 301118"
+    target.mkdir(parents=True)
+    for index in range(10):
+        (target / f"file-{index:02}.txt").write_text("content")
+
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id = db.create_volume("Site archive", str(source))
+        VolumeScanner(db).scan(volume_id)
+
+        results = db.search("Hal Far Site 301118", limit=3)
+
+        assert len(results) == 3
+        assert results[0]["item_type"] == "folder"
+        assert results[0]["name"] == "Hal Far Site 301118"
+    finally:
+        db.close()
