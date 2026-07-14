@@ -110,6 +110,22 @@ ROLE_PERCENT_FULL = Qt.ItemDataRole.UserRole + 5
 VOLUME_FULL_COLUMN = 18
 LAST_CATALOGUE_PATH_SETTING = "catalogues/lastPath"
 CATALOGUE_FILE_FILTER = "Joemt Archive View Files (*.jvvv)"
+
+
+def format_exception_diagnostics(exc: Exception) -> str:
+    sections = []
+    diagnostic_details = getattr(exc, "diagnostic_details", "")
+    if diagnostic_details:
+        sections.append(str(diagnostic_details).strip())
+
+    traceback_details = "".join(
+        traceback.TracebackException.from_exception(exc).format(chain=True)
+    ).strip()
+    if traceback_details:
+        sections.append(f"Traceback:\n{traceback_details}")
+    return "\n\n".join(sections)
+
+
 PROGRESS_BAR_HEIGHT = 16
 UI_ZOOM_STEP = 0.1
 MIN_UI_ZOOM = 0.8
@@ -2464,12 +2480,19 @@ class MainWindow(QMainWindow):
 
     def _show_catalogue_error(self, title: str, exc: Exception) -> None:
         message = str(exc) or "The catalogue could not be opened."
+        details = format_exception_diagnostics(exc)
+        dialog = QMessageBox(self)
         if isinstance(exc, CatalogueInUseError):
-            QMessageBox.warning(self, "Catalogue In Use", message)
-        elif isinstance(exc, (CatalogueError, OSError, FileNotFoundError, PermissionError)):
-            QMessageBox.critical(self, title, message)
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("Catalogue In Use")
         else:
-            QMessageBox.critical(self, title, message)
+            dialog.setIcon(QMessageBox.Icon.Critical)
+            dialog.setWindowTitle(title)
+        dialog.setText(message)
+        dialog.setInformativeText("Select Show Details… for diagnostic information.")
+        dialog.setDetailedText(details)
+        print(f"{title}: {message}\n\n{details}", file=sys.stderr)
+        dialog.exec()
 
     def refresh_volumes(self) -> None:
         if self.db is None:

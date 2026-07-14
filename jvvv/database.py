@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import sqlite3
 import tempfile
@@ -23,6 +24,10 @@ UINT64_MODULUS = 2**64
 UINT64_MAX = UINT64_MODULUS - 1
 DEFAULT_BUSY_TIMEOUT_MS = 2000
 INTERACTIVE_BUSY_TIMEOUT_MS = 250
+WINDOWS_DRIVE_REMOTE = 4
+SQLITE_EXTENDED_ERROR_NAMES = {
+    8714: "SQLITE_IOERR_IN_PAGE",
+}
 REQUIRED_TABLES = {"volumes", "volume_register", "folders", "files", "scan_history", "scan_errors"}
 REQUIRED_COLUMNS = {
     "volumes": {
@@ -114,7 +119,9 @@ REQUIRED_COLUMNS = {
 
 
 class CatalogueError(Exception):
-    pass
+    def __init__(self, message: str, *, diagnostic_details: str = "") -> None:
+        super().__init__(message)
+        self.diagnostic_details = diagnostic_details
 
 
 class CatalogueInUseError(CatalogueError):
@@ -200,6 +207,16 @@ def normalize_identity_integer(value: int | None) -> int | None:
     return None
 
 
+def _windows_drive_is_remote(drive: str) -> bool:
+    if os.name != "nt" or not drive:
+        return False
+
+    import ctypes
+
+    drive_root = drive.rstrip("\\/") + "\\"
+    return ctypes.windll.kernel32.GetDriveTypeW(drive_root) == WINDOWS_DRIVE_REMOTE
+
+
 class Database:
     def __init__(
         self,
@@ -211,6 +228,17 @@ class Database:
     ) -> None:
         self.path = Path(path).expanduser()
         self.busy_timeout_ms = busy_timeout_ms
+        self._operation = "preparing the catalogue path"
+        self._connect_target = ""
+        self._use_uri = False
+        self._network_storage = self._uses_network_storage(self.path)
+        self._requested_journal_mode = ""
+        self._stored_journal_mode = self._database_header_journal_mode(self.path)
+        if self._network_storage and self._stored_journal_mode == "WAL":
+            raise CatalogueError(
+                "This network catalogue is still in WAL mode. Move it to a local drive, "
+                "open and close it there to convert it, then move it back to the network share."
+            )
         if create:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connect_target = str(self.path)
@@ -221,7 +249,10 @@ class Database:
             connect_target = self._sqlite_uri(self.path)
             use_uri = True
 
+        self._connect_target = connect_target
+        self._use_uri = use_uri
         try:
+            self._operation = "opening the SQLite connection"
             self.connection = sqlite3.connect(
                 connect_target,
                 timeout=max(self.busy_timeout_ms, 0) / 1000,
@@ -230,6 +261,7 @@ class Database:
             self.connection.row_factory = sqlite3.Row
             self._configure_connection()
             if initialize:
+                self._operation = "initializing the catalogue schema"
                 self.initialize()
         except sqlite3.Error as exc:
             if hasattr(self, "connection"):
@@ -249,28 +281,98 @@ class Database:
 
     @staticmethod
     def _sqlite_uri(path: Path) -> str:
-        return f"{path.resolve(strict=False).as_uri()}?mode=rw"
+        resolved = path.resolve(strict=False)
+        uri = resolved.as_uri()
+        if resolved.drive.startswith("\\\\"):
+            # pathlib represents a UNC host as a file-URI authority, but SQLite
+            # rejects non-local authorities. Keep the UNC name in the URI path.
+            uri = f"file:////{uri[len('file://'):]}"
+        return f"{uri}?mode=rw"
+
+    @staticmethod
+    def _uses_network_storage(path: Path) -> bool:
+        resolved = path.resolve(strict=False)
+        return resolved.drive.startswith("\\\\") or _windows_drive_is_remote(
+            resolved.drive
+        )
+
+    @staticmethod
+    def _database_header_journal_mode(path: Path) -> str:
+        if not path.is_file():
+            return "New database"
+        try:
+            with path.open("rb") as database_file:
+                header = database_file.read(20)
+        except OSError:
+            return "Unreadable"
+        if len(header) < 20 or header[:16] != b"SQLite format 3\x00":
+            return "Unknown"
+        if 2 in (header[18], header[19]):
+            return "WAL"
+        if header[18:20] == b"\x01\x01":
+            return "Rollback"
+        return f"Unknown ({header[18]}/{header[19]})"
 
     def _configure_connection(self) -> None:
+        self._operation = "enabling SQLite foreign-key checks"
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self._operation = "setting the SQLite busy timeout"
         self.connection.execute(f"PRAGMA busy_timeout = {max(self.busy_timeout_ms, 0)}")
-        self.connection.execute("PRAGMA journal_mode = WAL")
+        if self._network_storage:
+            # Network catalogues are required to already use rollback
+            # journaling. Do not execute journal_mode here: even asking SQLite
+            # to re-select DELETE can trigger unreliable SMB memory mapping.
+            self._requested_journal_mode = "Preserve rollback mode"
+        else:
+            self._requested_journal_mode = "WAL"
+            self._operation = "setting SQLite journal mode to WAL"
+            self.connection.execute("PRAGMA journal_mode = WAL").fetchone()
+
+        self._operation = "setting SQLite synchronous mode to NORMAL"
         self.connection.execute("PRAGMA synchronous = NORMAL")
 
     def _catalogue_error(self, exc: sqlite3.Error) -> CatalogueError:
         message = str(exc)
         lower = message.lower()
         if "database is locked" in lower or "database table is locked" in lower:
-            return CatalogueInUseError(
+            error: CatalogueError = CatalogueInUseError(
                 "The catalogue is locked or already in use by another process."
             )
-        if (
+        elif (
             "file is not a database" in lower
             or "malformed" in lower
             or "database disk image is malformed" in lower
         ):
-            return InvalidCatalogueError("The selected file is not a valid catalogue database.")
-        return CatalogueError(message)
+            error = InvalidCatalogueError("The selected file is not a valid catalogue database.")
+        else:
+            error = CatalogueError(message)
+        error.diagnostic_details = self._diagnostic_details(exc)
+        return error
+
+    def _diagnostic_details(self, exc: sqlite3.Error) -> str:
+        sqlite_error_code = getattr(exc, "sqlite_errorcode", "Unavailable")
+        sqlite_error_name = getattr(exc, "sqlite_errorname", "Unavailable")
+        if not sqlite_error_name or sqlite_error_name.lower() == "unknown":
+            sqlite_error_name = SQLITE_EXTENDED_ERROR_NAMES.get(
+                sqlite_error_code,
+                "Unknown",
+            )
+        return "\n".join(
+            [
+                f"Operation: {self._operation}",
+                f"Catalogue path: {self.path}",
+                f"Connection target: {self._connect_target}",
+                f"SQLite URI mode: {'Yes' if self._use_uri else 'No'}",
+                f"Network storage detected: {'Yes' if self._network_storage else 'No'}",
+                f"Journal mode in file header: {self._stored_journal_mode}",
+                f"Requested journal mode: {self._requested_journal_mode or 'Not reached'}",
+                f"SQLite error: {type(exc).__name__}: {exc}",
+                f"SQLite error name: {sqlite_error_name}",
+                f"SQLite error code: {sqlite_error_code}",
+                f"SQLite library version: {sqlite3.sqlite_version}",
+                f"Operating system: {platform.platform()}",
+            ]
+        )
 
     def initialize(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
@@ -315,11 +417,17 @@ class Database:
 
     def validate_catalogue(self) -> None:
         try:
-            check = self.connection.execute("PRAGMA quick_check(1)").fetchone()
-            if check is None or check[0] != "ok":
-                raise InvalidCatalogueError("The selected catalogue database appears to be corrupted.")
+            if not self._network_storage:
+                self._operation = "checking catalogue database integrity"
+                check = self.connection.execute("PRAGMA quick_check(1)").fetchone()
+                if check is None or check[0] != "ok":
+                    raise InvalidCatalogueError(
+                        "The selected catalogue database appears to be corrupted."
+                    )
 
+            self._operation = "reading the catalogue schema version"
             version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+            self._operation = "reading the catalogue schema"
             existing_tables = self._table_names()
             if version == 0 and not REQUIRED_TABLES <= existing_tables:
                 raise InvalidCatalogueError(
@@ -331,8 +439,10 @@ class Database:
                     f"supports up to version {SCHEMA_VERSION}."
                 )
             if version < SCHEMA_VERSION:
+                self._operation = "migrating the catalogue schema"
                 self.initialize()
             else:
+                self._operation = "validating the catalogue schema"
                 self.validate_schema()
         except sqlite3.Error as exc:
             raise self._catalogue_error(exc) from exc

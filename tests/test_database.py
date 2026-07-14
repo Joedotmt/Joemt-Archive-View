@@ -100,6 +100,168 @@ def test_database_initializes_schema(tmp_path):
         db.close()
 
 
+def test_sqlite_uri_encodes_unc_server_as_part_of_path():
+    class ResolvedUncPath:
+        drive = r"\\192.168.1.100\archive"
+
+        @staticmethod
+        def as_uri():
+            return "file://192.168.1.100/archive/Archive%20One.jvvv"
+
+    class UncPath:
+        @staticmethod
+        def resolve(*, strict):
+            assert strict is False
+            return ResolvedUncPath()
+
+    assert Database._sqlite_uri(UncPath()) == (
+        "file:////192.168.1.100/archive/Archive%20One.jvvv?mode=rw"
+    )
+    assert Database._uses_network_storage(UncPath()) is True
+
+
+def test_network_storage_recognizes_mapped_windows_drive(monkeypatch):
+    class ResolvedMappedPath:
+        drive = "Z:"
+
+    class MappedPath:
+        @staticmethod
+        def resolve(*, strict):
+            assert strict is False
+            return ResolvedMappedPath()
+
+    checked_drives = []
+    monkeypatch.setattr(
+        database_module,
+        "_windows_drive_is_remote",
+        lambda drive: checked_drives.append(drive) or True,
+    )
+
+    assert Database._uses_network_storage(MappedPath()) is True
+    assert checked_drives == ["Z:"]
+
+
+def test_network_catalogue_preserves_existing_rollback_journal(monkeypatch, tmp_path):
+    path = tmp_path / "network-catalogue.jvvv"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    assert Database._database_header_journal_mode(path) == "Rollback"
+
+    monkeypatch.setattr(
+        Database,
+        "_uses_network_storage",
+        staticmethod(lambda path: True),
+    )
+
+    db = Database(path, create=False)
+    try:
+        journal_mode = db.connection.execute("PRAGMA journal_mode").fetchone()[0]
+        assert journal_mode.lower() == "delete"
+        locking_mode = db.connection.execute("PRAGMA locking_mode").fetchone()[0]
+        assert locking_mode.lower() == "normal"
+    finally:
+        db.close()
+
+
+def test_network_catalogue_rejects_wal_before_sqlite_access(monkeypatch, tmp_path):
+    path = tmp_path / "wal-catalogue.jvvv"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode = WAL").fetchone()
+    connection.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    assert Database._database_header_journal_mode(path) == "WAL"
+    monkeypatch.setattr(
+        Database,
+        "_uses_network_storage",
+        staticmethod(lambda path: True),
+    )
+
+    with pytest.raises(database_module.CatalogueError, match="still in WAL mode"):
+        Database(path, initialize=False, create=False)
+
+
+def test_network_catalogue_open_skips_full_integrity_scan(monkeypatch, tmp_path):
+    path = tmp_path / "network-catalogue.jvvv"
+    db = Database(path)
+    db.close()
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+    connection.close()
+
+    statements = []
+    sqlite_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        traced_connection = sqlite_connect(*args, **kwargs)
+        traced_connection.set_trace_callback(statements.append)
+        return traced_connection
+
+    monkeypatch.setattr(
+        Database,
+        "_uses_network_storage",
+        staticmethod(lambda path: True),
+    )
+    monkeypatch.setattr(database_module.sqlite3, "connect", traced_connect)
+
+    db = open_catalogue(path)
+    db.close()
+
+    assert not any("quick_check" in statement.lower() for statement in statements)
+
+
+def test_sqlite_failure_reports_connection_stage_and_error_code(monkeypatch, tmp_path):
+    class FailingConnection:
+        row_factory = None
+        closed = False
+        statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+            if statement == "PRAGMA synchronous = NORMAL":
+                error = sqlite3.OperationalError("disk I/O error")
+                error.sqlite_errorname = "unknown"
+                error.sqlite_errorcode = 8714
+                raise error
+            return self
+
+        @staticmethod
+        def fetchone():
+            return (None,)
+
+        def close(self):
+            self.closed = True
+
+    path = tmp_path / "network-catalogue.jvvv"
+    path.touch()
+    connection = FailingConnection()
+    monkeypatch.setattr(
+        Database,
+        "_uses_network_storage",
+        staticmethod(lambda path: True),
+    )
+    monkeypatch.setattr(database_module.sqlite3, "connect", lambda *args, **kwargs: connection)
+
+    with pytest.raises(database_module.CatalogueError) as error_info:
+        Database(path, initialize=False, create=False)
+
+    details = error_info.value.diagnostic_details
+    assert "Operation: setting SQLite synchronous mode to NORMAL" in details
+    assert "Network storage detected: Yes" in details
+    assert "Journal mode in file header: Unknown" in details
+    assert "Requested journal mode: Preserve rollback mode" in details
+    assert "SQLite error name: SQLITE_IOERR_IN_PAGE" in details
+    assert "SQLite error code: 8714" in details
+    assert connection.statements == [
+        "PRAGMA foreign_keys = ON",
+        "PRAGMA busy_timeout = 2000",
+        "PRAGMA synchronous = NORMAL",
+    ]
+    assert connection.closed is True
+
+
 def test_reads_remain_available_during_writer_transaction(tmp_path):
     path = tmp_path / "catalogue.sqlite3"
     scanned_at = "2026-06-25T12:00:00.000000+0000"

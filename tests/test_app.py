@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from jvvv.app import connected_volume_signature, include_content_timestamp, suggested_new_volume_drive_id
+from jvvv.app import (
+    connected_volume_signature,
+    format_exception_diagnostics,
+    include_content_timestamp,
+    suggested_new_volume_drive_id,
+)
+from jvvv.database import CatalogueError
 from jvvv.utils import VolumeSnapshot
 
 
@@ -47,3 +53,20 @@ def test_connected_volume_signature_detects_identity_and_mount_root():
         ("windows-volume-guid", "\\\\?\\volume{aaa}\\", "d:\\"),
         ("windows-volume-guid", "\\\\?\\volume{bbb}\\", "e:\\"),
     )
+
+
+def test_exception_diagnostics_includes_database_context_and_cause():
+    try:
+        try:
+            raise OSError("low-level failure")
+        except OSError as cause:
+            raise CatalogueError(
+                "catalogue failed",
+                diagnostic_details="Operation: setting SQLite journal mode to DELETE",
+            ) from cause
+    except CatalogueError as exc:
+        details = format_exception_diagnostics(exc)
+
+    assert "Operation: setting SQLite journal mode to DELETE" in details
+    assert "OSError: low-level failure" in details
+    assert "CatalogueError: catalogue failed" in details
