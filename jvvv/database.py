@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 CATALOGUE_EXTENSION = ".jvvv"
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
@@ -28,7 +28,16 @@ WINDOWS_DRIVE_REMOTE = 4
 SQLITE_EXTENDED_ERROR_NAMES = {
     8714: "SQLITE_IOERR_IN_PAGE",
 }
-REQUIRED_TABLES = {"volumes", "volume_register", "folders", "files", "scan_history", "scan_errors"}
+REQUIRED_TABLES = {
+    "volumes",
+    "volume_register",
+    "folders",
+    "files",
+    "files_fts",
+    "folders_fts",
+    "scan_history",
+    "scan_errors",
+}
 REQUIRED_COLUMNS = {
     "volumes": {
         "id",
@@ -224,10 +233,14 @@ class Database:
         *,
         initialize: bool = True,
         create: bool = True,
+        read_only: bool = False,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         check_same_thread: bool = True,
     ) -> None:
+        if create and read_only:
+            raise ValueError("A read-only database connection cannot create a catalogue.")
         self.path = Path(path).expanduser()
+        self.read_only = read_only
         self.busy_timeout_ms = busy_timeout_ms
         self._operation = "preparing the catalogue path"
         self._connect_target = ""
@@ -247,7 +260,10 @@ class Database:
         else:
             if not self.path.is_file():
                 raise InvalidCatalogueError(f"Catalogue file does not exist: {self.path}")
-            connect_target = self._sqlite_uri(self.path)
+            connect_target = self._sqlite_uri(
+                self.path,
+                mode="ro" if self.read_only else "rw",
+            )
             use_uri = True
 
         self._connect_target = connect_target
@@ -282,14 +298,14 @@ class Database:
             self.connection.close()
 
     @staticmethod
-    def _sqlite_uri(path: Path) -> str:
+    def _sqlite_uri(path: Path, *, mode: str = "rw") -> str:
         resolved = path.resolve(strict=False)
         uri = resolved.as_uri()
         if resolved.drive.startswith("\\\\"):
             # pathlib represents a UNC host as a file-URI authority, but SQLite
             # rejects non-local authorities. Keep the UNC name in the URI path.
             uri = f"file:////{uri[len('file://'):]}"
-        return f"{uri}?mode=rw"
+        return f"{uri}?mode={mode}"
 
     @staticmethod
     def _uses_network_storage(path: Path) -> bool:
@@ -320,6 +336,11 @@ class Database:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self._operation = "setting the SQLite busy timeout"
         self.connection.execute(f"PRAGMA busy_timeout = {max(self.busy_timeout_ms, 0)}")
+        if self.read_only:
+            self._requested_journal_mode = "Read-only"
+            self._operation = "enabling SQLite query-only mode"
+            self.connection.execute("PRAGMA query_only = ON")
+            return
         if self._network_storage:
             # Network catalogues are required to already use rollback
             # journaling. Do not execute journal_mode here: even asking SQLite
@@ -407,6 +428,12 @@ class Database:
                 if version < 6:
                     self._apply_migration_6()
                     version = 6
+                if version < 7:
+                    self._apply_migration_7()
+                    version = 7
+                if version < 8:
+                    self._apply_migration_8()
+                    version = 8
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
@@ -702,6 +729,118 @@ class Database:
         ]
         for statement in statements:
             self.connection.execute(statement)
+
+    def _apply_migration_7(self) -> None:
+        statements = [
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                name,
+                relative_path,
+                extension,
+                content='files',
+                content_rowid='id',
+                tokenize='trigram',
+                detail='column'
+            )
+            """,
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS folders_fts USING fts5(
+                name,
+                relative_path,
+                content='folders',
+                content_rowid='id',
+                tokenize='trigram',
+                detail='column'
+            )
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS files_fts_insert
+            AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, name, relative_path, extension)
+                VALUES (new.id, new.name, new.relative_path, new.extension);
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS files_fts_delete
+            AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name, relative_path, extension)
+                VALUES ('delete', old.id, old.name, old.relative_path, old.extension);
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS files_fts_update
+            AFTER UPDATE OF name, relative_path, extension ON files
+            WHEN old.name IS NOT new.name
+              OR old.relative_path IS NOT new.relative_path
+              OR old.extension IS NOT new.extension
+            BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name, relative_path, extension)
+                VALUES ('delete', old.id, old.name, old.relative_path, old.extension);
+                INSERT INTO files_fts(rowid, name, relative_path, extension)
+                VALUES (new.id, new.name, new.relative_path, new.extension);
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS folders_fts_insert
+            AFTER INSERT ON folders BEGIN
+                INSERT INTO folders_fts(rowid, name, relative_path)
+                VALUES (new.id, new.name, new.relative_path);
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS folders_fts_delete
+            AFTER DELETE ON folders BEGIN
+                INSERT INTO folders_fts(folders_fts, rowid, name, relative_path)
+                VALUES ('delete', old.id, old.name, old.relative_path);
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS folders_fts_update
+            AFTER UPDATE OF name, relative_path ON folders
+            WHEN old.name IS NOT new.name
+              OR old.relative_path IS NOT new.relative_path
+            BEGIN
+                INSERT INTO folders_fts(folders_fts, rowid, name, relative_path)
+                VALUES ('delete', old.id, old.name, old.relative_path);
+                INSERT INTO folders_fts(rowid, name, relative_path)
+                VALUES (new.id, new.name, new.relative_path);
+            END
+            """,
+        ]
+        for statement in statements:
+            self.connection.execute(statement)
+        self.connection.execute("INSERT INTO files_fts(files_fts) VALUES ('rebuild')")
+        self.connection.execute("INSERT INTO folders_fts(folders_fts) VALUES ('rebuild')")
+
+    def _apply_migration_8(self) -> None:
+        definitions = {
+            row["name"]: (row["sql"] or "").casefold().replace(" ", "")
+            for row in self.connection.execute(
+                """
+                SELECT name, sql
+                FROM sqlite_master
+                WHERE name IN ('files_fts', 'folders_fts')
+                """
+            )
+        }
+        if all(
+            "detail='column'" in definitions.get(table, "")
+            for table in ("files_fts", "folders_fts")
+        ):
+            return
+
+        for trigger in (
+            "files_fts_insert",
+            "files_fts_delete",
+            "files_fts_update",
+            "folders_fts_insert",
+            "folders_fts_delete",
+            "folders_fts_update",
+        ):
+            self.connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        self.connection.execute("DROP TABLE IF EXISTS files_fts")
+        self.connection.execute("DROP TABLE IF EXISTS folders_fts")
+        self._apply_migration_7()
 
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column not in self._column_names(table):
@@ -1793,33 +1932,102 @@ class Database:
             (volume_id, relative_path),
         ).fetchone()
 
-    def search(self, query: str, limit: int = 500) -> list[sqlite3.Row]:
+    def iter_search(
+        self,
+        query: str,
+        limit: int | None = None,
+        *,
+        include_paths: bool = False,
+    ) -> Iterator[sqlite3.Row]:
         text = query.strip()
         if not text:
-            return []
-        needle = f"%{text}%"
+            return iter(())
+        escaped_text = (
+            text.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        needle = f"%{escaped_text}%"
         params: dict[str, object] = {
             "text": text,
             "needle": needle,
-            "limit": limit,
         }
+        file_like_columns = ["f.name", "f.extension"]
+        folder_like_columns = ["fo.name"]
+        if include_paths:
+            file_like_columns.insert(1, "f.relative_path")
+            folder_like_columns.append("fo.relative_path")
+        file_like_clause = "\n                    OR ".join(
+            f"{column} LIKE :needle ESCAPE '\\' COLLATE NOCASE"
+            for column in file_like_columns
+        )
+        folder_like_clause = "\n                    OR ".join(
+            f"{column} LIKE :needle ESCAPE '\\' COLLATE NOCASE"
+            for column in folder_like_columns
+        )
+        if len(text) >= 3:
+            trigram_query = " AND ".join(
+                f'"{trigram.replace(chr(34), chr(34) * 2)}"'
+                for trigram in dict.fromkeys(
+                    text[index : index + 3]
+                    for index in range(len(text) - 2)
+                )
+            )
+            params["file_fts_query"] = (
+                trigram_query
+                if include_paths
+                else f"{{name extension}} : ({trigram_query})"
+            )
+            params["folder_fts_query"] = (
+                trigram_query if include_paths else f"name : ({trigram_query})"
+            )
         if text.startswith("."):
             params["extension"] = text[1:].lower()
+            file_search_join = ""
             file_clause = "f.extension = :extension"
             file_match_rank = "0"
-        else:
-            file_clause = """
-                f.name LIKE :needle COLLATE NOCASE
-                OR f.relative_path LIKE :needle COLLATE NOCASE
-                OR f.extension LIKE :needle COLLATE NOCASE
+        elif len(text) >= 3:
+            file_search_join = "JOIN files_fts ON files_fts.rowid = f.id"
+            file_clause = f"""
+                files_fts MATCH :file_fts_query
+                AND (
+                    {file_like_clause}
+                )
             """
             file_match_rank = """
                 CASE
                     WHEN f.name = :text COLLATE NOCASE THEN 0
-                    WHEN f.name LIKE :needle COLLATE NOCASE THEN 2
+                    WHEN f.name LIKE :needle ESCAPE '\\' COLLATE NOCASE THEN 2
                     ELSE 4
                 END
             """
+        else:
+            file_search_join = ""
+            file_clause = file_like_clause
+            file_match_rank = """
+                CASE
+                    WHEN f.name = :text COLLATE NOCASE THEN 0
+                    WHEN f.name LIKE :needle ESCAPE '\\' COLLATE NOCASE THEN 2
+                    ELSE 4
+                END
+            """
+
+        if len(text) >= 3:
+            folder_search_join = "JOIN folders_fts ON folders_fts.rowid = fo.id"
+            folder_clause = f"""
+                folders_fts MATCH :folder_fts_query
+                AND (
+                    {folder_like_clause}
+                )
+            """
+        else:
+            folder_search_join = ""
+            folder_clause = folder_like_clause
+
+        limit_clause = ""
+        if limit is not None:
+            params["limit"] = max(int(limit), 0)
+            limit_clause = "LIMIT :limit"
 
         sql = f"""
             SELECT *
@@ -1842,6 +2050,7 @@ class Database:
                     CASE WHEN f.missing = 0 THEN 0 ELSE 1 END AS missing_rank,
                     {file_match_rank} AS match_rank
                 FROM files f
+                {file_search_join}
                 JOIN volumes v ON v.id = f.volume_id
                 JOIN volume_register r ON r.volume_id = v.id
                 WHERE {file_clause}
@@ -1864,26 +2073,36 @@ class Database:
                     CASE WHEN fo.missing = 0 THEN 0 ELSE 1 END AS missing_rank,
                     CASE
                         WHEN fo.name = :text COLLATE NOCASE THEN 0
-                        WHEN fo.name LIKE :needle COLLATE NOCASE THEN 1
+                        WHEN fo.name LIKE :needle ESCAPE '\\' COLLATE NOCASE THEN 1
                         ELSE 3
                     END AS match_rank
                 FROM folders fo
+                {folder_search_join}
                 JOIN volumes v ON v.id = fo.volume_id
                 JOIN volume_register r ON r.volume_id = v.id
-                WHERE fo.name LIKE :needle COLLATE NOCASE
-                   OR fo.relative_path LIKE :needle COLLATE NOCASE
+                WHERE {folder_clause}
             )
             ORDER BY
                 match_rank,
                 missing_rank,
                 CASE WHEN item_type = 'folder' THEN 0 ELSE 1 END,
                 name COLLATE NOCASE
-            LIMIT :limit
+            {limit_clause}
         """
+        return iter(self.connection.execute(sql, params))
+
+    def search(
+        self,
+        query: str,
+        limit: int | None = None,
+        *,
+        include_paths: bool = False,
+    ) -> list[sqlite3.Row]:
         return list(
-            self.connection.execute(
-                sql,
-                params,
+            self.iter_search(
+                query,
+                limit=limit,
+                include_paths=include_paths,
             )
         )
 

@@ -34,8 +34,14 @@ class VolumeSnapshot:
 
 
 class ConnectedVolumeResolver:
-    def __init__(self, snapshots: list[VolumeSnapshot] | None = None) -> None:
+    def __init__(
+        self,
+        snapshots: list[VolumeSnapshot] | None = None,
+        *,
+        check_source_path: bool = True,
+    ) -> None:
         self.snapshots = snapshots if snapshots is not None else list_connected_volume_snapshots()
+        self.check_source_path = check_source_path
 
     def resolve(self, volume: Any) -> str | None:
         kind = _record_value(volume, "identity_kind")
@@ -48,6 +54,9 @@ class ConnectedVolumeResolver:
             if snapshot.identity_kind == kind and snapshot.identity_token.casefold() == token.casefold():
                 source_path = path_with_relative(snapshot.mount_root, relative)
                 return source_path if Path(source_path).exists() else None
+
+        if not self.check_source_path:
+            return None
 
         source_path = _record_value(volume, "source_path")
         if source_path and Path(source_path).exists():

@@ -14,8 +14,8 @@ component.
 - Create, edit, delete, scan, and rescan catalogue volumes.
 - Store each catalogue as a single SQLite-backed `.jvvv` file.
 - Browse indexed folders and files offline.
-- Search by filename, partial filename, extension, folder name, and relative
-  path across all volumes.
+- Search by filename, partial filename, extension, and folder name across all
+  volumes, with optional relative-path matching in **Help > Preferences**.
 - Show connected/offline status, capacity, used/free space, indexed item counts,
   last scan time, and scan logs.
 - Run scans on a Qt worker thread so the interface remains responsive.

@@ -37,7 +37,8 @@ def test_database_initializes_schema(tmp_path):
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
         assert "volume_register" in tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert {"files_fts", "folders_fts"} <= tables
         folder_indexes = {
             row["name"]
             for row in db.connection.execute("PRAGMA index_list(folders)")
@@ -118,6 +119,25 @@ def test_sqlite_uri_encodes_unc_server_as_part_of_path():
         "file:////192.168.1.100/archive/Archive%20One.jvvv?mode=rw"
     )
     assert Database._uses_network_storage(UncPath()) is True
+
+
+def test_read_only_connection_enables_query_only_mode(tmp_path):
+    path = tmp_path / "catalogue.jvvv"
+    created = Database(path)
+    created.close()
+
+    reader = Database(
+        path,
+        initialize=False,
+        create=False,
+        read_only=True,
+    )
+    try:
+        assert reader.connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            reader.connection.execute("DELETE FROM volumes")
+    finally:
+        reader.close()
 
 
 def test_network_storage_recognizes_mapped_windows_drive(monkeypatch):
@@ -678,7 +698,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 8
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
@@ -689,6 +709,86 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
         assert root["recursive_size_bytes"] == 123
         assert root["recursive_file_count"] == 1
         assert root["direct_file_count"] == 1
+        assert [row["name"] for row in migrated.search("file.txt")] == ["file.txt"]
+    finally:
+        migrated.close()
+
+
+def test_version_7_search_index_migrates_to_column_detail(tmp_path):
+    path = tmp_path / "catalogue.jvvv"
+    db = Database(path)
+    try:
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        with db.transaction():
+            folder_id = db.ensure_folder(
+                volume_id=volume_id,
+                parent_id=None,
+                name="Archive",
+                relative_path="",
+                scanned_at="2026-06-25T12:00:00.000000+0000",
+            )
+            db.upsert_file(
+                volume_id=volume_id,
+                folder_id=folder_id,
+                name="needle.txt",
+                relative_path="needle.txt",
+                extension="txt",
+                size_bytes=1,
+                modified_at=None,
+                scanned_at="2026-06-25T12:00:00.000000+0000",
+            )
+
+        with db.transaction() as conn:
+            for trigger in (
+                "files_fts_insert",
+                "files_fts_delete",
+                "files_fts_update",
+                "folders_fts_insert",
+                "folders_fts_delete",
+                "folders_fts_update",
+            ):
+                conn.execute(f"DROP TRIGGER {trigger}")
+            conn.execute("DROP TABLE files_fts")
+            conn.execute("DROP TABLE folders_fts")
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE files_fts USING fts5(
+                    name, relative_path, extension,
+                    content='files', content_rowid='id',
+                    tokenize='trigram', detail='none'
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE folders_fts USING fts5(
+                    name, relative_path,
+                    content='folders', content_rowid='id',
+                    tokenize='trigram', detail='none'
+                )
+                """
+            )
+            conn.execute("INSERT INTO files_fts(files_fts) VALUES ('rebuild')")
+            conn.execute("INSERT INTO folders_fts(folders_fts) VALUES ('rebuild')")
+            conn.execute("PRAGMA user_version = 7")
+    finally:
+        db.close()
+
+    migrated = open_catalogue(path)
+    try:
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        definitions = {
+            row["name"]: row["sql"]
+            for row in migrated.connection.execute(
+                """
+                SELECT name, sql FROM sqlite_master
+                WHERE name IN ('files_fts', 'folders_fts')
+                """
+            )
+        }
+        assert "detail='column'" in definitions["files_fts"]
+        assert "detail='column'" in definitions["folders_fts"]
+        assert [row["name"] for row in migrated.search("needle")] == ["needle.txt"]
     finally:
         migrated.close()
 

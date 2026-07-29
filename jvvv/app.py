@@ -109,6 +109,7 @@ ROLE_ITEM_ID = Qt.ItemDataRole.UserRole + 4
 ROLE_PERCENT_FULL = Qt.ItemDataRole.UserRole + 5
 VOLUME_FULL_COLUMN = 18
 LAST_CATALOGUE_PATH_SETTING = "catalogues/lastPath"
+SEARCH_INCLUDE_PATHS_SETTING = "search/includePaths"
 CATALOGUE_FILE_FILTER = "Joemt Archive View Files (*.jvvv)"
 
 
@@ -134,6 +135,7 @@ CONTENT_DATE_GUESS_ITEM_BUDGET = 500
 CONTENT_DATE_GUESS_TIME_BUDGET_SECONDS = 0.025
 VOLUME_CONNECTION_POLL_INTERVAL_MS = 1500
 VOLUME_CONNECTION_REFRESH_DELAY_MS = 250
+SEARCH_RESULT_BATCH_SIZE = 500
 AID_VOLUME_LABEL_RE = re.compile(r"^AID-\d{3,}$", re.IGNORECASE)
 
 
@@ -221,6 +223,15 @@ class StandardTableModel(QAbstractTableModel):
         self.items = items
         self._sort_items()
         self.endResetModel()
+
+    def append_items(self, items: list[Any]) -> None:
+        if not items:
+            return
+        first_row = len(self.items)
+        last_row = first_row + len(items) - 1
+        self.beginInsertRows(QModelIndex(), first_row, last_row)
+        self.items.extend(items)
+        self.endInsertRows()
 
     def item_at(self, index: QModelIndex) -> Any | None:
         if not index.isValid() or index.row() < 0 or index.row() >= len(self.items):
@@ -1430,6 +1441,47 @@ class ItemPropertiesDialog(QDialog):
     def copy_all(self) -> None:
         QApplication.clipboard().setText(self.copy_text)
 
+
+class PreferencesDialog(QDialog):
+    def __init__(
+        self,
+        include_paths: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Preferences - {APP_NAME}")
+        self.setMinimumWidth(440)
+
+        search_group = QGroupBox("Search")
+        self.include_paths_check = QCheckBox(
+            "Include file and folder paths in searches"
+        )
+        self.include_paths_check.setChecked(include_paths)
+        explanation = QLabel(
+            "When enabled, a folder-name match can also return every file and "
+            "subfolder beneath it. Leave this disabled for concise name-based results."
+        )
+        explanation.setWordWrap(True)
+
+        search_layout = QVBoxLayout(search_group)
+        search_layout.addWidget(self.include_paths_check)
+        search_layout.addWidget(explanation)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(search_group)
+        layout.addWidget(buttons)
+
+    def include_paths(self) -> bool:
+        return self.include_paths_check.isChecked()
+
+
 class HelpDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1479,8 +1531,8 @@ class HelpDialog(QDialog):
              "Select a saved volume to explore its folder tree, even when the "
              "original drive is disconnected."),
             ("4. Search",
-             "Find files and folders by name, extension, or relative path across "
-             "the stored catalogue."),
+             "Find files and folders by name or extension across the stored catalogue. "
+             "Path matching can be enabled under <b>Help &gt; Preferences</b>."),
         ]
         section_html = "".join(
             f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
@@ -1585,56 +1637,83 @@ class DeleteVolumeWorker(QObject):
 
 
 class SearchWorker(QObject):
-    finished = Signal(int, list)
+    batch_ready = Signal(int, list)
+    finished = Signal(int, int)
     cancelled = Signal(int)
     failed = Signal(int, str)
 
-    def __init__(self, db_path: Path, query: str, request_id: int) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        query: str,
+        request_id: int,
+        connected_volume_snapshots: list[VolumeSnapshot] | None = None,
+        *,
+        include_paths: bool = False,
+    ) -> None:
         super().__init__()
         self.db_path = db_path
         self.query = query
         self.request_id = request_id
+        self.connected_volume_snapshots = connected_volume_snapshots
+        self.include_paths = include_paths
         self.cancel_requested = False
 
     @Slot()
     def run(self) -> None:
         db: Database | None = None
-        items: list[SearchResultItem] = []
+        result_count = 0
         error_details: str | None = None
         try:
-            db = Database(self.db_path, initialize=False, create=False)
+            db = Database(
+                self.db_path,
+                initialize=False,
+                create=False,
+                read_only=True,
+            )
             db.connection.set_progress_handler(
                 lambda: 1 if self.cancel_requested else 0,
                 1000,
             )
-            results = db.search(self.query)
-            if not self.cancel_requested:
-                resolver = ConnectedVolumeResolver()
-                connected_by_volume: dict[int, bool] = {}
-                for result in results:
-                    if self.cancel_requested:
-                        break
-                    volume_id = result["volume_id"]
-                    connected = connected_by_volume.get(volume_id)
-                    if connected is None:
-                        connected = resolver.resolve(result) is not None
-                        connected_by_volume[volume_id] = connected
-                    items.append(
-                        SearchResultItem(
-                            item_type=result["item_type"],
-                            item_id=result["item_id"],
-                            name=result["name"],
-                            volume_id=volume_id,
-                            drive_id=result["drive_id"],
-                            volume_name=result["volume_name"],
-                            relative_path=result["relative_path"],
-                            size_bytes=result["size_bytes"],
-                            modified_at=result["modified_at"],
-                            missing=bool(result["missing"]),
-                            source_path=result["source_path"],
-                            connected=connected,
-                        )
+            resolver = ConnectedVolumeResolver(
+                self.connected_volume_snapshots,
+                check_source_path=self.connected_volume_snapshots is None,
+            )
+            connected_by_volume: dict[int, bool] = {}
+            batch: list[SearchResultItem] = []
+            for result in db.iter_search(
+                self.query,
+                include_paths=self.include_paths,
+            ):
+                if self.cancel_requested:
+                    break
+                volume_id = result["volume_id"]
+                connected = connected_by_volume.get(volume_id)
+                if connected is None:
+                    connected = resolver.resolve(result) is not None
+                    connected_by_volume[volume_id] = connected
+                batch.append(
+                    SearchResultItem(
+                        item_type=result["item_type"],
+                        item_id=result["item_id"],
+                        name=result["name"],
+                        volume_id=volume_id,
+                        drive_id=result["drive_id"],
+                        volume_name=result["volume_name"],
+                        relative_path=result["relative_path"],
+                        size_bytes=result["size_bytes"],
+                        modified_at=result["modified_at"],
+                        missing=bool(result["missing"]),
+                        source_path=result["source_path"],
+                        connected=connected,
                     )
+                )
+                result_count += 1
+                if len(batch) >= SEARCH_RESULT_BATCH_SIZE:
+                    self.batch_ready.emit(self.request_id, batch)
+                    batch = []
+            if batch and not self.cancel_requested:
+                self.batch_ready.emit(self.request_id, batch)
         except Exception:
             if not self.cancel_requested:
                 error_details = traceback.format_exc()
@@ -1648,7 +1727,7 @@ class SearchWorker(QObject):
         elif error_details is not None:
             self.failed.emit(self.request_id, error_details)
         else:
-            self.finished.emit(self.request_id, items)
+            self.finished.emit(self.request_id, result_count)
 
     def cancel(self) -> None:
         self.cancel_requested = True
@@ -1688,7 +1767,7 @@ class CatalogueOpenWorker(QObject):
                 )
             if not volumes:
                 self.progress.emit(1, 1, "Catalogue ready")
-            self.finished.emit(db, items, connected_volume_signature(snapshots))
+            self.finished.emit(db, items, snapshots)
             db = None
         except Exception as exc:
             self.failed.emit(exc)
@@ -1701,6 +1780,11 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = QSettings("JVVV", APP_NAME)
+        self.search_include_paths = self.settings.value(
+            SEARCH_INCLUDE_PATHS_SETTING,
+            False,
+            type=bool,
+        )
         self.db: Database | None = None
         self.catalogue_path: Path | None = None
         self.catalogue_lock: QLockFile | None = None
@@ -1718,7 +1802,7 @@ class MainWindow(QMainWindow):
         self.catalogue_open_lock: QLockFile | None = None
         self.catalogue_open_path: Path | None = None
         self.catalogue_open_status_message = "Catalogue opened."
-        self.pending_search_request: tuple[int, Path, str] | None = None
+        self.pending_search_request: tuple[int, Path, str, bool] | None = None
         self.search_request_id = 0
         self.browser_shortcuts: list[QShortcut] = []
         self.browser_icons = CatalogueIconProvider()
@@ -1732,6 +1816,7 @@ class MainWindow(QMainWindow):
         self.scan_blocked_widgets: list[QWidget] = []
         self.base_ui_font = QFont(QApplication.font())
         self.ui_zoom = 1.0
+        self._connected_volume_snapshots: list[VolumeSnapshot] = []
         self._connected_volume_signature: tuple[tuple[str, str, str], ...] = ()
         self.volume_connection_timer = QTimer(self)
         self.volume_connection_timer.setInterval(VOLUME_CONNECTION_POLL_INTERVAL_MS)
@@ -1831,6 +1916,12 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.zoom_out_action)
 
         help_menu = self.menuBar().addMenu("&Help")
+        self.preferences_action = QAction("Preferences\u2026", self)
+        self.preferences_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.preferences_action.triggered.connect(self.show_preferences)
+        help_menu.addAction(self.preferences_action)
+        help_menu.addSeparator()
+
         self.help_action = QAction("Help", self)
         self.help_action.setShortcut(QKeySequence(QKeySequence.StandardKey.HelpContents))
         self.help_action.triggered.connect(self.show_help)
@@ -2251,7 +2342,7 @@ class MainWindow(QMainWindow):
 
     def _build_search_tab(self) -> QWidget:
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search filename, extension, folder, or relative path")
+        self.search_edit.setPlaceholderText(self.search_placeholder_text())
         self.search_button = QPushButton("Search")
         self.open_file_button = QPushButton("Open File")
         self.reveal_file_button = QPushButton("Reveal")
@@ -2342,6 +2433,28 @@ class MainWindow(QMainWindow):
     def show_help(self) -> None:
         dialog = HelpDialog(self)
         dialog.exec()
+
+    def show_preferences(self) -> None:
+        dialog = PreferencesDialog(self.search_include_paths, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        include_paths = dialog.include_paths()
+        if include_paths == self.search_include_paths:
+            return
+
+        self.search_include_paths = include_paths
+        self.settings.setValue(SEARCH_INCLUDE_PATHS_SETTING, include_paths)
+        self.settings.sync()
+        self.search_edit.setPlaceholderText(self.search_placeholder_text())
+        if self.db is not None and self.search_edit.text().strip():
+            self.perform_search()
+        self.statusBar().showMessage("Preferences saved.", 3000)
+
+    def search_placeholder_text(self) -> str:
+        if self.search_include_paths:
+            return "Search filename, extension, folder, or relative path"
+        return "Search filename, extension, or folder"
 
     def open_catalogue_location(self) -> None:
         if self.catalogue_path is None:
@@ -2503,7 +2616,7 @@ class MainWindow(QMainWindow):
         self,
         db: Database,
         items: list[VolumeItem],
-        connection_signature: tuple[tuple[str, str, str], ...],
+        connected_volume_snapshots: list[VolumeSnapshot],
     ) -> None:
         path = self.catalogue_open_path
         lock = self.catalogue_open_lock
@@ -2518,7 +2631,7 @@ class MainWindow(QMainWindow):
             path,
             lock,
             initial_volume_items=items,
-            connection_signature=connection_signature,
+            connected_volume_snapshots=connected_volume_snapshots,
         )
         self._set_catalogue_loading(False)
         self.statusBar().showMessage(self.catalogue_open_status_message, 4000)
@@ -2630,14 +2743,14 @@ class MainWindow(QMainWindow):
         lock: QLockFile,
         *,
         initial_volume_items: list[VolumeItem] | None = None,
-        connection_signature: tuple[tuple[str, str, str], ...] | None = None,
+        connected_volume_snapshots: list[VolumeSnapshot] | None = None,
     ) -> None:
         self.db = db
         self.catalogue_path = path
         self.catalogue_lock = lock
         self.settings.setValue(LAST_CATALOGUE_PATH_SETTING, str(path.resolve(strict=False)))
         self._set_catalogue_open(True)
-        self.start_connected_volume_monitor(connection_signature)
+        self.start_connected_volume_monitor(connected_volume_snapshots)
         if initial_volume_items is None:
             self.refresh_volumes()
         else:
@@ -2648,12 +2761,15 @@ class MainWindow(QMainWindow):
 
     def start_connected_volume_monitor(
         self,
-        connection_signature: tuple[tuple[str, str, str], ...] | None = None,
+        connected_volume_snapshots: list[VolumeSnapshot] | None = None,
     ) -> None:
-        self._connected_volume_signature = (
-            self.current_connected_volume_signature()
-            if connection_signature is None
-            else connection_signature
+        self._connected_volume_snapshots = (
+            list_connected_volume_snapshots()
+            if connected_volume_snapshots is None
+            else connected_volume_snapshots
+        )
+        self._connected_volume_signature = connected_volume_signature(
+            self._connected_volume_snapshots
         )
         self.volume_connection_refresh_timer.stop()
         self.volume_connection_timer.start()
@@ -2661,13 +2777,16 @@ class MainWindow(QMainWindow):
     def stop_connected_volume_monitor(self) -> None:
         self.volume_connection_timer.stop()
         self.volume_connection_refresh_timer.stop()
+        self._connected_volume_snapshots = []
         self._connected_volume_signature = ()
 
     @Slot()
     def check_connected_volumes(self) -> None:
         if self.db is None:
             return
-        signature = self.current_connected_volume_signature()
+        snapshots = list_connected_volume_snapshots()
+        signature = connected_volume_signature(snapshots)
+        self._connected_volume_snapshots = snapshots
         if signature == self._connected_volume_signature:
             return
         self._connected_volume_signature = signature
@@ -2839,7 +2958,10 @@ class MainWindow(QMainWindow):
             self._clear_catalogue_views()
             return
         volumes = self.db.list_volumes()
-        resolver = ConnectedVolumeResolver()
+        resolver = ConnectedVolumeResolver(
+            self._connected_volume_snapshots,
+            check_source_path=False,
+        )
         all_items = [
             volume_item_from_record(
                 volume,
@@ -3766,7 +3888,14 @@ class MainWindow(QMainWindow):
             self.statusBar().clearMessage()
             return
 
-        request = (request_id, self.db.path, query)
+        request = (
+            request_id,
+            self.db.path,
+            query,
+            self.search_include_paths,
+        )
+        self.search_model.set_items([])
+        self.on_search_selection_changed()
         if self.search_thread is not None:
             self.pending_search_request = request
             if self.search_thread.isRunning() and self.search_worker is not None:
@@ -3777,15 +3906,22 @@ class MainWindow(QMainWindow):
 
         self._start_search(request)
 
-    def _start_search(self, request: tuple[int, Path, str]) -> None:
-        request_id, db_path, query = request
+    def _start_search(self, request: tuple[int, Path, str, bool]) -> None:
+        request_id, db_path, query, include_paths = request
         self.search_button.setText("Searching...")
         self.statusBar().showMessage(f'Searching for "{query}"...')
 
         self.search_thread = QThread(self)
-        self.search_worker = SearchWorker(db_path, query, request_id)
+        self.search_worker = SearchWorker(
+            db_path,
+            query,
+            request_id,
+            list(self._connected_volume_snapshots),
+            include_paths=include_paths,
+        )
         self.search_worker.moveToThread(self.search_thread)
         self.search_thread.started.connect(self.search_worker.run)
+        self.search_worker.batch_ready.connect(self.on_search_batch_ready)
         self.search_worker.finished.connect(self.on_search_finished)
         self.search_worker.cancelled.connect(self.on_search_cancelled)
         self.search_worker.failed.connect(self.on_search_failed)
@@ -3800,12 +3936,25 @@ class MainWindow(QMainWindow):
         self.search_thread.start()
 
     @Slot(int, list)
-    def on_search_finished(self, request_id: int, items: list[SearchResultItem]) -> None:
+    def on_search_batch_ready(
+        self,
+        request_id: int,
+        items: list[SearchResultItem],
+    ) -> None:
         if request_id != self.search_request_id or self.db is None:
             return
-        self.search_model.set_items(items)
+        self.search_model.append_items(items)
+
+    @Slot(int, int)
+    def on_search_finished(self, request_id: int, result_count: int) -> None:
+        if request_id != self.search_request_id or self.db is None:
+            return
+        self.search_model.sort(
+            self.search_model.sort_column,
+            self.search_model.sort_order,
+        )
         self.on_search_selection_changed()
-        self.statusBar().showMessage(f"{len(items)} search results.", 4000)
+        self.statusBar().showMessage(f"{result_count} search results.", 4000)
 
     @Slot(int)
     def on_search_cancelled(self, request_id: int) -> None:
@@ -3816,6 +3965,8 @@ class MainWindow(QMainWindow):
     def on_search_failed(self, request_id: int, details: str) -> None:
         if request_id != self.search_request_id or self.db is None:
             return
+        self.search_model.set_items([])
+        self.on_search_selection_changed()
         self.statusBar().showMessage("Search failed.", 4000)
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Critical)
