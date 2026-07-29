@@ -357,6 +357,20 @@ class BrowserItem:
     modified_at: str | None = None
     missing: bool = False
     parent_id: int | None = None
+    is_parent_entry: bool = False
+
+    @property
+    def is_folder(self) -> bool:
+        return self.item_type == "folder"
+
+
+@dataclass(frozen=True)
+class CatalogueItemRef:
+    item_type: str
+    item_id: int
+    volume_id: int
+    relative_path: str
+    missing: bool = False
 
     @property
     def is_folder(self) -> bool:
@@ -550,6 +564,8 @@ class BrowserTableModel(StandardTableModel):
         return None
 
     def group_key(self, item: BrowserItem) -> int:
+        if item.is_parent_entry:
+            return -1
         return 0 if item.is_folder else 1
 
 
@@ -2186,6 +2202,7 @@ class MainWindow(QMainWindow):
         self.folder_tree = QTreeWidget()
         self.folder_tree.setHeaderLabel("Folders")
         self.folder_tree.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
+        self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         self.up_button = QPushButton("UP")
         self.up_button.setEnabled(False)
@@ -2344,7 +2361,7 @@ class MainWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText(self.search_placeholder_text())
         self.search_button = QPushButton("Search")
-        self.open_file_button = QPushButton("Open File")
+        self.open_file_button = QPushButton("Open")
         self.reveal_file_button = QPushButton("Reveal")
         self.open_file_button.setEnabled(False)
         self.reveal_file_button.setEnabled(False)
@@ -2360,6 +2377,7 @@ class MainWindow(QMainWindow):
         self.search_table.setModel(self.search_model)
         self.configure_table_view(self.search_table)
         self.search_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.search_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         QTimer.singleShot(
             0,
             lambda: self.apply_table_default_columns(
@@ -2391,14 +2409,16 @@ class MainWindow(QMainWindow):
         self.volume_table.doubleClicked.connect(self.edit_volume_index)
         self.folder_tree.itemExpanded.connect(self.load_tree_children)
         self.folder_tree.currentItemChanged.connect(self.on_folder_changed)
+        self.folder_tree.customContextMenuRequested.connect(self.show_folder_tree_context_menu)
         self.up_button.clicked.connect(self.navigate_parent_folder)
         self.file_table.doubleClicked.connect(self.open_browser_index)
         self.file_table.customContextMenuRequested.connect(self.show_browser_context_menu)
         self.search_button.clicked.connect(self.perform_search)
         self.search_edit.returnPressed.connect(self.perform_search)
         self.search_table.selectionModel().selectionChanged.connect(self.on_search_selection_changed)
-        self.search_table.doubleClicked.connect(self.open_search_location)
-        self.open_file_button.clicked.connect(lambda: self.open_selected_real_item(reveal=False))
+        self.search_table.doubleClicked.connect(self.open_search_index)
+        self.search_table.customContextMenuRequested.connect(self.show_search_context_menu)
+        self.open_file_button.clicked.connect(self.open_selected_search_item)
         self.reveal_file_button.clicked.connect(lambda: self.open_selected_real_item(reveal=True))
 
         self.refresh_action = QAction("Refresh", self)
@@ -3554,6 +3574,24 @@ class MainWindow(QMainWindow):
             return
 
         items: list[BrowserItem] = []
+        if folder["parent_id"] is not None:
+            parent = self.db.get_folder(folder["parent_id"])
+            if parent is not None:
+                items.append(
+                    BrowserItem(
+                        item_type="folder",
+                        item_id=parent["id"],
+                        name="..",
+                        relative_path=parent["relative_path"],
+                        type_label="Folder",
+                        size_bytes=parent["recursive_size_bytes"],
+                        modified_at=parent["modified_at"],
+                        missing=bool(parent["missing"]),
+                        parent_id=parent["parent_id"],
+                        is_parent_entry=True,
+                    )
+                )
+
         for child in self.db.list_child_folders(volume_id, folder_id):
             items.append(
                 BrowserItem(
@@ -3615,15 +3653,6 @@ class MainWindow(QMainWindow):
             return
         self.open_real_browser_item(item, reveal=False)
 
-    def open_catalogue_location_for_browser_item(self, item: BrowserItem) -> None:
-        if item.is_folder:
-            self.select_folder_path(item.relative_path)
-            return
-
-        folder_path = self.parent_catalogue_path(item.relative_path)
-        self.select_folder_path(folder_path)
-        self.select_browser_relative_path(item.relative_path)
-
     def navigate_parent_folder(self) -> None:
         if self.db is None or self.current_folder_id is None:
             return
@@ -3648,39 +3677,157 @@ class MainWindow(QMainWindow):
         if item is None:
             return
 
-        real_path = self.browser_real_path(item)
-        real_available = real_path is not None and real_path.exists() and not item.missing
+        target = self.catalogue_ref_for_browser_item(item)
+        if target is not None:
+            self.show_catalogue_item_context_menu(target, self.file_table.viewport(), point)
+
+    def show_folder_tree_context_menu(self, point: QPoint) -> None:
+        if self.db is None:
+            return
+        tree_item = self.folder_tree.itemAt(point)
+        if tree_item is None:
+            return
+        folder_id = tree_item.data(0, ROLE_FOLDER_ID)
+        if folder_id is None or int(folder_id) < 0:
+            return
+        folder = self.db.get_folder(int(folder_id))
+        if folder is None:
+            return
+
+        target = CatalogueItemRef(
+            item_type="folder",
+            item_id=int(folder["id"]),
+            volume_id=int(folder["volume_id"]),
+            relative_path=folder["relative_path"],
+            missing=bool(folder["missing"]),
+        )
+        self.show_catalogue_item_context_menu(target, self.folder_tree.viewport(), point)
+
+    def catalogue_ref_for_browser_item(self, item: BrowserItem) -> CatalogueItemRef | None:
+        if self.current_volume_id is None:
+            return None
+        return CatalogueItemRef(
+            item_type=item.item_type,
+            item_id=item.item_id,
+            volume_id=self.current_volume_id,
+            relative_path=item.relative_path,
+            missing=item.missing,
+        )
+
+    def show_catalogue_item_context_menu(
+        self,
+        target: CatalogueItemRef,
+        viewport: QWidget,
+        point: QPoint,
+        *,
+        include_catalogue_location: bool = False,
+    ) -> None:
+        menu = self.build_catalogue_item_context_menu(
+            target,
+            include_catalogue_location=include_catalogue_location,
+        )
+        menu.exec(viewport.mapToGlobal(point))
+
+    def build_catalogue_item_context_menu(
+        self,
+        target: CatalogueItemRef,
+        *,
+        include_catalogue_location: bool = False,
+    ) -> QMenu:
+        real_path = self.catalogue_item_real_path(target)
+        real_available = real_path is not None and real_path.exists() and not target.missing
 
         menu = QMenu(self)
         open_action = menu.addAction("Open")
-        open_action.setEnabled(item.is_folder or real_available)
-        open_action.triggered.connect(lambda checked=False, item=item: self.open_browser_item(item))
-
-        catalogue_action = menu.addAction("Open Catalogue Location")
-        catalogue_action.triggered.connect(
-            lambda checked=False, item=item: self.open_catalogue_location_for_browser_item(item)
+        open_action.setEnabled(target.is_folder or real_available)
+        open_action.triggered.connect(
+            lambda checked=False, target=target: self.open_catalogue_item(target)
         )
 
-        reveal_action = menu.addAction("Reveal in File Manager")
-        reveal_action.setEnabled(real_available)
-        reveal_action.triggered.connect(
-            lambda checked=False, item=item: self.open_real_browser_item(item, reveal=True)
+        if include_catalogue_location:
+            catalogue_action = menu.addAction("Open Catalogue Location")
+            catalogue_action.triggered.connect(
+                lambda checked=False, target=target: self.open_catalogue_location_for_item(target)
+            )
+
+        manager_action = menu.addAction("Open File Location")
+        manager_action.setEnabled(real_available)
+        manager_action.triggered.connect(
+            lambda checked=False, target=target: self.open_catalogue_item_in_file_manager(target)
         )
 
         copy_action = menu.addAction("Copy Path")
         copy_action.setEnabled(real_path is not None)
-        copy_action.triggered.connect(lambda checked=False, item=item: self.copy_browser_path(item))
+        copy_action.triggered.connect(
+            lambda checked=False, target=target: self.copy_catalogue_item_path(target)
+        )
 
         menu.addSeparator()
         properties_action = menu.addAction("Properties")
         properties_action.triggered.connect(
-            lambda checked=False, item_type=item.item_type, item_id=item.item_id: self.show_browser_item_properties(
-                item_type,
-                item_id,
+            lambda checked=False, target=target: self.show_browser_item_properties(
+                target.item_type,
+                target.item_id,
             )
         )
+        return menu
 
-        menu.exec(self.file_table.viewport().mapToGlobal(point))
+    def open_catalogue_item(self, target: CatalogueItemRef) -> None:
+        if target.is_folder:
+            self.open_catalogue_location_for_item(target)
+            return
+        self.open_real_catalogue_item(target, reveal=False)
+
+    def open_catalogue_location_for_item(self, target: CatalogueItemRef) -> None:
+        if self.current_volume_id != target.volume_id:
+            if not self.select_volume(target.volume_id):
+                self.volume_filter_edit.clear()
+                if not self.select_volume(target.volume_id):
+                    return
+        self.tabs.setCurrentWidget(self.browser_tab)
+
+        folder_path = (
+            target.relative_path
+            if target.is_folder
+            else self.parent_catalogue_path(target.relative_path)
+        )
+        self.select_folder_path(folder_path)
+        if not target.is_folder:
+            QTimer.singleShot(
+                0,
+                lambda path=target.relative_path: self.select_browser_relative_path(path, focus=True),
+            )
+
+    def open_catalogue_item_in_file_manager(self, target: CatalogueItemRef) -> None:
+        self.open_real_catalogue_item(target, reveal=not target.is_folder)
+
+    def open_real_catalogue_item(self, target: CatalogueItemRef, reveal: bool) -> None:
+        real_path = self.catalogue_item_real_path(target)
+        if real_path is None or not real_path.exists() or target.missing:
+            self.statusBar().showMessage(
+                "The real item is not available because the volume is offline or changed.",
+                5000,
+            )
+            return
+        try:
+            open_in_file_manager(real_path, reveal=reveal)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Failed", str(exc))
+
+    def copy_catalogue_item_path(self, target: CatalogueItemRef) -> None:
+        real_path = self.catalogue_item_real_path(target)
+        if real_path is None:
+            return
+        QApplication.clipboard().setText(str(real_path))
+        self.statusBar().showMessage("Path copied.", 3000)
+
+    def catalogue_item_real_path(self, target: CatalogueItemRef) -> Path | None:
+        if self.db is None:
+            return None
+        volume = self.db.get_volume(target.volume_id)
+        if volume is None:
+            return None
+        return self.real_path_for(volume, target.relative_path)
 
     def show_browser_item_properties(self, item_type: str, item_id: int) -> None:
         if self.db is None:
@@ -3801,14 +3948,9 @@ class MainWindow(QMainWindow):
         return "Yes" if physical_path.exists() else "No"
 
     def open_real_browser_item(self, item: BrowserItem, reveal: bool) -> None:
-        real_path = self.browser_real_path(item)
-        if real_path is None or not real_path.exists() or item.missing:
-            self.statusBar().showMessage("The real item is not available because the volume is offline or changed.", 5000)
-            return
-        try:
-            open_in_file_manager(real_path, reveal=reveal)
-        except Exception as exc:
-            QMessageBox.warning(self, "Open Failed", str(exc))
+        target = self.catalogue_ref_for_browser_item(item)
+        if target is not None:
+            self.open_real_catalogue_item(target, reveal)
 
     def copy_selected_browser_path(self) -> None:
         item = self.selected_browser_item()
@@ -3816,19 +3958,13 @@ class MainWindow(QMainWindow):
             self.copy_browser_path(item)
 
     def copy_browser_path(self, item: BrowserItem) -> None:
-        real_path = self.browser_real_path(item)
-        if real_path is None:
-            return
-        QApplication.clipboard().setText(str(real_path))
-        self.statusBar().showMessage("Path copied.", 3000)
+        target = self.catalogue_ref_for_browser_item(item)
+        if target is not None:
+            self.copy_catalogue_item_path(target)
 
     def browser_real_path(self, item: BrowserItem) -> Path | None:
-        if self.db is None or self.current_volume_id is None:
-            return None
-        volume = self.db.get_volume(self.current_volume_id)
-        if volume is None:
-            return None
-        return self.real_path_for(volume, item.relative_path)
+        target = self.catalogue_ref_for_browser_item(item)
+        return self.catalogue_item_real_path(target) if target is not None else None
 
     def real_path_for(self, volume, relative_path: str) -> Path | None:
         source_path = self.current_source_path_for_volume(volume)
@@ -3989,50 +4125,63 @@ class MainWindow(QMainWindow):
     def on_search_selection_changed(self, selected=None, deselected=None) -> None:
         item = self.selected_search_item()
         real_path = self.selected_search_real_path()
-        enabled = item is not None and not item.missing and real_path is not None and real_path.exists()
-        self.open_file_button.setEnabled(enabled)
-        self.reveal_file_button.setEnabled(enabled)
+        real_available = item is not None and not item.missing and real_path is not None and real_path.exists()
+        self.open_file_button.setEnabled(item is not None and (item.is_folder or real_available))
+        self.reveal_file_button.setEnabled(real_available)
 
     def selected_search_item(self) -> SearchResultItem | None:
         return self.search_model.item_at(self.search_table.currentIndex())
 
-    def selected_search_real_path(self) -> Path | None:
+    def show_search_context_menu(self, point: QPoint) -> None:
         if self.db is None:
-            return None
+            return
+        index = self.search_table.indexAt(point)
+        if not index.isValid():
+            return
+
+        self.search_table.selectRow(index.row())
+        self.search_table.setCurrentIndex(self.search_model.index(index.row(), 0))
+        item = self.search_model.item_at(index)
+        if item is None:
+            return
+
+        target = self.catalogue_ref_for_search_item(item)
+        self.show_catalogue_item_context_menu(
+            target,
+            self.search_table.viewport(),
+            point,
+            include_catalogue_location=True,
+        )
+
+    def catalogue_ref_for_search_item(self, item: SearchResultItem) -> CatalogueItemRef:
+        return CatalogueItemRef(
+            item_type=item.item_type,
+            item_id=item.item_id,
+            volume_id=item.volume_id,
+            relative_path=item.relative_path,
+            missing=item.missing,
+        )
+
+    def selected_search_real_path(self) -> Path | None:
         item = self.selected_search_item()
         if item is None:
             return None
-        volume = self.db.get_volume(item.volume_id)
-        if volume is None:
-            return None
-        return self.real_path_for(volume, item.relative_path)
+        return self.catalogue_item_real_path(self.catalogue_ref_for_search_item(item))
 
     def open_selected_real_item(self, reveal: bool) -> None:
         item = self.selected_search_item()
-        path = self.selected_search_real_path()
-        if item is None or item.missing or path is None or not path.exists():
-            QMessageBox.information(self, "Unavailable", "The real item is not currently available.")
-            return
-        try:
-            open_in_file_manager(path, reveal=reveal)
-        except Exception as exc:
-            QMessageBox.warning(self, "Open Failed", str(exc))
+        if item is not None:
+            self.open_real_catalogue_item(self.catalogue_ref_for_search_item(item), reveal)
 
-    def open_search_location(self, clicked_index: QModelIndex | None = None) -> None:
-        if self.db is None:
-            return
-        item = self.search_model.item_at(clicked_index) if clicked_index is not None else self.selected_search_item()
-        if item is None:
-            return
-        folder_path = self.parent_catalogue_path(item.relative_path) if item.item_type == "file" else item.relative_path
-        self.tabs.setCurrentWidget(self.browser_tab)
-        self.select_volume(item.volume_id)
-        self.select_folder_path(folder_path)
-        if item.item_type == "file":
-            QTimer.singleShot(
-                0,
-                lambda path=item.relative_path: self.select_browser_relative_path(path, focus=True),
-            )
+    def open_selected_search_item(self) -> None:
+        item = self.selected_search_item()
+        if item is not None:
+            self.open_catalogue_item(self.catalogue_ref_for_search_item(item))
+
+    def open_search_index(self, index: QModelIndex) -> None:
+        item = self.search_model.item_at(index)
+        if item is not None:
+            self.open_catalogue_item(self.catalogue_ref_for_search_item(item))
 
     def select_folder_path(self, relative_path: str) -> None:
         if self.db is None or self.current_volume_id is None:
