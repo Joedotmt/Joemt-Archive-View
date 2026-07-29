@@ -457,6 +457,36 @@ class VolumeItem:
     percent_full: int
 
 
+def volume_item_from_record(volume: Any, connected: bool) -> VolumeItem:
+    return VolumeItem(
+        id=volume["id"],
+        drive_id=volume["drive_id"] or "",
+        name=volume["name"],
+        source_path=volume["source_path"],
+        register_status=volume["register_status"],
+        condition=volume["condition"],
+        description=volume["description"] or "",
+        connector=volume["connector"],
+        is_mirror=bool(volume["is_mirror"]),
+        master_volume_id=volume["master_volume_id"],
+        master_drive_id=volume["master_drive_id"],
+        master_name=volume["master_name"],
+        date_added=volume["date_added"],
+        earliest_content_date=volume["earliest_content_date"],
+        latest_content_date=volume["latest_content_date"],
+        retired_date=volume["retired_date"],
+        mirror_date=volume["mirror_date"],
+        capacity_bytes=volume["capacity_bytes"],
+        used_bytes=volume["used_bytes"],
+        free_bytes=volume["free_bytes"],
+        indexed_file_count=volume["indexed_file_count"],
+        indexed_folder_count=volume["indexed_folder_count"],
+        last_scan_at=volume["last_scan_at"],
+        connected=connected,
+        percent_full=percentage_full(volume["used_bytes"], volume["capacity_bytes"]),
+    )
+
+
 @dataclass(frozen=True)
 class SearchResultItem:
     item_type: str
@@ -1624,6 +1654,49 @@ class SearchWorker(QObject):
         self.cancel_requested = True
 
 
+class CatalogueOpenWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object, list, object)
+    failed = Signal(object)
+
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self.path = path
+
+    @Slot()
+    def run(self) -> None:
+        db: Database | None = None
+        try:
+            self.progress.emit(0, 0, "Opening and checking catalogue...")
+            # This connection is created in the worker and, once this method is
+            # finished with it, becomes the main-window connection.
+            db = open_catalogue(self.path, check_same_thread=False)
+            volumes = db.list_volumes()
+            snapshots = list_connected_volume_snapshots()
+            resolver = ConnectedVolumeResolver(snapshots)
+            total = len(volumes)
+            self.progress.emit(0, max(total, 1), "Loading volumes...")
+            items: list[VolumeItem] = []
+            for index, volume in enumerate(volumes, start=1):
+                items.append(
+                    volume_item_from_record(volume, resolver.resolve(volume) is not None)
+                )
+                self.progress.emit(
+                    index,
+                    max(total, 1),
+                    f"Loading volumes... {index}/{total}",
+                )
+            if not volumes:
+                self.progress.emit(1, 1, "Catalogue ready")
+            self.finished.emit(db, items, connected_volume_signature(snapshots))
+            db = None
+        except Exception as exc:
+            self.failed.emit(exc)
+        finally:
+            if db is not None:
+                db.close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1640,6 +1713,11 @@ class MainWindow(QMainWindow):
         self.delete_worker: DeleteVolumeWorker | None = None
         self.search_thread: QThread | None = None
         self.search_worker: SearchWorker | None = None
+        self.catalogue_open_thread: QThread | None = None
+        self.catalogue_open_worker: CatalogueOpenWorker | None = None
+        self.catalogue_open_lock: QLockFile | None = None
+        self.catalogue_open_path: Path | None = None
+        self.catalogue_open_status_message = "Catalogue opened."
         self.pending_search_request: tuple[int, Path, str] | None = None
         self.search_request_id = 0
         self.browser_shortcuts: list[QShortcut] = []
@@ -1686,6 +1764,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.save_all_table_header_states()
+        if self.catalogue_open_worker is not None and self.db is None:
+            QMessageBox.information(
+                self,
+                "Catalogue Loading",
+                "Wait for the catalogue to finish loading before closing the application.",
+            )
+            event.ignore()
+            return
         if not self.close_catalogue(show_status=False):
             event.ignore()
             return
@@ -1710,6 +1796,10 @@ class MainWindow(QMainWindow):
         self.open_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Open))
         self.open_catalogue_action.triggered.connect(self.open_catalogue_from_dialog)
         file_menu.addAction(self.open_catalogue_action)
+
+        self.open_catalogue_location_action = QAction("Open Catalogue Location", self)
+        self.open_catalogue_location_action.triggered.connect(self.open_catalogue_location)
+        file_menu.addAction(self.open_catalogue_location_action)
 
         self.close_catalogue_action = QAction("Close Catalogue", self)
         self.close_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Close))
@@ -1794,6 +1884,8 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "scan_progress"):
             configure_progress_bar(self.scan_progress, self.ui_zoom)
+        if hasattr(self, "catalogue_loading_progress"):
+            configure_progress_bar(self.catalogue_loading_progress, self.ui_zoom)
         if hasattr(self, "detail_full"):
             configure_progress_bar(self.detail_full, self.ui_zoom)
         if hasattr(self, "details_box"):
@@ -1805,8 +1897,10 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.stack = QStackedWidget()
         self.welcome_page = self._build_welcome_page()
+        self.loading_page = self._build_loading_page()
         self.catalogue_page = self._build_catalogue_workspace()
         self.stack.addWidget(self.welcome_page)
+        self.stack.addWidget(self.loading_page)
         self.stack.addWidget(self.catalogue_page)
         self.setCentralWidget(self.stack)
 
@@ -1838,6 +1932,34 @@ class MainWindow(QMainWindow):
         layout.addSpacing(8)
         layout.addWidget(self.welcome_new_button, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.welcome_open_button, 0, Qt.AlignmentFlag.AlignCenter)
+        return page
+
+    def _build_loading_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(14)
+
+        title = QLabel("Opening Catalogue")
+        title_font = title.font()
+        title_font.setPointSize(title_font.pointSize() + 6)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.catalogue_loading_path_label = QLabel()
+        self.catalogue_loading_path_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.catalogue_loading_path_label.setWordWrap(True)
+        self.catalogue_loading_path_label.setMaximumWidth(700)
+
+        self.catalogue_loading_progress = QProgressBar()
+        self.catalogue_loading_progress.setMinimumWidth(420)
+        self.catalogue_loading_progress.setTextVisible(True)
+        configure_progress_bar(self.catalogue_loading_progress)
+
+        layout.addWidget(title)
+        layout.addWidget(self.catalogue_loading_path_label)
+        layout.addWidget(self.catalogue_loading_progress)
         return page
 
     def _build_catalogue_workspace(self) -> QWidget:
@@ -2194,6 +2316,7 @@ class MainWindow(QMainWindow):
         self.addAction(self.refresh_action)
         self.catalogue_actions = [
             self.close_catalogue_action,
+            self.open_catalogue_location_action,
             self.new_volume_action,
             self.catalogue_info_action,
             self.refresh_action,
@@ -2219,6 +2342,18 @@ class MainWindow(QMainWindow):
     def show_help(self) -> None:
         dialog = HelpDialog(self)
         dialog.exec()
+
+    def open_catalogue_location(self) -> None:
+        if self.catalogue_path is None:
+            return
+        try:
+            open_in_file_manager(self.catalogue_path, reveal=True)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Open Catalogue Location Failed",
+                str(exc),
+            )
 
     def show_catalogue_info(self) -> None:
         if self.db is None:
@@ -2265,6 +2400,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def new_catalogue(self) -> None:
+        if self.catalogue_open_worker is not None:
+            return
         path = self._choose_new_catalogue_path()
         if path is None:
             return
@@ -2288,6 +2425,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Catalogue created.", 4000)
 
     def open_catalogue_from_dialog(self) -> None:
+        if self.catalogue_open_worker is not None:
+            return
         path_text, _ = QFileDialog.getOpenFileName(
             self,
             "Open Catalogue",
@@ -2299,7 +2438,7 @@ class MainWindow(QMainWindow):
         self.open_catalogue_path(catalogue_path_with_extension(path_text))
 
     def open_last_catalogue(self) -> None:
-        if self.db is not None:
+        if self.db is not None or self.catalogue_open_worker is not None:
             return
         path_text = self.settings.value(LAST_CATALOGUE_PATH_SETTING, "", type=str)
         if not path_text:
@@ -2313,25 +2452,106 @@ class MainWindow(QMainWindow):
         self.open_catalogue_path(path, status_message="Last catalogue opened.")
 
     def open_catalogue_path(self, path: str | Path, status_message: str = "Catalogue opened.") -> None:
+        if self.catalogue_open_worker is not None:
+            return
         path = catalogue_path_with_extension(path)
         if self.db is not None and not self.close_catalogue(show_status=False):
             return
 
         lock: QLockFile | None = None
-        db: Database | None = None
         try:
             lock = self._acquire_catalogue_lock(path)
-            db = open_catalogue(path)
         except Exception as exc:
-            if db is not None:
-                db.close()
             if lock is not None:
                 lock.unlock()
             self._show_catalogue_error("Open Catalogue Failed", exc)
             return
 
-        self._open_catalogue_in_window(db, path, lock)
-        self.statusBar().showMessage(status_message, 4000)
+        self.catalogue_open_lock = lock
+        self.catalogue_open_path = path
+        self.catalogue_open_status_message = status_message
+        self._set_catalogue_loading(True, path)
+
+        self.catalogue_open_thread = QThread(self)
+        self.catalogue_open_worker = CatalogueOpenWorker(path)
+        self.catalogue_open_worker.moveToThread(self.catalogue_open_thread)
+        self.catalogue_open_thread.started.connect(self.catalogue_open_worker.run)
+        self.catalogue_open_worker.progress.connect(self.on_catalogue_open_progress)
+        self.catalogue_open_worker.finished.connect(self.on_catalogue_open_finished)
+        self.catalogue_open_worker.failed.connect(self.on_catalogue_open_failed)
+        self.catalogue_open_worker.finished.connect(self.catalogue_open_thread.quit)
+        self.catalogue_open_worker.failed.connect(self.catalogue_open_thread.quit)
+        self.catalogue_open_worker.finished.connect(self.catalogue_open_worker.deleteLater)
+        self.catalogue_open_worker.failed.connect(self.catalogue_open_worker.deleteLater)
+        self.catalogue_open_thread.finished.connect(self.catalogue_open_thread.deleteLater)
+        self.catalogue_open_thread.finished.connect(self.clear_catalogue_open_worker)
+        self.catalogue_open_thread.start()
+
+    @Slot(int, int, str)
+    def on_catalogue_open_progress(self, value: int, maximum: int, message: str) -> None:
+        if maximum <= 0:
+            self.catalogue_loading_progress.setRange(0, 0)
+            self.catalogue_loading_progress.setFormat(message)
+        else:
+            self.catalogue_loading_progress.setRange(0, maximum)
+            self.catalogue_loading_progress.setValue(min(max(value, 0), maximum))
+            self.catalogue_loading_progress.setFormat(f"{message} — %p%")
+        self.statusBar().showMessage(message)
+
+    @Slot(object, list, object)
+    def on_catalogue_open_finished(
+        self,
+        db: Database,
+        items: list[VolumeItem],
+        connection_signature: tuple[tuple[str, str, str], ...],
+    ) -> None:
+        path = self.catalogue_open_path
+        lock = self.catalogue_open_lock
+        if path is None or lock is None:
+            db.close()
+            return
+
+        self.catalogue_open_lock = None
+        self.catalogue_open_path = None
+        self._open_catalogue_in_window(
+            db,
+            path,
+            lock,
+            initial_volume_items=items,
+            connection_signature=connection_signature,
+        )
+        self._set_catalogue_loading(False)
+        self.statusBar().showMessage(self.catalogue_open_status_message, 4000)
+
+    @Slot(object)
+    def on_catalogue_open_failed(self, exc: Exception) -> None:
+        lock = self.catalogue_open_lock
+        self.catalogue_open_lock = None
+        self.catalogue_open_path = None
+        if lock is not None:
+            lock.unlock()
+        self._set_catalogue_loading(False)
+        self._set_catalogue_open(False)
+        self._show_catalogue_error("Open Catalogue Failed", exc)
+
+    @Slot()
+    def clear_catalogue_open_worker(self) -> None:
+        self.catalogue_open_worker = None
+        self.catalogue_open_thread = None
+        self._set_catalogue_loading(False)
+
+    def _set_catalogue_loading(self, loading: bool, path: Path | None = None) -> None:
+        enabled = not loading and self.catalogue_open_worker is None
+        self.new_catalogue_action.setEnabled(enabled)
+        self.open_catalogue_action.setEnabled(enabled)
+        self.welcome_new_button.setEnabled(enabled)
+        self.welcome_open_button.setEnabled(enabled)
+        if loading:
+            self.catalogue_loading_path_label.setText(str(path) if path is not None else "")
+            self.catalogue_loading_progress.setRange(0, 0)
+            self.catalogue_loading_progress.setFormat("Opening and checking catalogue...")
+            self.stack.setCurrentWidget(self.loading_page)
+            self.statusBar().showMessage("Opening catalogue...")
 
     def close_catalogue(self, show_status: bool = True) -> bool:
         if self.db is None:
@@ -2403,20 +2623,38 @@ class MainWindow(QMainWindow):
             )
         return lock
 
-    def _open_catalogue_in_window(self, db: Database, path: Path, lock: QLockFile) -> None:
+    def _open_catalogue_in_window(
+        self,
+        db: Database,
+        path: Path,
+        lock: QLockFile,
+        *,
+        initial_volume_items: list[VolumeItem] | None = None,
+        connection_signature: tuple[tuple[str, str, str], ...] | None = None,
+    ) -> None:
         self.db = db
         self.catalogue_path = path
         self.catalogue_lock = lock
         self.settings.setValue(LAST_CATALOGUE_PATH_SETTING, str(path.resolve(strict=False)))
         self._set_catalogue_open(True)
-        self.start_connected_volume_monitor()
-        self.refresh_volumes()
+        self.start_connected_volume_monitor(connection_signature)
+        if initial_volume_items is None:
+            self.refresh_volumes()
+        else:
+            self._apply_volume_items(initial_volume_items)
 
     def current_connected_volume_signature(self) -> tuple[tuple[str, str, str], ...]:
         return connected_volume_signature(list_connected_volume_snapshots())
 
-    def start_connected_volume_monitor(self) -> None:
-        self._connected_volume_signature = self.current_connected_volume_signature()
+    def start_connected_volume_monitor(
+        self,
+        connection_signature: tuple[tuple[str, str, str], ...] | None = None,
+    ) -> None:
+        self._connected_volume_signature = (
+            self.current_connected_volume_signature()
+            if connection_signature is None
+            else connection_signature
+        )
         self.volume_connection_refresh_timer.stop()
         self.volume_connection_timer.start()
 
@@ -2600,39 +2838,19 @@ class MainWindow(QMainWindow):
         if self.db is None:
             self._clear_catalogue_views()
             return
-        selected_id = self.selected_volume_id() or self.current_volume_id
         volumes = self.db.list_volumes()
         resolver = ConnectedVolumeResolver()
         all_items = [
-            VolumeItem(
-                id=volume["id"],
-                drive_id=volume["drive_id"] or "",
-                name=volume["name"],
-                source_path=volume["source_path"],
-                register_status=volume["register_status"],
-                condition=volume["condition"],
-                description=volume["description"] or "",
-                connector=volume["connector"],
-                is_mirror=bool(volume["is_mirror"]),
-                master_volume_id=volume["master_volume_id"],
-                master_drive_id=volume["master_drive_id"],
-                master_name=volume["master_name"],
-                date_added=volume["date_added"],
-                earliest_content_date=volume["earliest_content_date"],
-                latest_content_date=volume["latest_content_date"],
-                retired_date=volume["retired_date"],
-                mirror_date=volume["mirror_date"],
-                capacity_bytes=volume["capacity_bytes"],
-                used_bytes=volume["used_bytes"],
-                free_bytes=volume["free_bytes"],
-                indexed_file_count=volume["indexed_file_count"],
-                indexed_folder_count=volume["indexed_folder_count"],
-                last_scan_at=volume["last_scan_at"],
-                connected=self.current_source_path_for_volume(volume, resolver) is not None,
-                percent_full=percentage_full(volume["used_bytes"], volume["capacity_bytes"]),
+            volume_item_from_record(
+                volume,
+                self.current_source_path_for_volume(volume, resolver) is not None,
             )
             for volume in volumes
         ]
+        self._apply_volume_items(all_items)
+
+    def _apply_volume_items(self, all_items: list[VolumeItem]) -> None:
+        selected_id = self.selected_volume_id() or self.current_volume_id
         filter_text = self.volume_filter_edit.text() if hasattr(self, "volume_filter_edit") else ""
         items = [item for item in all_items if volume_matches_filter(item, filter_text)]
         self.volume_model.set_items(items)

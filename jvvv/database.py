@@ -225,6 +225,7 @@ class Database:
         initialize: bool = True,
         create: bool = True,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        check_same_thread: bool = True,
     ) -> None:
         self.path = Path(path).expanduser()
         self.busy_timeout_ms = busy_timeout_ms
@@ -257,6 +258,7 @@ class Database:
                 connect_target,
                 timeout=max(self.busy_timeout_ms, 0) / 1000,
                 uri=use_uri,
+                check_same_thread=check_same_thread,
             )
             self.connection.row_factory = sqlite3.Row
             self._configure_connection()
@@ -1943,12 +1945,18 @@ def create_catalogue(path: str | Path, *, overwrite: bool = False) -> Database:
         raise
 
 
-def open_catalogue(path: str | Path, *, busy_timeout_ms: int = INTERACTIVE_BUSY_TIMEOUT_MS) -> Database:
+def open_catalogue(
+    path: str | Path,
+    *,
+    busy_timeout_ms: int = INTERACTIVE_BUSY_TIMEOUT_MS,
+    check_same_thread: bool = True,
+) -> Database:
     db = Database(
         catalogue_path_with_extension(path),
         initialize=False,
         create=False,
         busy_timeout_ms=busy_timeout_ms,
+        check_same_thread=check_same_thread,
     )
     try:
         db.validate_catalogue()

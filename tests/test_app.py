@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from jvvv.app import (
+    CatalogueOpenWorker,
     MainWindow,
     SearchWorker,
     connected_volume_signature,
@@ -11,7 +12,7 @@ from jvvv.app import (
     include_content_timestamp,
     suggested_new_volume_drive_id,
 )
-from jvvv.database import CatalogueError
+from jvvv.database import CatalogueError, create_catalogue
 from jvvv.utils import VolumeSnapshot
 
 
@@ -142,6 +143,19 @@ def test_perform_search_delegates_database_work_to_worker():
     assert requests == [(1, Path("catalogue.jvvv"), "report")]
 
 
+def test_open_catalogue_location_reveals_catalogue_file(monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        "jvvv.app.open_in_file_manager",
+        lambda path, reveal: opened.append((path, reveal)),
+    )
+    window = SimpleNamespace(catalogue_path=Path("archive.jvvv"))
+
+    MainWindow.open_catalogue_location(window)
+
+    assert opened == [(Path("archive.jvvv"), True)]
+
+
 def test_search_worker_reuses_connected_state_for_results_on_same_volume(monkeypatch):
     events = []
 
@@ -195,3 +209,32 @@ def test_search_worker_reuses_connected_state_for_results_on_same_volume(monkeyp
     assert [item.name for item in completed[0][1]] == ["report-a.txt", "report-b.txt"]
     assert [event for event in events if event[0] == "resolve"] == [("resolve", 12)]
     assert ("open", Path("catalogue.jvvv"), False, False) in events
+
+
+def test_catalogue_open_worker_opens_and_prepares_catalogue(tmp_path):
+    path = tmp_path / "archive.jvvv"
+    created = create_catalogue(path)
+    created.close()
+
+    progress = []
+    completed = []
+    failures = []
+    worker = CatalogueOpenWorker(path)
+    worker.progress.connect(
+        lambda value, maximum, message: progress.append((value, maximum, message))
+    )
+    worker.finished.connect(
+        lambda db, items, signature: completed.append((db, items, signature))
+    )
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert failures == []
+    assert progress[0] == (0, 0, "Opening and checking catalogue...")
+    assert progress[-1] == (1, 1, "Catalogue ready")
+    db, items, signature = completed[0]
+    assert items == []
+    assert isinstance(signature, tuple)
+    assert db.get_catalogue_info()["volume_count"] == 0
+    db.close()
