@@ -149,6 +149,26 @@ def test_perform_search_delegates_database_work_to_worker():
     assert requests == [(1, Path("catalogue.jvvv"), "report", False)]
 
 
+def test_catalogue_write_refresh_reuses_open_database_connection():
+    events = []
+
+    class FakeDatabase:
+        def close(self):
+            raise AssertionError("refresh must not reopen the catalogue on the UI thread")
+
+    database = FakeDatabase()
+    window = SimpleNamespace(
+        db=database,
+        refresh_volumes=lambda: events.append("volumes"),
+        perform_search=lambda: events.append("search"),
+    )
+
+    MainWindow.refresh_after_catalogue_write(window)
+
+    assert window.db is database
+    assert events == ["volumes", "search"]
+
+
 def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch):
     events = []
 

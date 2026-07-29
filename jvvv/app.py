@@ -3465,19 +3465,11 @@ class MainWindow(QMainWindow):
     def refresh_after_catalogue_write(self) -> None:
         if self.db is None:
             return
-        path = self.db.path
-        self.db.close()
-        try:
-            self.db = open_catalogue(path)
-        except Exception as exc:
-            self.db = None
-            if self.catalogue_lock is not None:
-                self.catalogue_lock.unlock()
-                self.catalogue_lock = None
-            self.catalogue_path = None
-            self._set_catalogue_open(False)
-            self._show_catalogue_error("Catalogue Refresh Failed", exc)
-            return
+        # The scan/delete worker commits through a separate SQLite connection.
+        # The next read on this connection sees that commit; reopening here is
+        # unnecessary and runs catalogue validation (including quick_check) on
+        # the GUI thread, which can make a large catalogue appear to hang just
+        # as a scan finishes.
         self.refresh_volumes()
         self.perform_search()
 
@@ -3745,7 +3737,7 @@ class MainWindow(QMainWindow):
         )
 
         if include_catalogue_location:
-            catalogue_action = menu.addAction("Open Catalogue Location")
+            catalogue_action = menu.addAction("View in Catalogue")
             catalogue_action.triggered.connect(
                 lambda checked=False, target=target: self.open_catalogue_location_for_item(target)
             )
