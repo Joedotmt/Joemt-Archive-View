@@ -24,6 +24,7 @@ UINT64_MODULUS = 2**64
 UINT64_MAX = UINT64_MODULUS - 1
 DEFAULT_BUSY_TIMEOUT_MS = 2000
 INTERACTIVE_BUSY_TIMEOUT_MS = 250
+AUTOMATIC_INTEGRITY_CHECK_MAX_BYTES = 256 * 1024 * 1024
 WINDOWS_DRIVE_REMOTE = 4
 SQLITE_EXTENDED_ERROR_NAMES = {
     8714: "SQLITE_IOERR_IN_PAGE",
@@ -446,7 +447,16 @@ class Database:
 
     def validate_catalogue(self) -> None:
         try:
-            if not self._network_storage:
+            # quick_check walks every table and index. On multi-gigabyte
+            # catalogues (especially ones with FTS indexes), doing that on
+            # every open can take minutes even when the database is healthy.
+            # Schema validation and normal SQLite reads still catch malformed
+            # data as it is accessed; reserve the automatic full scan for
+            # catalogues small enough for it to remain an inexpensive guard.
+            if (
+                not self._network_storage
+                and self.path.stat().st_size <= AUTOMATIC_INTEGRITY_CHECK_MAX_BYTES
+            ):
                 self._operation = "checking catalogue database integrity"
                 check = self.connection.execute("PRAGMA quick_check(1)").fetchone()
                 if check is None or check[0] != "ok":

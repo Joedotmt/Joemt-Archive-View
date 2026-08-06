@@ -232,6 +232,28 @@ def test_network_catalogue_open_skips_full_integrity_scan(monkeypatch, tmp_path)
     assert not any("quick_check" in statement.lower() for statement in statements)
 
 
+def test_large_local_catalogue_open_skips_full_integrity_scan(monkeypatch, tmp_path):
+    path = tmp_path / "large-catalogue.jvvv"
+    db = Database(path)
+    db.close()
+
+    statements = []
+    sqlite_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        traced_connection = sqlite_connect(*args, **kwargs)
+        traced_connection.set_trace_callback(statements.append)
+        return traced_connection
+
+    monkeypatch.setattr(database_module, "AUTOMATIC_INTEGRITY_CHECK_MAX_BYTES", 1)
+    monkeypatch.setattr(database_module.sqlite3, "connect", traced_connect)
+
+    db = open_catalogue(path)
+    db.close()
+
+    assert not any("quick_check" in statement.lower() for statement in statements)
+
+
 def test_sqlite_failure_reports_connection_stage_and_error_code(monkeypatch, tmp_path):
     class FailingConnection:
         row_factory = None
