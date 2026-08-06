@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import os
 import re
+import sqlite3
 import sys
 import traceback
 from time import monotonic
@@ -26,6 +27,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QLocale,
+    QProcess,
     QSettings,
     QThread,
     QTimer,
@@ -111,6 +113,11 @@ VOLUME_FULL_COLUMN = 18
 LAST_CATALOGUE_PATH_SETTING = "catalogues/lastPath"
 SEARCH_INCLUDE_PATHS_SETTING = "search/includePaths"
 CATALOGUE_FILE_FILTER = "Joemt Archive View Files (*.jvvv)"
+CATALOGUE_PROBE_ARGUMENT = "--catalogue-location-probe"
+CATALOGUE_PROBE_TIMEOUT_MS = 8000
+CATALOGUE_PROBE_OK = 0
+CATALOGUE_PROBE_UNAVAILABLE = 2
+CATALOGUE_PROBE_INVALID = 3
 
 
 def format_exception_diagnostics(exc: Exception) -> str:
@@ -125,6 +132,44 @@ def format_exception_diagnostics(exc: Exception) -> str:
     if traceback_details:
         sections.append(f"Traceback:\n{traceback_details}")
     return "\n\n".join(sections)
+
+
+def acquire_catalogue_lock(path: Path) -> QLockFile:
+    lock = QLockFile(f"{path}.lock")
+    if not lock.tryLock(100):
+        raise CatalogueInUseError(
+            "This catalogue appears to be open in another JVVV window or process."
+        )
+    return lock
+
+
+def probe_catalogue_location(path: str | Path) -> int:
+    """Read a catalogue without modifying it to test whether its location responds."""
+    catalogue_path = catalogue_path_with_extension(path)
+    try:
+        with catalogue_path.open("rb") as catalogue_file:
+            header = catalogue_file.read(100)
+        if len(header) < 16 or header[:16] != b"SQLite format 3\x00":
+            return CATALOGUE_PROBE_INVALID
+
+        connection = sqlite3.connect(
+            Database._sqlite_uri(catalogue_path, mode="ro"),
+            timeout=0.25,
+            uri=True,
+        )
+        try:
+            connection.execute("PRAGMA schema_version").fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return CATALOGUE_PROBE_UNAVAILABLE
+    return CATALOGUE_PROBE_OK
+
+
+def catalogue_probe_command(path: Path) -> tuple[str, list[str]]:
+    if getattr(sys, "frozen", False):
+        return sys.executable, [CATALOGUE_PROBE_ARGUMENT, str(path)]
+    return sys.executable, ["-m", "jvvv", CATALOGUE_PROBE_ARGUMENT, str(path)]
 
 
 PROGRESS_BAR_HEIGHT = 16
@@ -1749,30 +1794,92 @@ class SearchWorker(QObject):
         self.cancel_requested = True
 
 
+class _CatalogueOpenCancelled(Exception):
+    pass
+
+
 class CatalogueOpenWorker(QObject):
     progress = Signal(int, int, str)
-    finished = Signal(object, list, object)
+    finished = Signal(object, list, object, object)
     failed = Signal(object)
+    cancelled = Signal()
 
     def __init__(self, path: Path) -> None:
         super().__init__()
         self.path = path
+        self.cancel_requested = False
+        self._active_db: Database | None = None
+        self._windows_thread_handle: Any | None = None
+
+    def _start_cancellable_io(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenThread.restype = wintypes.HANDLE
+            # CancelSynchronousIo requires a handle with THREAD_TERMINATE access.
+            self._windows_thread_handle = kernel32.OpenThread(
+                0x0001,
+                False,
+                kernel32.GetCurrentThreadId(),
+            )
+        except Exception:
+            self._windows_thread_handle = None
+
+    def _stop_cancellable_io(self) -> None:
+        handle = self._windows_thread_handle
+        self._windows_thread_handle = None
+        if os.name != "nt" or not handle:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_requested:
+            raise _CatalogueOpenCancelled
 
     @Slot()
     def run(self) -> None:
         db: Database | None = None
+        lock: QLockFile | None = None
+        result: tuple[Database, list[VolumeItem], list[VolumeSnapshot], QLockFile] | None = None
+        error: Exception | None = None
+        was_cancelled = False
+        self._start_cancellable_io()
         try:
+            self._check_cancelled()
+            self.progress.emit(0, 0, "Acquiring catalogue lock...")
+            lock = acquire_catalogue_lock(self.path)
+            self._check_cancelled()
             self.progress.emit(0, 0, "Opening and checking catalogue...")
             # This connection is created in the worker and, once this method is
             # finished with it, becomes the main-window connection.
             db = open_catalogue(self.path, check_same_thread=False)
+            self._active_db = db
+            self._check_cancelled()
             volumes = db.list_volumes()
+            self._check_cancelled()
             snapshots = list_connected_volume_snapshots()
+            self._check_cancelled()
             resolver = ConnectedVolumeResolver(snapshots)
             total = len(volumes)
             self.progress.emit(0, max(total, 1), "Loading volumes...")
             items: list[VolumeItem] = []
             for index, volume in enumerate(volumes, start=1):
+                self._check_cancelled()
                 items.append(
                     volume_item_from_record(volume, resolver.resolve(volume) is not None)
                 )
@@ -1783,13 +1890,54 @@ class CatalogueOpenWorker(QObject):
                 )
             if not volumes:
                 self.progress.emit(1, 1, "Catalogue ready")
-            self.finished.emit(db, items, snapshots)
+            self._check_cancelled()
+            result = (db, items, snapshots, lock)
             db = None
+            lock = None
+        except _CatalogueOpenCancelled:
+            was_cancelled = True
         except Exception as exc:
-            self.failed.emit(exc)
+            if self.cancel_requested:
+                was_cancelled = True
+            else:
+                error = exc
         finally:
+            self._active_db = None
             if db is not None:
                 db.close()
+            if lock is not None:
+                lock.unlock()
+            self._stop_cancellable_io()
+
+        if result is not None:
+            self.finished.emit(*result)
+        elif was_cancelled:
+            self.cancelled.emit()
+        elif error is not None:
+            self.failed.emit(error)
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        db = self._active_db
+        if db is not None:
+            try:
+                db.connection.interrupt()
+            except Exception:
+                pass
+
+        handle = self._windows_thread_handle
+        if os.name != "nt" or not handle:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+            kernel32.CancelSynchronousIo.restype = wintypes.BOOL
+            kernel32.CancelSynchronousIo(handle)
+        except Exception:
+            pass
 
 
 class MainWindow(QMainWindow):
@@ -1813,11 +1961,13 @@ class MainWindow(QMainWindow):
         self.delete_worker: DeleteVolumeWorker | None = None
         self.search_thread: QThread | None = None
         self.search_worker: SearchWorker | None = None
+        self.catalogue_probe_process: QProcess | None = None
+        self.catalogue_probe_timed_out = False
         self.catalogue_open_thread: QThread | None = None
         self.catalogue_open_worker: CatalogueOpenWorker | None = None
-        self.catalogue_open_lock: QLockFile | None = None
         self.catalogue_open_path: Path | None = None
         self.catalogue_open_status_message = "Catalogue opened."
+        self.catalogue_open_cancel_requested = False
         self.pending_search_request: tuple[int, Path, str, bool] | None = None
         self.search_request_id = 0
         self.browser_shortcuts: list[QShortcut] = []
@@ -1841,6 +1991,10 @@ class MainWindow(QMainWindow):
         self.volume_connection_refresh_timer.setSingleShot(True)
         self.volume_connection_refresh_timer.setInterval(VOLUME_CONNECTION_REFRESH_DELAY_MS)
         self.volume_connection_refresh_timer.timeout.connect(self.refresh_after_connected_volumes_changed)
+        self.catalogue_probe_timer = QTimer(self)
+        self.catalogue_probe_timer.setSingleShot(True)
+        self.catalogue_probe_timer.setInterval(CATALOGUE_PROBE_TIMEOUT_MS)
+        self.catalogue_probe_timer.timeout.connect(self.on_catalogue_probe_timeout)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1180, 760)
@@ -1865,7 +2019,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.save_all_table_header_states()
-        if self.catalogue_open_worker is not None and self.db is None:
+        if self._catalogue_open_in_progress() and self.db is None:
             QMessageBox.information(
                 self,
                 "Catalogue Loading",
@@ -2064,9 +2218,17 @@ class MainWindow(QMainWindow):
         self.catalogue_loading_progress.setTextVisible(True)
         configure_progress_bar(self.catalogue_loading_progress)
 
+        self.catalogue_loading_cancel_button = QPushButton("Cancel")
+        self.catalogue_loading_cancel_button.setMinimumWidth(120)
+
         layout.addWidget(title)
         layout.addWidget(self.catalogue_loading_path_label)
         layout.addWidget(self.catalogue_loading_progress)
+        layout.addWidget(
+            self.catalogue_loading_cancel_button,
+            0,
+            Qt.AlignmentFlag.AlignCenter,
+        )
         return page
 
     def _build_catalogue_workspace(self) -> QWidget:
@@ -2403,6 +2565,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.welcome_new_button.clicked.connect(self.new_catalogue)
         self.welcome_open_button.clicked.connect(self.open_catalogue_from_dialog)
+        self.catalogue_loading_cancel_button.clicked.connect(self.cancel_catalogue_open)
         self.volume_filter_edit.textChanged.connect(lambda _text: self.refresh_volumes())
         self.volume_table.selectionModel().selectionChanged.connect(self.on_volume_selection_changed)
         self.volume_table.customContextMenuRequested.connect(self.show_volume_context_menu)
@@ -2533,7 +2696,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def new_catalogue(self) -> None:
-        if self.catalogue_open_worker is not None:
+        if self._catalogue_open_in_progress():
             return
         path = self._choose_new_catalogue_path()
         if path is None:
@@ -2558,7 +2721,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Catalogue created.", 4000)
 
     def open_catalogue_from_dialog(self) -> None:
-        if self.catalogue_open_worker is not None:
+        if self._catalogue_open_in_progress():
             return
         path_text, _ = QFileDialog.getOpenFileName(
             self,
@@ -2571,39 +2734,124 @@ class MainWindow(QMainWindow):
         self.open_catalogue_path(catalogue_path_with_extension(path_text))
 
     def open_last_catalogue(self) -> None:
-        if self.db is not None or self.catalogue_open_worker is not None:
+        if self.db is not None or self._catalogue_open_in_progress():
             return
         path_text = self.settings.value(LAST_CATALOGUE_PATH_SETTING, "", type=str)
         if not path_text:
             return
 
         path = catalogue_path_with_extension(path_text)
-        if not path.is_file():
-            self.settings.remove(LAST_CATALOGUE_PATH_SETTING)
-            return
-
         self.open_catalogue_path(path, status_message="Last catalogue opened.")
 
     def open_catalogue_path(self, path: str | Path, status_message: str = "Catalogue opened.") -> None:
-        if self.catalogue_open_worker is not None:
+        if self._catalogue_open_in_progress():
             return
         path = catalogue_path_with_extension(path)
         if self.db is not None and not self.close_catalogue(show_status=False):
             return
 
-        lock: QLockFile | None = None
-        try:
-            lock = self._acquire_catalogue_lock(path)
-        except Exception as exc:
-            if lock is not None:
-                lock.unlock()
-            self._show_catalogue_error("Open Catalogue Failed", exc)
-            return
-
-        self.catalogue_open_lock = lock
+        self.catalogue_open_cancel_requested = False
         self.catalogue_open_path = path
         self.catalogue_open_status_message = status_message
         self._set_catalogue_loading(True, path)
+
+        self.catalogue_probe_timed_out = False
+        self.catalogue_probe_process = QProcess(self)
+        program, arguments = catalogue_probe_command(path)
+        self.catalogue_probe_process.setProgram(program)
+        self.catalogue_probe_process.setArguments(arguments)
+        if not getattr(sys, "frozen", False):
+            self.catalogue_probe_process.setWorkingDirectory(
+                str(Path(__file__).resolve().parent.parent)
+            )
+        self.catalogue_probe_process.finished.connect(self.on_catalogue_probe_finished)
+        self.catalogue_probe_process.errorOccurred.connect(self.on_catalogue_probe_error)
+        self.catalogue_loading_progress.setFormat("Checking catalogue location...")
+        self.statusBar().showMessage("Checking catalogue location...")
+        self.catalogue_probe_timer.start()
+        self.catalogue_probe_process.start()
+
+    @Slot(int, QProcess.ExitStatus)
+    def on_catalogue_probe_finished(
+        self,
+        exit_code: int,
+        _exit_status: QProcess.ExitStatus,
+    ) -> None:
+        process = self.catalogue_probe_process
+        if process is None:
+            return
+        self.catalogue_probe_timer.stop()
+        self.catalogue_probe_process = None
+        process.deleteLater()
+
+        if self.catalogue_open_cancel_requested:
+            self.on_catalogue_open_cancelled()
+            self.catalogue_open_cancel_requested = False
+            self._set_catalogue_loading(False)
+            return
+
+        if self.catalogue_probe_timed_out:
+            timeout_seconds = CATALOGUE_PROBE_TIMEOUT_MS // 1000
+            self._fail_catalogue_probe(
+                f"The catalogue location did not respond within {timeout_seconds} seconds. "
+                "Check that the network drive is connected and try again."
+            )
+            return
+        if exit_code == CATALOGUE_PROBE_INVALID:
+            self._fail_catalogue_probe(
+                "The selected file is not a valid SQLite catalogue database."
+            )
+            return
+        if exit_code != CATALOGUE_PROBE_OK:
+            self._fail_catalogue_probe(
+                "The catalogue location is unavailable. Check that the network drive "
+                "is connected and try again."
+            )
+            return
+
+        self._start_catalogue_open_worker()
+
+    @Slot(QProcess.ProcessError)
+    def on_catalogue_probe_error(self, error: QProcess.ProcessError) -> None:
+        if error != QProcess.ProcessError.FailedToStart:
+            return
+        process = self.catalogue_probe_process
+        if process is None:
+            return
+        self.catalogue_probe_timer.stop()
+        self.catalogue_probe_process = None
+        process.deleteLater()
+        if self.catalogue_open_cancel_requested:
+            self.on_catalogue_open_cancelled()
+            self.catalogue_open_cancel_requested = False
+            self._set_catalogue_loading(False)
+            return
+        self._fail_catalogue_probe("The catalogue accessibility check could not be started.")
+
+    @Slot()
+    def on_catalogue_probe_timeout(self) -> None:
+        process = self.catalogue_probe_process
+        if process is None:
+            return
+        self.catalogue_probe_timed_out = True
+        self.catalogue_loading_progress.setFormat("Catalogue location is not responding...")
+        self.statusBar().showMessage("Catalogue location is not responding...")
+        process.kill()
+
+    def _fail_catalogue_probe(self, message: str) -> None:
+        self.catalogue_open_path = None
+        self.catalogue_probe_timed_out = False
+        self._set_catalogue_loading(False)
+        self._set_catalogue_open(False)
+        QMessageBox.critical(self, "Open Catalogue Failed", message)
+
+    def _start_catalogue_open_worker(self) -> None:
+        path = self.catalogue_open_path
+        if path is None:
+            return
+        self.catalogue_loading_progress.setRange(0, 0)
+        self.catalogue_loading_progress.setFormat("Acquiring catalogue lock...")
+        self.statusBar().showMessage("Opening catalogue...")
 
         self.catalogue_open_thread = QThread(self)
         self.catalogue_open_worker = CatalogueOpenWorker(path)
@@ -2612,16 +2860,38 @@ class MainWindow(QMainWindow):
         self.catalogue_open_worker.progress.connect(self.on_catalogue_open_progress)
         self.catalogue_open_worker.finished.connect(self.on_catalogue_open_finished)
         self.catalogue_open_worker.failed.connect(self.on_catalogue_open_failed)
+        self.catalogue_open_worker.cancelled.connect(self.on_catalogue_open_cancelled)
         self.catalogue_open_worker.finished.connect(self.catalogue_open_thread.quit)
         self.catalogue_open_worker.failed.connect(self.catalogue_open_thread.quit)
+        self.catalogue_open_worker.cancelled.connect(self.catalogue_open_thread.quit)
         self.catalogue_open_worker.finished.connect(self.catalogue_open_worker.deleteLater)
         self.catalogue_open_worker.failed.connect(self.catalogue_open_worker.deleteLater)
+        self.catalogue_open_worker.cancelled.connect(self.catalogue_open_worker.deleteLater)
         self.catalogue_open_thread.finished.connect(self.catalogue_open_thread.deleteLater)
         self.catalogue_open_thread.finished.connect(self.clear_catalogue_open_worker)
         self.catalogue_open_thread.start()
 
+    @Slot()
+    def cancel_catalogue_open(self) -> None:
+        if not self._catalogue_open_in_progress() or self.catalogue_open_cancel_requested:
+            return
+        self.catalogue_open_cancel_requested = True
+        self.catalogue_loading_cancel_button.setEnabled(False)
+        self.catalogue_loading_progress.setRange(0, 0)
+        self.catalogue_loading_progress.setFormat("Cancelling...")
+        self.statusBar().showMessage("Cancelling catalogue open...")
+        process = self.catalogue_probe_process
+        if process is not None:
+            process.kill()
+            return
+        worker = self.catalogue_open_worker
+        if worker is not None:
+            worker.cancel()
+
     @Slot(int, int, str)
     def on_catalogue_open_progress(self, value: int, maximum: int, message: str) -> None:
+        if self.catalogue_open_cancel_requested:
+            return
         if maximum <= 0:
             self.catalogue_loading_progress.setRange(0, 0)
             self.catalogue_loading_progress.setFormat(message)
@@ -2631,20 +2901,24 @@ class MainWindow(QMainWindow):
             self.catalogue_loading_progress.setFormat(f"{message} — %p%")
         self.statusBar().showMessage(message)
 
-    @Slot(object, list, object)
+    @Slot(object, list, object, object)
     def on_catalogue_open_finished(
         self,
         db: Database,
         items: list[VolumeItem],
         connected_volume_snapshots: list[VolumeSnapshot],
+        lock: QLockFile,
     ) -> None:
         path = self.catalogue_open_path
-        lock = self.catalogue_open_lock
-        if path is None or lock is None:
+        if self.catalogue_open_cancel_requested or path is None:
             db.close()
+            lock.unlock()
+            self.catalogue_open_path = None
+            self._set_catalogue_loading(False)
+            self._set_catalogue_open(False)
+            self.statusBar().showMessage("Catalogue opening cancelled.", 3000)
             return
 
-        self.catalogue_open_lock = None
         self.catalogue_open_path = None
         self._open_catalogue_in_window(
             db,
@@ -2658,27 +2932,40 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def on_catalogue_open_failed(self, exc: Exception) -> None:
-        lock = self.catalogue_open_lock
-        self.catalogue_open_lock = None
         self.catalogue_open_path = None
-        if lock is not None:
-            lock.unlock()
         self._set_catalogue_loading(False)
         self._set_catalogue_open(False)
         self._show_catalogue_error("Open Catalogue Failed", exc)
 
     @Slot()
+    def on_catalogue_open_cancelled(self) -> None:
+        self.catalogue_open_path = None
+        self._set_catalogue_loading(False)
+        self._set_catalogue_open(False)
+        self.statusBar().showMessage("Catalogue opening cancelled.", 3000)
+
+    @Slot()
     def clear_catalogue_open_worker(self) -> None:
         self.catalogue_open_worker = None
         self.catalogue_open_thread = None
+        self.catalogue_open_cancel_requested = False
         self._set_catalogue_loading(False)
 
+    def _catalogue_open_in_progress(self) -> bool:
+        return (
+            getattr(self, "catalogue_probe_process", None) is not None
+            or getattr(self, "catalogue_open_worker", None) is not None
+        )
+
     def _set_catalogue_loading(self, loading: bool, path: Path | None = None) -> None:
-        enabled = not loading and self.catalogue_open_worker is None
+        enabled = not loading and not self._catalogue_open_in_progress()
         self.new_catalogue_action.setEnabled(enabled)
         self.open_catalogue_action.setEnabled(enabled)
         self.welcome_new_button.setEnabled(enabled)
         self.welcome_open_button.setEnabled(enabled)
+        self.catalogue_loading_cancel_button.setEnabled(
+            loading and not self.catalogue_open_cancel_requested
+        )
         if loading:
             self.catalogue_loading_path_label.setText(str(path) if path is not None else "")
             self.catalogue_loading_progress.setRange(0, 0)
@@ -2749,12 +3036,7 @@ class MainWindow(QMainWindow):
         return path
 
     def _acquire_catalogue_lock(self, path: Path) -> QLockFile:
-        lock = QLockFile(f"{path}.lock")
-        if not lock.tryLock(100):
-            raise CatalogueInUseError(
-                "This catalogue appears to be open in another JVVV window or process."
-            )
-        return lock
+        return acquire_catalogue_lock(path)
 
     def _open_catalogue_in_window(
         self,
@@ -4235,6 +4517,8 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == CATALOGUE_PROBE_ARGUMENT:
+        return probe_catalogue_location(sys.argv[2])
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("JVVV")

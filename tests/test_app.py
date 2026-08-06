@@ -7,12 +7,16 @@ from PySide6.QtWidgets import QDialog
 
 from jvvv.app import (
     CatalogueOpenWorker,
+    CATALOGUE_PROBE_INVALID,
+    CATALOGUE_PROBE_OK,
+    CATALOGUE_PROBE_UNAVAILABLE,
     MainWindow,
     SEARCH_INCLUDE_PATHS_SETTING,
     SearchWorker,
     connected_volume_signature,
     format_exception_diagnostics,
     include_content_timestamp,
+    probe_catalogue_location,
     suggested_new_volume_drive_id,
 )
 from jvvv.database import CatalogueError, create_catalogue
@@ -324,17 +328,166 @@ def test_catalogue_open_worker_opens_and_prepares_catalogue(tmp_path):
         lambda value, maximum, message: progress.append((value, maximum, message))
     )
     worker.finished.connect(
-        lambda db, items, snapshots: completed.append((db, items, snapshots))
+        lambda db, items, snapshots, lock: completed.append(
+            (db, items, snapshots, lock)
+        )
     )
     worker.failed.connect(failures.append)
 
     worker.run()
 
     assert failures == []
-    assert progress[0] == (0, 0, "Opening and checking catalogue...")
+    assert progress[0] == (0, 0, "Acquiring catalogue lock...")
+    assert progress[1] == (0, 0, "Opening and checking catalogue...")
     assert progress[-1] == (1, 1, "Catalogue ready")
-    db, items, snapshots = completed[0]
+    db, items, snapshots, lock = completed[0]
     assert items == []
     assert isinstance(snapshots, list)
     assert db.get_catalogue_info()["volume_count"] == 0
     db.close()
+    lock.unlock()
+
+
+def test_catalogue_location_probe_is_read_only_and_detects_unavailable_paths(tmp_path):
+    path = tmp_path / "archive.jvvv"
+    created = create_catalogue(path)
+    created.close()
+
+    assert probe_catalogue_location(path) == CATALOGUE_PROBE_OK
+    assert probe_catalogue_location(tmp_path / "missing.jvvv") == CATALOGUE_PROBE_UNAVAILABLE
+
+    invalid_path = tmp_path / "invalid.jvvv"
+    invalid_path.write_text("not a catalogue")
+    assert probe_catalogue_location(invalid_path) == CATALOGUE_PROBE_INVALID
+
+
+def test_cancel_catalogue_open_kills_an_unresponsive_location_probe():
+    events = []
+
+    class FakeProcess:
+        def kill(self):
+            events.append("kill")
+
+    class FakeControl:
+        def setEnabled(self, enabled):
+            events.append(("enabled", enabled))
+
+        def setRange(self, minimum, maximum):
+            events.append(("range", minimum, maximum))
+
+        def setFormat(self, message):
+            events.append(("format", message))
+
+    class FakeStatusBar:
+        def showMessage(self, message):
+            events.append(("status", message))
+
+    window = SimpleNamespace(
+        catalogue_probe_process=FakeProcess(),
+        catalogue_open_worker=None,
+        catalogue_open_cancel_requested=False,
+        catalogue_loading_cancel_button=FakeControl(),
+        catalogue_loading_progress=FakeControl(),
+        _catalogue_open_in_progress=lambda: True,
+        statusBar=lambda: FakeStatusBar(),
+    )
+
+    MainWindow.cancel_catalogue_open(window)
+
+    assert window.catalogue_open_cancel_requested is True
+    assert events[-1] == "kill"
+
+
+def test_catalogue_open_worker_can_be_cancelled_before_opening(monkeypatch):
+    opened = []
+    cancelled = []
+    worker = CatalogueOpenWorker(Path("unavailable.jvvv"))
+    monkeypatch.setattr("jvvv.app.acquire_catalogue_lock", lambda path: opened.append(path))
+    worker.cancelled.connect(lambda: cancelled.append(True))
+
+    worker.cancel()
+    worker.run()
+
+    assert opened == []
+    assert cancelled == [True]
+
+
+def test_catalogue_open_worker_cancel_interrupts_and_releases_resources(monkeypatch):
+    events = []
+
+    class FakeConnection:
+        def interrupt(self):
+            events.append("interrupt")
+
+    class FakeDatabase:
+        connection = FakeConnection()
+
+        def list_volumes(self):
+            worker.cancel()
+            return []
+
+        def close(self):
+            events.append("close")
+
+    class FakeLock:
+        def unlock(self):
+            events.append("unlock")
+
+    worker = CatalogueOpenWorker(Path("catalogue.jvvv"))
+    monkeypatch.setattr("jvvv.app.acquire_catalogue_lock", lambda path: FakeLock())
+    monkeypatch.setattr("jvvv.app.open_catalogue", lambda path, **kwargs: FakeDatabase())
+    monkeypatch.setattr("jvvv.app.list_connected_volume_snapshots", lambda: [])
+    completed = []
+    failures = []
+    cancelled = []
+    worker.finished.connect(lambda *args: completed.append(args))
+    worker.failed.connect(failures.append)
+    worker.cancelled.connect(lambda: cancelled.append(True))
+
+    worker.run()
+
+    assert completed == []
+    assert failures == []
+    assert cancelled == [True]
+    assert events == ["interrupt", "close", "unlock"]
+
+
+def test_cancelled_catalogue_open_ignores_a_late_success():
+    events = []
+
+    class FakeDatabase:
+        def close(self):
+            events.append("close")
+
+    class FakeLock:
+        def unlock(self):
+            events.append("unlock")
+
+    class FakeStatusBar:
+        def showMessage(self, message, timeout):
+            events.append(("status", message, timeout))
+
+    window = SimpleNamespace(
+        catalogue_open_path=Path("catalogue.jvvv"),
+        catalogue_open_cancel_requested=True,
+        _set_catalogue_loading=lambda loading: events.append(("loading", loading)),
+        _set_catalogue_open=lambda is_open: events.append(("open", is_open)),
+        statusBar=lambda: FakeStatusBar(),
+    )
+
+    MainWindow.on_catalogue_open_finished(
+        window,
+        FakeDatabase(),
+        [],
+        [],
+        FakeLock(),
+    )
+
+    assert window.catalogue_open_path is None
+    assert events == [
+        "close",
+        "unlock",
+        ("loading", False),
+        ("open", False),
+        ("status", "Catalogue opening cancelled.", 3000),
+    ]
