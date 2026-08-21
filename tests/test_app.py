@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from PySide6.QtWidgets import QDialog
 
 from jvvv.app import (
+    CatalogueInfoWorker,
     CatalogueOpenWorker,
     CATALOGUE_PROBE_INVALID,
     CATALOGUE_PROBE_OK,
@@ -153,6 +154,29 @@ def test_perform_search_delegates_database_work_to_worker():
     assert requests == [(1, Path("catalogue.jvvv"), "report", False)]
 
 
+def test_search_empty_state_replaces_results_table():
+    class FakeStack:
+        current = None
+
+        def setCurrentWidget(self, widget):
+            self.current = widget
+
+    table = object()
+    empty_state = object()
+    stack = FakeStack()
+    window = SimpleNamespace(
+        search_results_stack=stack,
+        search_table=table,
+        search_empty_state=empty_state,
+    )
+
+    MainWindow.set_search_empty_state(window, True)
+    assert stack.current is empty_state
+
+    MainWindow.set_search_empty_state(window, False)
+    assert stack.current is table
+
+
 def test_catalogue_write_refresh_reuses_open_database_connection():
     events = []
 
@@ -171,6 +195,70 @@ def test_catalogue_write_refresh_reuses_open_database_connection():
 
     assert window.db is database
     assert events == ["volumes", "search"]
+
+
+def test_show_catalogue_info_delegates_database_work_to_worker():
+    requests = []
+
+    class FakeDatabase:
+        path = Path("catalogue.jvvv")
+
+        def get_catalogue_info(self):
+            raise AssertionError("catalogue info must not run on the UI thread")
+
+    window = SimpleNamespace(
+        db=FakeDatabase(),
+        catalogue_info_thread=None,
+        _catalogue_job_running=lambda: False,
+        _start_catalogue_info=requests.append,
+    )
+
+    MainWindow.show_catalogue_info(window)
+
+    assert requests == [Path("catalogue.jvvv")]
+
+
+def test_catalogue_info_worker_uses_a_separate_read_only_connection(monkeypatch):
+    events = []
+    expected_info = {"volume_count": 3}
+
+    class FakeConnection:
+        def set_progress_handler(self, callback, steps):
+            events.append(("progress", callback is not None, steps))
+
+        def interrupt(self):
+            events.append(("interrupt",))
+
+    class FakeDatabase:
+        def __init__(self, path, *, initialize, create, read_only):
+            events.append(("open", path, initialize, create, read_only))
+            self.connection = FakeConnection()
+
+        def get_catalogue_info(self):
+            events.append(("info",))
+            return expected_info
+
+        def close(self):
+            events.append(("close",))
+
+    monkeypatch.setattr("jvvv.app.Database", FakeDatabase)
+    completed = []
+    failures = []
+    worker = CatalogueInfoWorker(Path("catalogue.jvvv"))
+    worker.finished.connect(completed.append)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert completed == [expected_info]
+    assert failures == []
+    assert events == [
+        ("open", Path("catalogue.jvvv"), False, False, True),
+        ("progress", True, 1000),
+        ("info",),
+        ("progress", False, 0),
+        ("close",),
+    ]
 
 
 def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch):

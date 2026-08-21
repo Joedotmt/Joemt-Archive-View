@@ -67,6 +67,7 @@ from PySide6.QtWidgets import (
     QTableView,
     QTabWidget,
     QTextBrowser,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -90,6 +91,7 @@ from .database import (
     parse_db_time,
 )
 from .scanner import VolumeScanner
+from .theme import apply_application_theme
 from .utils import (
     ConnectedVolumeResolver,
     VolumeSnapshot,
@@ -184,18 +186,18 @@ SEARCH_RESULT_BATCH_SIZE = 500
 AID_VOLUME_LABEL_RE = re.compile(r"^AID-\d{3,}$", re.IGNORECASE)
 
 
-def progress_bar_style(height: int) -> str:
+def progress_bar_style(height: int, radius: int, chunk_radius: int) -> str:
     return f"""
 QProgressBar {{
     min-height: {height}px;
     max-height: {height}px;
     border: 1px solid palette(mid);
-    border-radius: 3px;
+    border-radius: {radius}px;
     background: palette(base);
     text-align: center;
 }}
 QProgressBar::chunk {{
-    border-radius: 2px;
+    border-radius: {chunk_radius}px;
     background: palette(highlight);
 }}
 """
@@ -204,7 +206,13 @@ QProgressBar::chunk {{
 def configure_progress_bar(progress_bar: QProgressBar, zoom: float = 1.0) -> None:
     height = max(1, round(PROGRESS_BAR_HEIGHT * zoom))
     progress_bar.setMinimumHeight(height + 2)
-    progress_bar.setStyleSheet(progress_bar_style(height))
+    progress_bar.setStyleSheet(
+        progress_bar_style(
+            height,
+            max(2, round(5 * zoom)),
+            max(1, round(4 * zoom)),
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -1697,6 +1705,62 @@ class DeleteVolumeWorker(QObject):
             self.failed.emit(error_details)
 
 
+class CatalogueInfoWorker(QObject):
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__()
+        self.db_path = db_path
+        self.cancel_requested = False
+        self._active_db: Database | None = None
+
+    @Slot()
+    def run(self) -> None:
+        db: Database | None = None
+        info = None
+        error_details: str | None = None
+        try:
+            db = Database(
+                self.db_path,
+                initialize=False,
+                create=False,
+                read_only=True,
+            )
+            self._active_db = db
+            db.connection.set_progress_handler(
+                lambda: 1 if self.cancel_requested else 0,
+                1000,
+            )
+            if not self.cancel_requested:
+                info = db.get_catalogue_info()
+        except Exception:
+            if not self.cancel_requested:
+                error_details = traceback.format_exc()
+        finally:
+            self._active_db = None
+            if db is not None:
+                db.connection.set_progress_handler(None, 0)
+                db.close()
+
+        if self.cancel_requested:
+            self.cancelled.emit()
+        elif error_details is not None:
+            self.failed.emit(error_details)
+        else:
+            self.finished.emit(info)
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        db = self._active_db
+        if db is not None:
+            try:
+                db.connection.interrupt()
+            except Exception:
+                pass
+
+
 class SearchWorker(QObject):
     batch_ready = Signal(int, list)
     finished = Signal(int, int)
@@ -1943,6 +2007,9 @@ class CatalogueOpenWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            apply_application_theme(application)
         self.settings = QSettings("JVVV", APP_NAME)
         self.search_include_paths = self.settings.value(
             SEARCH_INCLUDE_PATHS_SETTING,
@@ -1959,6 +2026,8 @@ class MainWindow(QMainWindow):
         self.post_scan_edit_volume_id: int | None = None
         self.delete_thread: QThread | None = None
         self.delete_worker: DeleteVolumeWorker | None = None
+        self.catalogue_info_thread: QThread | None = None
+        self.catalogue_info_worker: CatalogueInfoWorker | None = None
         self.search_thread: QThread | None = None
         self.search_worker: SearchWorker | None = None
         self.catalogue_probe_process: QProcess | None = None
@@ -1999,6 +2068,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1180, 760)
         self.setStatusBar(QStatusBar())
+        self.statusBar().setSizeGripEnabled(False)
 
         self._build_menu_bar()
         self._build_ui()
@@ -2124,6 +2194,10 @@ class MainWindow(QMainWindow):
         self.zoom_in_action.setEnabled(self.ui_zoom < MAX_UI_ZOOM)
         self.zoom_out_action.setEnabled(self.ui_zoom > MIN_UI_ZOOM)
 
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            apply_application_theme(application, self.ui_zoom)
+
         if hasattr(self, "welcome_title_label"):
             title_font = QFont(QApplication.font())
             point_size = title_font.pointSizeF()
@@ -2142,6 +2216,13 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "folder_tree"):
             self.folder_tree.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
+            self.folder_tree.setIndentation(self.scaled_ui_value(16))
+        if hasattr(self, "up_button"):
+            navigation_size = self.scaled_ui_value(26)
+            self.up_button.setFixedSize(navigation_size, navigation_size)
+            self.up_button.setIconSize(
+                QSize(self.scaled_ui_value(16), self.scaled_ui_value(16))
+            )
 
         if hasattr(self, "scan_progress"):
             configure_progress_bar(self.scan_progress, self.ui_zoom)
@@ -2151,6 +2232,48 @@ class MainWindow(QMainWindow):
             configure_progress_bar(self.detail_full, self.ui_zoom)
         if hasattr(self, "details_box"):
             self.details_box.setMaximumHeight(self.scaled_ui_value(150))
+        if hasattr(self, "workspace_splitter"):
+            self.workspace_splitter.setHandleWidth(self.scaled_ui_value(3))
+        if hasattr(self, "browser_splitter"):
+            self.browser_splitter.setHandleWidth(self.scaled_ui_value(3))
+        if hasattr(self, "welcome_new_button"):
+            self.welcome_new_button.setMinimumWidth(self.scaled_ui_value(240))
+            self.welcome_open_button.setMinimumWidth(self.scaled_ui_value(240))
+        if hasattr(self, "catalogue_loading_progress"):
+            self.catalogue_loading_path_label.setMaximumWidth(self.scaled_ui_value(700))
+            self.catalogue_loading_progress.setMinimumWidth(self.scaled_ui_value(420))
+            self.catalogue_loading_cancel_button.setMinimumWidth(self.scaled_ui_value(120))
+
+        self.apply_scaled_layout_metrics()
+
+    def apply_scaled_layout_metrics(self) -> None:
+        layout_metrics = (
+            ("volume_pane_layout", (6, 6, 3, 6), 5),
+            ("content_pane_layout", (3, 6, 6, 6), 5),
+            ("browser_tab_layout", (6, 6, 6, 6), 5),
+            ("search_tab_layout", (6, 6, 6, 6), 5),
+            ("log_tab_layout", (6, 6, 6, 6), None),
+            ("browser_path_layout", (0, 0, 0, 0), 4),
+            ("search_controls_layout", (0, 0, 0, 0), 4),
+            ("search_empty_layout", (0, 0, 0, 0), 4),
+        )
+        for name, margins, spacing in layout_metrics:
+            layout = getattr(self, name, None)
+            if layout is None:
+                continue
+            layout.setContentsMargins(*(self.scaled_ui_value(value) if value else 0 for value in margins))
+            if spacing is not None:
+                layout.setSpacing(self.scaled_ui_value(spacing))
+
+        details_layout = getattr(self, "details_layout", None)
+        if details_layout is not None:
+            details_layout.setHorizontalSpacing(self.scaled_ui_value(12))
+            details_layout.setVerticalSpacing(self.scaled_ui_value(4))
+
+        for name in ("welcome_layout", "loading_layout"):
+            layout = getattr(self, name, None)
+            if layout is not None:
+                layout.setSpacing(self.scaled_ui_value(14))
 
     def scaled_ui_value(self, value: int) -> int:
         return max(1, round(value * self.ui_zoom))
@@ -2167,11 +2290,14 @@ class MainWindow(QMainWindow):
 
     def _build_welcome_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("welcomePage")
         layout = QVBoxLayout(page)
+        self.welcome_layout = layout
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(14)
 
         title = QLabel("No Catalogue Open")
+        title.setObjectName("welcomeTitle")
         title_font = title.font()
         title_font.setPointSize(title_font.pointSize() + 8)
         title_font.setBold(True)
@@ -2180,10 +2306,12 @@ class MainWindow(QMainWindow):
         self.welcome_title_label = title
 
         description = QLabel("Create a new catalogue file or open an existing .jvvv catalogue.")
+        description.setObjectName("mutedLabel")
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
         description.setWordWrap(True)
 
         self.welcome_new_button = QPushButton("Create New Catalogue")
+        self.welcome_new_button.setObjectName("primaryButton")
         self.welcome_open_button = QPushButton("Open Existing Catalogue")
         self.welcome_new_button.setMinimumWidth(240)
         self.welcome_open_button.setMinimumWidth(240)
@@ -2197,7 +2325,9 @@ class MainWindow(QMainWindow):
 
     def _build_loading_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("loadingPage")
         layout = QVBoxLayout(page)
+        self.loading_layout = layout
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(14)
 
@@ -2209,6 +2339,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.catalogue_loading_path_label = QLabel()
+        self.catalogue_loading_path_label.setObjectName("loadingPath")
         self.catalogue_loading_path_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.catalogue_loading_path_label.setWordWrap(True)
         self.catalogue_loading_path_label.setMaximumWidth(700)
@@ -2273,16 +2404,21 @@ class MainWindow(QMainWindow):
         )
 
         self.volume_filter_edit = QLineEdit()
+        self.volume_filter_edit.setObjectName("filterField")
         self.volume_filter_edit.setPlaceholderText("Filter volumes by any visible field")
 
         left = QWidget()
+        left.setObjectName("volumePane")
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 2, 0)
+        self.volume_pane_layout = left_layout
+        left_layout.setContentsMargins(6, 6, 3, 6)
+        left_layout.setSpacing(5)
         left_layout.addWidget(self.volume_filter_edit)
         left_layout.addWidget(self.volume_table, 1)
 
         self.details_box = self._build_details_box()
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("workspaceTabs")
         self.browser_tab = self._build_browser_tab()
         self.search_tab = self._build_search_tab()
         self.log_tab = self._build_log_tab()
@@ -2298,14 +2434,19 @@ class MainWindow(QMainWindow):
         configure_progress_bar(self.scan_progress)
 
         right = QWidget()
+        right.setObjectName("contentPane")
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(2, 0, 0, 0)
+        self.content_pane_layout = right_layout
+        right_layout.setContentsMargins(3, 6, 6, 6)
+        right_layout.setSpacing(5)
         right_layout.addWidget(self.details_box)
         right_layout.addWidget(self.tabs, 1)
         right_layout.addWidget(self.scan_progress)
 
         splitter = QSplitter()
-        splitter.setHandleWidth(2)
+        self.workspace_splitter = splitter
+        splitter.setObjectName("workspaceSplitter")
+        splitter.setHandleWidth(3)
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
@@ -2314,6 +2455,7 @@ class MainWindow(QMainWindow):
 
     def _detail_value_label(self, key: str, word_wrap: bool = False) -> QLabel:
         widget = QLabel("-")
+        widget.setObjectName("detailValue")
         widget.setWordWrap(word_wrap)
         widget.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -2324,6 +2466,7 @@ class MainWindow(QMainWindow):
 
     def _build_details_box(self) -> QGroupBox:
         box = QGroupBox("Selected Volume")
+        box.setObjectName("detailsPanel")
         box.setMaximumHeight(self.scaled_ui_value(150))
         self.detail_labels: dict[str, QLabel] = {}
         self.detail_full = QProgressBar()
@@ -2332,6 +2475,7 @@ class MainWindow(QMainWindow):
         configure_progress_bar(self.detail_full)
 
         grid = QGridLayout(box)
+        self.details_layout = grid
         grid.setHorizontalSpacing(self.scaled_ui_value(12))
         grid.setVerticalSpacing(self.scaled_ui_value(4))
         grid.setColumnStretch(1, 1)
@@ -2347,31 +2491,63 @@ class MainWindow(QMainWindow):
             (1, 4, "Last Scan", "last_scan"),
         ]
         for row, column, label, key in summary_rows:
-            grid.addWidget(QLabel(label), row, column)
+            key_label = QLabel(label)
+            key_label.setObjectName("detailKey")
+            grid.addWidget(key_label, row, column)
             grid.addWidget(self._detail_value_label(key), row, column + 1)
 
         path_row = 2
-        grid.addWidget(QLabel("Scan Path"), path_row, 0)
+        scan_path_label = QLabel("Scan Path")
+        scan_path_label.setObjectName("detailKey")
+        grid.addWidget(scan_path_label, path_row, 0)
         grid.addWidget(self._detail_value_label("path"), path_row, 1, 1, 5)
 
         full_row = 3
-        grid.addWidget(QLabel("Full"), full_row, 0)
+        full_label = QLabel("Full")
+        full_label.setObjectName("detailKey")
+        grid.addWidget(full_label, full_row, 0)
         grid.addWidget(self.detail_full, full_row, 1, 1, 5)
         return box
 
     def _build_browser_tab(self) -> QWidget:
         self.offline_label = QLabel("")
+        self.offline_label.setObjectName("offlineNotice")
+        self.offline_label.setVisible(False)
         self.folder_tree = QTreeWidget()
-        self.folder_tree.setHeaderLabel("Folders")
+        self.folder_tree.setObjectName("folderTree")
+        self.folder_tree.setHeaderHidden(True)
         self.folder_tree.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
         self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.folder_tree.setUniformRowHeights(True)
+        self.folder_tree.setIndentation(self.scaled_ui_value(16))
 
-        self.up_button = QPushButton("UP")
+        self.up_button = QToolButton()
+        self.up_button.setObjectName("navigationButton")
+        self.up_button.setIcon(
+            QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp)
+        )
+        self.up_button.setToolTip("Up one folder (Alt+Up)")
+        self.up_button.setAccessibleName("Up one folder")
+        self.up_button.setFixedSize(
+            self.scaled_ui_value(26), self.scaled_ui_value(26)
+        )
+        self.up_button.setIconSize(
+            QSize(self.scaled_ui_value(16), self.scaled_ui_value(16))
+        )
         self.up_button.setEnabled(False)
-        self.current_path_label = QLabel("/")
-        self.current_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.current_path_label = QLineEdit("/")
+        self.current_path_label.setObjectName("pathField")
+        self.current_path_label.setReadOnly(True)
+        self.current_path_label.setToolTip("Current catalogue path")
+        self.current_path_label.addAction(
+            self.browser_icons.folder_icon,
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
 
         path_row = QHBoxLayout()
+        self.browser_path_layout = path_row
+        path_row.setContentsMargins(0, 0, 0, 0)
+        path_row.setSpacing(4)
         path_row.addWidget(self.up_button)
         path_row.addWidget(self.current_path_label, 1)
 
@@ -2390,13 +2566,20 @@ class MainWindow(QMainWindow):
         )
 
         browser_splitter = QSplitter()
+        self.browser_splitter = browser_splitter
+        browser_splitter.setObjectName("browserSplitter")
+        browser_splitter.setHandleWidth(3)
         browser_splitter.addWidget(self.folder_tree)
         browser_splitter.addWidget(self.file_table)
         browser_splitter.setStretchFactor(0, 1)
         browser_splitter.setStretchFactor(1, 2)
 
         widget = QWidget()
+        widget.setObjectName("browserTab")
         layout = QVBoxLayout(widget)
+        self.browser_tab_layout = layout
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
         layout.addWidget(self.offline_label)
         layout.addLayout(path_row)
         layout.addWidget(browser_splitter, 1)
@@ -2408,10 +2591,12 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
         self.configure_table_palette(table)
         table.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
         table.setWordWrap(False)
         table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(self.scaled_ui_value(24))
 
@@ -2523,12 +2708,16 @@ class MainWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText(self.search_placeholder_text())
         self.search_button = QPushButton("Search")
+        self.search_button.setObjectName("searchButton")
         self.open_file_button = QPushButton("Open")
         self.reveal_file_button = QPushButton("Reveal")
         self.open_file_button.setEnabled(False)
         self.reveal_file_button.setEnabled(False)
 
         search_row = QHBoxLayout()
+        self.search_controls_layout = search_row
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(4)
         search_row.addWidget(self.search_edit, 1)
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.open_file_button)
@@ -2548,17 +2737,45 @@ class MainWindow(QMainWindow):
             ),
         )
 
+        self.search_empty_state = QWidget()
+        empty_layout = QVBoxLayout(self.search_empty_state)
+        self.search_empty_layout = empty_layout
+        empty_layout.setContentsMargins(0, 0, 0, 0)
+        empty_layout.setSpacing(4)
+        empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_title = QLabel("No Results")
+        empty_title.setObjectName("emptyStateTitle")
+        empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_description = QLabel("Try a different name, extension, or folder.")
+        empty_description.setObjectName("emptyStateDescription")
+        empty_description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_title)
+        empty_layout.addWidget(empty_description)
+
+        self.search_results_stack = QStackedWidget()
+        self.search_results_stack.setObjectName("searchResultsStack")
+        self.search_results_stack.addWidget(self.search_table)
+        self.search_results_stack.addWidget(self.search_empty_state)
+        self.search_results_stack.setCurrentWidget(self.search_table)
+
         widget = QWidget()
+        widget.setObjectName("searchTab")
         layout = QVBoxLayout(widget)
+        self.search_tab_layout = layout
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
         layout.addLayout(search_row)
-        layout.addWidget(self.search_table, 1)
+        layout.addWidget(self.search_results_stack, 1)
         return widget
 
     def _build_log_tab(self) -> QWidget:
         self.scan_log = QPlainTextEdit()
+        self.scan_log.setObjectName("scanLog")
         self.scan_log.setReadOnly(True)
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        self.log_tab_layout = layout
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.addWidget(self.scan_log)
         return widget
 
@@ -2652,10 +2869,47 @@ class MainWindow(QMainWindow):
             )
 
     def show_catalogue_info(self) -> None:
-        if self.db is None:
+        if self.db is None or self.catalogue_info_thread is not None:
+            return
+        if self._catalogue_job_running():
+            self._show_catalogue_job_running_message()
             return
 
-        info = self.db.get_catalogue_info()
+        self._start_catalogue_info(self.db.path)
+
+    def _start_catalogue_info(self, db_path: Path) -> None:
+        self._set_catalogue_busy(True)
+        self.scan_progress.setRange(0, 0)
+        self.scan_progress.setFormat("Loading catalogue info...")
+        self.statusBar().showMessage("Loading catalogue info...")
+
+        self.catalogue_info_thread = QThread(self)
+        self.catalogue_info_worker = CatalogueInfoWorker(db_path)
+        self.catalogue_info_worker.moveToThread(self.catalogue_info_thread)
+        self.catalogue_info_thread.started.connect(self.catalogue_info_worker.run)
+        self.catalogue_info_worker.finished.connect(self.on_catalogue_info_finished)
+        self.catalogue_info_worker.cancelled.connect(self.on_catalogue_info_cancelled)
+        self.catalogue_info_worker.failed.connect(self.on_catalogue_info_failed)
+        self.catalogue_info_worker.finished.connect(self.catalogue_info_thread.quit)
+        self.catalogue_info_worker.cancelled.connect(self.catalogue_info_thread.quit)
+        self.catalogue_info_worker.failed.connect(self.catalogue_info_thread.quit)
+        self.catalogue_info_worker.finished.connect(self.catalogue_info_worker.deleteLater)
+        self.catalogue_info_worker.cancelled.connect(self.catalogue_info_worker.deleteLater)
+        self.catalogue_info_worker.failed.connect(self.catalogue_info_worker.deleteLater)
+        self.catalogue_info_thread.finished.connect(self.catalogue_info_thread.deleteLater)
+        self.catalogue_info_thread.finished.connect(self.clear_catalogue_info_worker)
+        self.catalogue_info_thread.start()
+
+    @Slot(object)
+    def on_catalogue_info_finished(self, info) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_progress.setFormat("Catalogue info loaded")
+        self.statusBar().showMessage("Catalogue info loaded.", 3000)
+        self._show_catalogue_info_dialog(info)
+
+    def _show_catalogue_info_dialog(self, info) -> None:
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Catalogue Info")
         dialog.setMinimumWidth(self.scaled_ui_value(460))
@@ -2694,6 +2948,31 @@ class MainWindow(QMainWindow):
         layout.addLayout(form)
         layout.addWidget(buttons)
         dialog.exec()
+
+    @Slot()
+    def on_catalogue_info_cancelled(self) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Idle")
+
+    @Slot(str)
+    def on_catalogue_info_failed(self, details: str) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Catalogue info failed")
+        self.statusBar().showMessage("Catalogue info failed.", 4000)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setWindowTitle("Catalogue Info Failed")
+        dialog.setText("The catalogue information could not be loaded.")
+        dialog.setDetailedText(details)
+        dialog.exec()
+
+    @Slot()
+    def clear_catalogue_info_worker(self) -> None:
+        self.catalogue_info_worker = None
+        self.catalogue_info_thread = None
+        self._set_catalogue_busy(False)
 
     def new_catalogue(self) -> None:
         if self._catalogue_open_in_progress():
@@ -2986,6 +3265,8 @@ class MainWindow(QMainWindow):
             )
             return False
 
+        if not self._stop_catalogue_info_for_close():
+            return False
         if not self._stop_scan_for_catalogue_close():
             return False
         if not self._stop_search_for_catalogue_close():
@@ -3161,6 +3442,31 @@ class MainWindow(QMainWindow):
         )
         return False
 
+    def _stop_catalogue_info_for_close(self) -> bool:
+        if (
+            self.catalogue_info_worker is None
+            or self.catalogue_info_thread is None
+            or not self.catalogue_info_thread.isRunning()
+        ):
+            return True
+
+        self.catalogue_info_worker.cancel()
+        self.scan_progress.setFormat("Cancelling...")
+        self.statusBar().showMessage("Cancelling catalogue info...")
+
+        for _ in range(50):
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+            if self.catalogue_info_thread is None or not self.catalogue_info_thread.isRunning():
+                return True
+            self.catalogue_info_thread.wait(100)
+
+        QMessageBox.information(
+            self,
+            "Catalogue Info Cancelling",
+            "Cancellation has been requested. Close the catalogue after loading stops.",
+        )
+        return False
+
     def _catalogue_job_running(self) -> bool:
         return self.scan_worker is not None or self.delete_worker is not None
 
@@ -3222,6 +3528,7 @@ class MainWindow(QMainWindow):
         self.volume_model.set_items([])
         self.browser_model.set_items([])
         self.search_model.set_items([])
+        self.set_search_empty_state(False)
         self.volume_filter_edit.clear()
         self.search_edit.clear()
         self.scan_log.clear()
@@ -3773,12 +4080,12 @@ class MainWindow(QMainWindow):
         if volume is None:
             return
         connected = self.current_source_path_for_volume(volume) is not None
-        self.offline_label.setText(
+        self.set_browser_notice(
             "" if connected else "This volume is offline. Showing the saved catalogue."
         )
         root = self.db.get_root_folder(volume_id)
         if root is None:
-            self.offline_label.setText("No scan data available for this volume.")
+            self.set_browser_notice("No scan data available for this volume.")
             return
         root_item = self._folder_tree_item(root)
         self.folder_tree.addTopLevelItem(root_item)
@@ -3787,12 +4094,16 @@ class MainWindow(QMainWindow):
         root_item.setExpanded(True)
 
     def clear_browser(self) -> None:
-        self.offline_label.setText("")
+        self.set_browser_notice("")
         self.folder_tree.clear()
         self.browser_model.set_items([])
         self.current_folder_id = None
         self.current_path_label.setText("/")
         self.up_button.setEnabled(False)
+
+    def set_browser_notice(self, message: str) -> None:
+        self.offline_label.setText(message)
+        self.offline_label.setVisible(bool(message))
 
     def _folder_tree_item(self, folder) -> QTreeWidgetItem:
         name = folder["name"] or "/"
@@ -4272,6 +4583,7 @@ class MainWindow(QMainWindow):
     def perform_search(self) -> None:
         self.search_request_id += 1
         request_id = self.search_request_id
+        MainWindow.set_search_empty_state(self, False)
         if self.db is None:
             self.pending_search_request = None
             if (
@@ -4318,6 +4630,7 @@ class MainWindow(QMainWindow):
 
     def _start_search(self, request: tuple[int, Path, str, bool]) -> None:
         request_id, db_path, query, include_paths = request
+        self.set_search_empty_state(False)
         self.search_button.setText("Searching...")
         self.statusBar().showMessage(f'Searching for "{query}"...')
 
@@ -4354,6 +4667,8 @@ class MainWindow(QMainWindow):
         if request_id != self.search_request_id or self.db is None:
             return
         self.search_model.append_items(items)
+        if items:
+            self.set_search_empty_state(False)
 
     @Slot(int, int)
     def on_search_finished(self, request_id: int, result_count: int) -> None:
@@ -4363,6 +4678,7 @@ class MainWindow(QMainWindow):
             self.search_model.sort_column,
             self.search_model.sort_order,
         )
+        self.set_search_empty_state(result_count == 0)
         self.on_search_selection_changed()
         self.statusBar().showMessage(f"{result_count} search results.", 4000)
 
@@ -4376,6 +4692,7 @@ class MainWindow(QMainWindow):
         if request_id != self.search_request_id or self.db is None:
             return
         self.search_model.set_items([])
+        self.set_search_empty_state(False)
         self.on_search_selection_changed()
         self.statusBar().showMessage("Search failed.", 4000)
         dialog = QMessageBox(self)
@@ -4384,6 +4701,14 @@ class MainWindow(QMainWindow):
         dialog.setText("The catalogue could not be searched.")
         dialog.setDetailedText(details)
         dialog.exec()
+
+    def set_search_empty_state(self, no_results: bool) -> None:
+        stack = getattr(self, "search_results_stack", None)
+        search_table = getattr(self, "search_table", None)
+        empty_state = getattr(self, "search_empty_state", None)
+        if stack is None or search_table is None or empty_state is None:
+            return
+        stack.setCurrentWidget(empty_state if no_results else search_table)
 
     @Slot()
     def clear_search_worker(self) -> None:
@@ -4520,7 +4845,7 @@ def main() -> int:
     if len(sys.argv) == 3 and sys.argv[1] == CATALOGUE_PROBE_ARGUMENT:
         return probe_catalogue_location(sys.argv[2])
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    apply_application_theme(app)
     app.setApplicationName("JVVV")
     app.setOrganizationName("JVVV")
     window = MainWindow()
