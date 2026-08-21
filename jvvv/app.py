@@ -7,6 +7,7 @@ import re
 import sqlite3
 import sys
 import traceback
+from threading import Event
 from time import monotonic
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
@@ -48,6 +49,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDateEdit,
     QLabel,
@@ -91,7 +93,20 @@ from .database import (
     parse_db_time,
 )
 from .scanner import VolumeScanner
-from .theme import apply_application_theme
+from .theme import (
+    CUSTOM_THEME,
+    DARK_MODE,
+    DEFAULT_ACCENT_COLOR,
+    DEFAULT_COLOR_MODE,
+    DEFAULT_THEME_STYLE,
+    FUSION_THEME,
+    LIGHT_MODE,
+    apply_application_theme,
+    contrasting_text_color,
+    normalize_accent_color,
+    normalize_color_mode,
+    normalize_theme_style,
+)
 from .utils import (
     ConnectedVolumeResolver,
     VolumeSnapshot,
@@ -114,6 +129,9 @@ ROLE_PERCENT_FULL = Qt.ItemDataRole.UserRole + 5
 VOLUME_FULL_COLUMN = 18
 LAST_CATALOGUE_PATH_SETTING = "catalogues/lastPath"
 SEARCH_INCLUDE_PATHS_SETTING = "search/includePaths"
+THEME_STYLE_SETTING = "appearance/themeStyle"
+COLOR_MODE_SETTING = "appearance/colorMode"
+ACCENT_COLOR_SETTING = "appearance/accentColor"
 CATALOGUE_FILE_FILTER = "Joemt Archive View Files (*.jvvv)"
 CATALOGUE_PROBE_ARGUMENT = "--catalogue-location-probe"
 CATALOGUE_PROBE_TIMEOUT_MS = 8000
@@ -1512,9 +1530,14 @@ class ItemPropertiesDialog(QDialog):
 
 
 class PreferencesDialog(QDialog):
+    appearance_changed = Signal(str, str, str)
+
     def __init__(
         self,
         include_paths: bool,
+        theme_style: str,
+        color_mode: str,
+        accent_color: str,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1536,6 +1559,41 @@ class PreferencesDialog(QDialog):
         search_layout.addWidget(self.include_paths_check)
         search_layout.addWidget(explanation)
 
+        appearance_group = QGroupBox("Appearance")
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Custom", CUSTOM_THEME)
+        self.theme_combo.addItem("Fusion (default)", FUSION_THEME)
+        theme_index = self.theme_combo.findData(normalize_theme_style(theme_style))
+        self.theme_combo.setCurrentIndex(max(0, theme_index))
+
+        self.color_mode_combo = QComboBox()
+        self.color_mode_combo.addItem("Dark", DARK_MODE)
+        self.color_mode_combo.addItem("Light", LIGHT_MODE)
+        mode_index = self.color_mode_combo.findData(normalize_color_mode(color_mode))
+        self.color_mode_combo.setCurrentIndex(max(0, mode_index))
+
+        self._accent_color = normalize_accent_color(accent_color)
+        self.accent_button = QPushButton()
+        self.accent_button.setToolTip("Choose a custom accent color")
+        self.accent_button.clicked.connect(self.choose_accent_color)
+        self.update_accent_button()
+
+        appearance_form = QFormLayout(appearance_group)
+        appearance_form.addRow("Theme:", self.theme_combo)
+        appearance_form.addRow("Mode:", self.color_mode_combo)
+        appearance_form.addRow("Accent color:", self.accent_button)
+
+        self.reset_theme_button = QPushButton("Reset Theme")
+        self.reset_theme_button.setObjectName("resetThemeButton")
+        self.reset_theme_button.setToolTip(
+            "Restore the custom dark theme and its original green accent"
+        )
+        self.reset_theme_button.clicked.connect(self.reset_theme)
+        appearance_form.addRow("", self.reset_theme_button)
+
+        self.theme_combo.currentIndexChanged.connect(self.emit_appearance_changed)
+        self.color_mode_combo.currentIndexChanged.connect(self.emit_appearance_changed)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -1544,11 +1602,76 @@ class PreferencesDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
+        layout.addWidget(appearance_group)
         layout.addWidget(search_group)
         layout.addWidget(buttons)
 
+    def choose_accent_color(self) -> None:
+        starting_color = self._accent_color
+        picker = QColorDialog(QColor(starting_color), self)
+        picker.setWindowTitle("Select Accent Color")
+        picker.setOption(
+            QColorDialog.ColorDialogOption.DontUseNativeDialog,
+            True,
+        )
+        picker.currentColorChanged.connect(self.preview_accent_color)
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            self.preview_accent_color(picker.currentColor())
+            return
+
+        self._accent_color = starting_color
+        self.update_accent_button()
+        self.emit_appearance_changed()
+
+    def preview_accent_color(self, color: QColor) -> None:
+        if not color.isValid():
+            return
+        self._accent_color = normalize_accent_color(color)
+        self.update_accent_button()
+        self.emit_appearance_changed()
+
+    def reset_theme(self) -> None:
+        theme_was_blocked = self.theme_combo.blockSignals(True)
+        mode_was_blocked = self.color_mode_combo.blockSignals(True)
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(DEFAULT_THEME_STYLE))
+        self.color_mode_combo.setCurrentIndex(
+            self.color_mode_combo.findData(DEFAULT_COLOR_MODE)
+        )
+        self.theme_combo.blockSignals(theme_was_blocked)
+        self.color_mode_combo.blockSignals(mode_was_blocked)
+        self._accent_color = DEFAULT_ACCENT_COLOR
+        self.update_accent_button()
+        self.emit_appearance_changed()
+
+    def emit_appearance_changed(self, *_args: object) -> None:
+        self.appearance_changed.emit(
+            self.theme_style(),
+            self.color_mode(),
+            self.accent_color(),
+        )
+
+    def update_accent_button(self) -> None:
+        text_color = contrasting_text_color(self._accent_color)
+        border_color = QColor(self._accent_color).darker(135).name()
+        self.accent_button.setText(self._accent_color.upper())
+        self.accent_button.setStyleSheet(
+            "QPushButton {"
+            f"background-color: {self._accent_color}; color: {text_color}; "
+            f"border: 1px solid {border_color}; font-weight: 600;"
+            "}"
+        )
+
     def include_paths(self) -> bool:
         return self.include_paths_check.isChecked()
+
+    def theme_style(self) -> str:
+        return normalize_theme_style(self.theme_combo.currentData())
+
+    def color_mode(self) -> str:
+        return normalize_color_mode(self.color_mode_combo.currentData())
+
+    def accent_color(self) -> str:
+        return self._accent_color
 
 
 class HelpDialog(QDialog):
@@ -1595,13 +1718,13 @@ class HelpDialog(QDialog):
             ("2. Add a volume",
              "Choose <b>New Volume</b>, select a connected drive or folder, "
              "and it scans automatically. "
-             "Rescan later to record changes and mark missing items."),
+             "Scan it again later to review and apply catalogue changes."),
             ("3. Browse offline",
              "Select a saved volume to explore its folder tree, even when the "
              "original drive is disconnected."),
             ("4. Search",
              "Find files and folders by name or extension across the stored catalogue. "
-             "Path matching can be enabled under <b>Help &gt; Preferences</b>."),
+             "Path matching can be enabled under <b>Settings &gt; Preferences</b>."),
         ]
         section_html = "".join(
             f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
@@ -1627,15 +1750,17 @@ class HelpDialog(QDialog):
 class ScanWorker(QObject):
     progress = Signal(int, int, str)
     stats_progress = Signal(int, int, str, int, int)
+    review_requested = Signal(dict)
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, db_path: Path, volume_id: int, remove_deleted: bool) -> None:
+    def __init__(self, db_path: Path, volume_id: int) -> None:
         super().__init__()
         self.db_path = db_path
         self.volume_id = volume_id
-        self.remove_deleted = remove_deleted
         self.cancel_requested = False
+        self._review_event = Event()
+        self._apply_reviewed_changes = False
 
     @Slot()
     def run(self) -> None:
@@ -1653,8 +1778,9 @@ class ScanWorker(QObject):
                     total,
                 ),
                 cancel_callback=lambda: self.cancel_requested,
+                preview_callback=self.request_review,
             )
-            result = scanner.scan(self.volume_id, remove_deleted=self.remove_deleted)
+            result = scanner.scan(self.volume_id)
             self.finished.emit(
                 {
                     "status": result.status,
@@ -1662,6 +1788,7 @@ class ScanWorker(QObject):
                     "folders_seen": result.folders_seen,
                     "errors_count": result.errors_count,
                     "message": result.message or "",
+                    "changes": result.changes.as_dict() if result.changes is not None else {},
                 }
             )
         except Exception:
@@ -1670,9 +1797,21 @@ class ScanWorker(QObject):
             if db is not None:
                 db.close()
 
+    def request_review(self, changes) -> bool:
+        self._apply_reviewed_changes = False
+        self._review_event.clear()
+        self.review_requested.emit(changes.as_dict())
+        self._review_event.wait()
+        return self._apply_reviewed_changes and not self.cancel_requested
+
+    def resolve_review(self, apply_changes: bool) -> None:
+        self._apply_reviewed_changes = bool(apply_changes)
+        self._review_event.set()
+
     @Slot()
     def cancel(self) -> None:
         self.cancel_requested = True
+        self._review_event.set()
 
 
 class DeleteVolumeWorker(QObject):
@@ -2007,15 +2146,29 @@ class CatalogueOpenWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        application = QApplication.instance()
-        if isinstance(application, QApplication):
-            apply_application_theme(application)
         self.settings = QSettings("JVVV", APP_NAME)
         self.search_include_paths = self.settings.value(
             SEARCH_INCLUDE_PATHS_SETTING,
             False,
             type=bool,
         )
+        self.theme_style = normalize_theme_style(
+            self.settings.value(THEME_STYLE_SETTING, DEFAULT_THEME_STYLE)
+        )
+        self.color_mode = normalize_color_mode(
+            self.settings.value(COLOR_MODE_SETTING, DEFAULT_COLOR_MODE)
+        )
+        self.accent_color = normalize_accent_color(
+            self.settings.value(ACCENT_COLOR_SETTING, DEFAULT_ACCENT_COLOR)
+        )
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            apply_application_theme(
+                application,
+                theme_style=self.theme_style,
+                color_mode=self.color_mode,
+                accent_color=self.accent_color,
+            )
         self.db: Database | None = None
         self.catalogue_path: Path | None = None
         self.catalogue_lock: QLockFile | None = None
@@ -2106,12 +2259,6 @@ class MainWindow(QMainWindow):
     def _build_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
 
-        self.new_volume_action = QAction("New Volume\u2026", self)
-        self.new_volume_action.triggered.connect(self.add_volume)
-        file_menu.addAction(self.new_volume_action)
-
-        file_menu.addSeparator()
-
         self.new_catalogue_action = QAction("New Catalogue\u2026", self)
         self.new_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.New))
         self.new_catalogue_action.triggered.connect(self.new_catalogue)
@@ -2121,6 +2268,8 @@ class MainWindow(QMainWindow):
         self.open_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Open))
         self.open_catalogue_action.triggered.connect(self.open_catalogue_from_dialog)
         file_menu.addAction(self.open_catalogue_action)
+
+        file_menu.addSeparator()
 
         self.open_catalogue_location_action = QAction("Open Catalogue Location", self)
         self.open_catalogue_location_action.triggered.connect(self.open_catalogue_location)
@@ -2140,6 +2289,13 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.exit_action)
 
         catalogue_menu = self.menuBar().addMenu("&Catalogue")
+
+        self.new_volume_action = QAction("New Volume\u2026", self)
+        self.new_volume_action.triggered.connect(self.add_volume)
+        catalogue_menu.addAction(self.new_volume_action)
+
+        catalogue_menu.addSeparator()
+
         self.catalogue_info_action = QAction("Catalogue Info\u2026", self)
         self.catalogue_info_action.triggered.connect(self.show_catalogue_info)
         catalogue_menu.addAction(self.catalogue_info_action)
@@ -2155,13 +2311,13 @@ class MainWindow(QMainWindow):
         self.zoom_out_action.triggered.connect(self.zoom_out)
         view_menu.addAction(self.zoom_out_action)
 
-        help_menu = self.menuBar().addMenu("&Help")
+        settings_menu = self.menuBar().addMenu("&Settings")
         self.preferences_action = QAction("Preferences\u2026", self)
-        self.preferences_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
         self.preferences_action.triggered.connect(self.show_preferences)
-        help_menu.addAction(self.preferences_action)
-        help_menu.addSeparator()
+        settings_menu.addAction(self.preferences_action)
 
+        help_menu = self.menuBar().addMenu("&Help")
         self.help_action = QAction("Help", self)
         self.help_action.setShortcut(QKeySequence(QKeySequence.StandardKey.HelpContents))
         self.help_action.triggered.connect(self.show_help)
@@ -2196,7 +2352,13 @@ class MainWindow(QMainWindow):
 
         application = QApplication.instance()
         if isinstance(application, QApplication):
-            apply_application_theme(application, self.ui_zoom)
+            apply_application_theme(
+                application,
+                self.ui_zoom,
+                self.theme_style,
+                self.color_mode,
+                self.accent_color,
+            )
 
         if hasattr(self, "welcome_title_label"):
             title_font = QFont(QApplication.font())
@@ -2608,7 +2770,7 @@ class MainWindow(QMainWindow):
         header.setSortIndicatorShown(True)
 
     def configure_table_palette(self, table: QTableView) -> None:
-        palette = table.palette()
+        palette = QPalette(QApplication.palette())
         base_color = palette.color(QPalette.ColorRole.Base)
         alternate_color = base_color.lighter(112) if base_color.lightness() < 128 else base_color.darker(104)
         palette.setColor(QPalette.ColorRole.AlternateBase, alternate_color)
@@ -2834,21 +2996,90 @@ class MainWindow(QMainWindow):
         dialog = HelpDialog(self)
         dialog.exec()
 
+    def apply_appearance(
+        self,
+        theme_style: str,
+        color_mode: str,
+        accent_color: str,
+    ) -> None:
+        """Apply an appearance choice without persisting it."""
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            apply_application_theme(
+                application,
+                getattr(self, "ui_zoom", 1.0),
+                theme_style,
+                color_mode,
+                accent_color,
+            )
+        for table_name in ("volume_table", "file_table", "search_table"):
+            table = getattr(self, table_name, None)
+            if table is not None:
+                MainWindow.configure_table_palette(self, table)
+
     def show_preferences(self) -> None:
-        dialog = PreferencesDialog(self.search_include_paths, self)
+        original_appearance = (
+            self.theme_style,
+            self.color_mode,
+            self.accent_color,
+        )
+        dialog = PreferencesDialog(
+            self.search_include_paths,
+            original_appearance[0],
+            original_appearance[1],
+            original_appearance[2],
+            self,
+        )
+        preview_signal = getattr(dialog, "appearance_changed", None)
+        if preview_signal is not None:
+            preview_signal.connect(
+                lambda theme_style, color_mode, accent_color: MainWindow.apply_appearance(
+                    self,
+                    theme_style,
+                    color_mode,
+                    accent_color,
+                )
+            )
+
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            MainWindow.apply_appearance(self, *original_appearance)
             return
 
         include_paths = dialog.include_paths()
-        if include_paths == self.search_include_paths:
+        theme_style = dialog.theme_style()
+        color_mode = dialog.color_mode()
+        accent_color = dialog.accent_color()
+        search_changed = include_paths != self.search_include_paths
+        appearance_changed = (
+            theme_style != self.theme_style
+            or color_mode != self.color_mode
+            or accent_color != self.accent_color
+        )
+        if not search_changed and not appearance_changed:
             return
 
         self.search_include_paths = include_paths
+        self.theme_style = theme_style
+        self.color_mode = color_mode
+        self.accent_color = accent_color
         self.settings.setValue(SEARCH_INCLUDE_PATHS_SETTING, include_paths)
+        self.settings.setValue(THEME_STYLE_SETTING, theme_style)
+        self.settings.setValue(COLOR_MODE_SETTING, color_mode)
+        self.settings.setValue(ACCENT_COLOR_SETTING, accent_color)
         self.settings.sync()
-        self.search_edit.setPlaceholderText(self.search_placeholder_text())
-        if self.db is not None and self.search_edit.text().strip():
-            self.perform_search()
+
+        if appearance_changed:
+            MainWindow.apply_appearance(
+                self,
+                self.theme_style,
+                self.color_mode,
+                self.accent_color,
+            )
+
+        if search_changed:
+            self.search_edit.setPlaceholderText(self.search_placeholder_text())
+            if self.db is not None and self.search_edit.text().strip():
+                self.perform_search()
         self.statusBar().showMessage("Preferences saved.", 3000)
 
     def search_placeholder_text(self) -> str:
@@ -3642,12 +3873,8 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
         scan_action = menu.addAction("Scan")
-        scan_action.triggered.connect(lambda: self.start_scan(remove_deleted=True, is_rescan=False))
+        scan_action.triggered.connect(lambda: self.start_scan())
         scan_action.setEnabled(not busy)
-
-        rescan_action = menu.addAction("Rescan")
-        rescan_action.triggered.connect(self.start_rescan)
-        rescan_action.setEnabled(not busy)
 
         cancel_action = menu.addAction("Cancel Scan")
         cancel_action.triggered.connect(self.cancel_scan)
@@ -3731,8 +3958,6 @@ class MainWindow(QMainWindow):
             self.current_volume_id = volume_id
             self.refresh_volumes()
             self.start_scan(
-                remove_deleted=True,
-                is_rescan=False,
                 volume_id=volume_id,
                 source_path=source_path,
                 edit_after_success=True,
@@ -3865,27 +4090,8 @@ class MainWindow(QMainWindow):
         self.delete_thread.finished.connect(self.clear_delete_worker)
         self.delete_thread.start()
 
-    def start_rescan(self) -> None:
-        volume = self.selected_volume()
-        if volume is None:
-            return
-        box = QMessageBox(self)
-        box.setWindowTitle("Rescan Volume")
-        box.setText("How should catalogue records for deleted files be handled?")
-        remove_button = box.addButton("Remove Deleted", QMessageBox.ButtonRole.AcceptRole)
-        mark_button = box.addButton("Mark Missing", QMessageBox.ButtonRole.ActionRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == remove_button:
-            self.start_scan(remove_deleted=True, is_rescan=True)
-        elif clicked == mark_button:
-            self.start_scan(remove_deleted=False, is_rescan=True)
-
     def start_scan(
         self,
-        remove_deleted: bool,
-        is_rescan: bool,
         volume_id: int | None = None,
         source_path: str | None = None,
         edit_after_success: bool = False,
@@ -3900,7 +4106,7 @@ class MainWindow(QMainWindow):
             return
 
         if source_path is None:
-            source_path = self.choose_scan_location(volume, is_rescan)
+            source_path = self.choose_scan_location(volume)
             if source_path is None:
                 return
         try:
@@ -3918,16 +4124,17 @@ class MainWindow(QMainWindow):
 
         self.scan_progress.setRange(0, 0)
         self.scan_progress.setFormat("Starting scan...")
-        self.statusBar().showMessage("Rescanning..." if is_rescan else "Scanning...")
+        self.statusBar().showMessage("Scanning...")
         self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
         self._set_scan_running_ui(True)
 
         self.scan_thread = QThread(self)
-        self.scan_worker = ScanWorker(self.db.path, volume["id"], remove_deleted)
+        self.scan_worker = ScanWorker(self.db.path, volume["id"])
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.stats_progress.connect(self.on_scan_stats_progress)
+        self.scan_worker.review_requested.connect(self.on_scan_review_requested)
         self.scan_worker.finished.connect(self.on_scan_finished)
         self.scan_worker.failed.connect(self.on_scan_failed)
         self.scan_worker.finished.connect(self.scan_thread.quit)
@@ -3938,11 +4145,10 @@ class MainWindow(QMainWindow):
         self.scan_thread.finished.connect(self.clear_scan_worker)
         self.scan_thread.start()
 
-    def choose_scan_location(self, volume, is_rescan: bool) -> str | None:
+    def choose_scan_location(self, volume) -> str | None:
         current_path = self.current_source_path_for_volume(volume) or volume["source_path"] or ""
         initial_dir = current_path if source_path_exists(current_path) else str(Path.home())
-        title = "Choose Rescan Location" if is_rescan else "Choose Scan Location"
-        directory = QFileDialog.getExistingDirectory(self, title, initial_dir)
+        directory = QFileDialog.getExistingDirectory(self, "Choose Scan Location", initial_dir)
         return directory or None
 
     def cancel_scan(self) -> None:
@@ -3958,6 +4164,67 @@ class MainWindow(QMainWindow):
         self.scan_progress.setFormat(
             f"Scanning... {files_seen:,} files, {folders_seen:,} folders - {current_path}"
         )
+
+    @Slot(dict)
+    def on_scan_review_requested(self, changes: dict) -> None:
+        worker = self.scan_worker
+        if worker is None:
+            return
+
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_progress.setFormat("Waiting for confirmation")
+        self.statusBar().showMessage("Review the detected catalogue changes.")
+
+        bytes_before = int(changes.get("bytes_before", 0))
+        bytes_after = int(changes.get("bytes_after", 0))
+        size_delta = bytes_after - bytes_before
+        delta_text = format_size(abs(size_delta))
+        if size_delta > 0:
+            delta_text = f"+{delta_text}"
+        elif size_delta < 0:
+            delta_text = f"-{delta_text}"
+
+        details = [
+            f"Files added: {int(changes.get('files_added', 0)):,} "
+            f"(+{format_size(int(changes.get('bytes_added', 0)))})",
+            f"Files no longer present: {int(changes.get('files_removed', 0)):,} "
+            f"(-{format_size(int(changes.get('bytes_removed', 0)))})",
+            f"Files changed: {int(changes.get('files_changed', 0)):,}",
+            f"Folders added: {int(changes.get('folders_added', 0)):,}",
+            f"Folders no longer present: {int(changes.get('folders_removed', 0)):,}",
+            "",
+            f"Indexed size: {format_size(bytes_before)} → {format_size(bytes_after)} "
+            f"({delta_text})",
+        ]
+        errors_count = int(changes.get("errors_count", 0))
+        if errors_count:
+            details.extend(
+                [
+                    "",
+                    f"Warning: the scan reported {errors_count:,} errors. Some items listed as "
+                    "no longer present may only have been inaccessible.",
+                ]
+            )
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Review Scan Changes")
+        box.setIcon(
+            QMessageBox.Icon.Warning if errors_count else QMessageBox.Icon.Question
+        )
+        box.setText("Apply these changes to the catalogue?")
+        box.setInformativeText("\n".join(details))
+        apply_button = box.addButton("Apply Update", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel_button if errors_count else apply_button)
+        box.setEscapeButton(cancel_button)
+
+        apply_changes = False
+        try:
+            box.exec()
+            apply_changes = box.clickedButton() == apply_button
+        finally:
+            worker.resolve_review(apply_changes)
 
     @Slot(int, int, str, int, int)
     def on_scan_stats_progress(
@@ -4822,6 +5089,19 @@ class MainWindow(QMainWindow):
                 f"{row['files_seen']} files, {row['folders_seen']} folders, "
                 f"{row['errors_count']} errors"
             )
+            if row["files_added"] is not None:
+                lines.append(
+                    f"  Changes: +{row['files_added']} files, "
+                    f"-{row['files_removed']} files, {row['files_changed']} changed; "
+                    f"+{row['folders_added']} folders, -{row['folders_removed']} folders"
+                )
+                size_delta = int(row["bytes_after"]) - int(row["bytes_before"])
+                delta_prefix = "+" if size_delta > 0 else "-" if size_delta < 0 else ""
+                lines.append(
+                    f"  Indexed size: {format_size(row['bytes_before'])} -> "
+                    f"{format_size(row['bytes_after'])} "
+                    f"({delta_prefix}{format_size(abs(size_delta))})"
+                )
             if row["message"]:
                 lines.append(f"  {row['message']}")
         if errors:
@@ -4845,7 +5125,6 @@ def main() -> int:
     if len(sys.argv) == 3 and sys.argv[1] == CATALOGUE_PROBE_ARGUMENT:
         return probe_catalogue_location(sys.argv[2])
     app = QApplication(sys.argv)
-    apply_application_theme(app)
     app.setApplicationName("JVVV")
     app.setOrganizationName("JVVV")
     window = MainWindow()

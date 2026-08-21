@@ -6,14 +6,18 @@ from types import SimpleNamespace
 from PySide6.QtWidgets import QDialog
 
 from jvvv.app import (
+    ACCENT_COLOR_SETTING,
     CatalogueInfoWorker,
     CatalogueOpenWorker,
     CATALOGUE_PROBE_INVALID,
     CATALOGUE_PROBE_OK,
     CATALOGUE_PROBE_UNAVAILABLE,
+    COLOR_MODE_SETTING,
     MainWindow,
+    PreferencesDialog,
     SEARCH_INCLUDE_PATHS_SETTING,
     SearchWorker,
+    THEME_STYLE_SETTING,
     connected_volume_signature,
     format_exception_diagnostics,
     include_content_timestamp,
@@ -21,6 +25,15 @@ from jvvv.app import (
     suggested_new_volume_drive_id,
 )
 from jvvv.database import CatalogueError, create_catalogue
+from jvvv.theme import (
+    CUSTOM_THEME,
+    DARK_MODE,
+    DEFAULT_ACCENT_COLOR,
+    DEFAULT_COLOR_MODE,
+    DEFAULT_THEME_STYLE,
+    FUSION_THEME,
+    LIGHT_MODE,
+)
 from jvvv.utils import VolumeSnapshot
 
 
@@ -265,14 +278,25 @@ def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch
     events = []
 
     class FakePreferencesDialog:
-        def __init__(self, include_paths, parent):
-            events.append(("dialog", include_paths, parent))
+        def __init__(self, include_paths, theme_style, color_mode, accent_color, parent):
+            events.append(
+                ("dialog", include_paths, theme_style, color_mode, accent_color, parent)
+            )
 
         def exec(self):
             return QDialog.DialogCode.Accepted
 
         def include_paths(self):
             return True
+
+        def theme_style(self):
+            return CUSTOM_THEME
+
+        def color_mode(self):
+            return DARK_MODE
+
+        def accent_color(self):
+            return DEFAULT_ACCENT_COLOR
 
     class FakeSettings:
         def setValue(self, key, value):
@@ -295,6 +319,10 @@ def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch
     monkeypatch.setattr("jvvv.app.PreferencesDialog", FakePreferencesDialog)
     window = SimpleNamespace(
         search_include_paths=False,
+        theme_style=CUSTOM_THEME,
+        color_mode=DARK_MODE,
+        accent_color=DEFAULT_ACCENT_COLOR,
+        ui_zoom=1.0,
         settings=FakeSettings(),
         search_edit=FakeSearchEdit(),
         db=object(),
@@ -307,9 +335,150 @@ def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch
 
     assert window.search_include_paths is True
     assert ("setting", SEARCH_INCLUDE_PATHS_SETTING, True) in events
+    assert ("setting", THEME_STYLE_SETTING, CUSTOM_THEME) in events
+    assert ("setting", COLOR_MODE_SETTING, DARK_MODE) in events
+    assert ("setting", ACCENT_COLOR_SETTING, DEFAULT_ACCENT_COLOR) in events
     assert ("placeholder", "Search with paths") in events
     assert ("search",) in events
     assert ("sync",) in events
+
+
+def test_preferences_persist_appearance_choices(monkeypatch):
+    events = []
+
+    class FakePreferencesDialog:
+        def __init__(self, include_paths, theme_style, color_mode, accent_color, parent):
+            events.append(
+                ("dialog", include_paths, theme_style, color_mode, accent_color, parent)
+            )
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def include_paths(self):
+            return False
+
+        def theme_style(self):
+            return FUSION_THEME
+
+        def color_mode(self):
+            return LIGHT_MODE
+
+        def accent_color(self):
+            return "#3366cc"
+
+    class FakeSettings:
+        def setValue(self, key, value):
+            events.append(("setting", key, value))
+
+        def sync(self):
+            events.append(("sync",))
+
+    class FakeStatusBar:
+        def showMessage(self, message, timeout):
+            events.append(("status", message, timeout))
+
+    monkeypatch.setattr("jvvv.app.PreferencesDialog", FakePreferencesDialog)
+    window = SimpleNamespace(
+        search_include_paths=False,
+        theme_style=CUSTOM_THEME,
+        color_mode=DARK_MODE,
+        accent_color=DEFAULT_ACCENT_COLOR,
+        ui_zoom=1.0,
+        settings=FakeSettings(),
+        statusBar=lambda: FakeStatusBar(),
+    )
+
+    MainWindow.show_preferences(window)
+
+    assert window.theme_style == FUSION_THEME
+    assert window.color_mode == LIGHT_MODE
+    assert window.accent_color == "#3366cc"
+    assert ("setting", THEME_STYLE_SETTING, FUSION_THEME) in events
+    assert ("setting", COLOR_MODE_SETTING, LIGHT_MODE) in events
+    assert ("setting", ACCENT_COLOR_SETTING, "#3366cc") in events
+    assert ("sync",) in events
+
+
+def test_preferences_preview_is_rolled_back_when_cancelled(monkeypatch):
+    events = []
+
+    class FakeSignal:
+        def connect(self, callback):
+            self.callback = callback
+
+        def emit(self, *values):
+            self.callback(*values)
+
+    class FakePreferencesDialog:
+        def __init__(self, include_paths, theme_style, color_mode, accent_color, parent):
+            self.appearance_changed = FakeSignal()
+
+        def exec(self):
+            self.appearance_changed.emit(FUSION_THEME, LIGHT_MODE, "#3366cc")
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr("jvvv.app.PreferencesDialog", FakePreferencesDialog)
+    monkeypatch.setattr(
+        MainWindow,
+        "apply_appearance",
+        lambda self, *appearance: events.append(("appearance", *appearance)),
+    )
+    window = SimpleNamespace(
+        search_include_paths=False,
+        theme_style=CUSTOM_THEME,
+        color_mode=DARK_MODE,
+        accent_color=DEFAULT_ACCENT_COLOR,
+    )
+
+    MainWindow.show_preferences(window)
+
+    assert events == [
+        ("appearance", FUSION_THEME, LIGHT_MODE, "#3366cc"),
+        ("appearance", CUSTOM_THEME, DARK_MODE, DEFAULT_ACCENT_COLOR),
+    ]
+
+
+def test_reset_theme_restores_all_appearance_defaults():
+    events = []
+
+    class FakeCombo:
+        def __init__(self, values, current_index):
+            self.values = values
+            self.current_index = current_index
+            self.signals_blocked = False
+
+        def blockSignals(self, blocked):
+            previous = self.signals_blocked
+            self.signals_blocked = blocked
+            return previous
+
+        def findData(self, value):
+            return self.values.index(value)
+
+        def setCurrentIndex(self, index):
+            self.current_index = index
+
+    dialog = SimpleNamespace(
+        theme_combo=FakeCombo([CUSTOM_THEME, FUSION_THEME], 1),
+        color_mode_combo=FakeCombo([DARK_MODE, LIGHT_MODE], 1),
+        _accent_color="#3366cc",
+        update_accent_button=lambda: events.append("button"),
+        emit_appearance_changed=lambda: events.append("preview"),
+    )
+
+    PreferencesDialog.reset_theme(dialog)
+
+    assert (
+        dialog.theme_combo.values[dialog.theme_combo.current_index]
+        == DEFAULT_THEME_STYLE
+    )
+    assert (
+        dialog.color_mode_combo.values[dialog.color_mode_combo.current_index]
+        == DEFAULT_COLOR_MODE
+    )
+    assert dialog._accent_color == DEFAULT_ACCENT_COLOR
+    assert events == ["button", "preview"]
 
 
 def test_open_catalogue_location_reveals_catalogue_file(monkeypatch):

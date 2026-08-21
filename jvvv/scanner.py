@@ -17,15 +17,76 @@ CancelCallback = Callable[[], bool]
 
 
 @dataclass(frozen=True)
+class ScanChanges:
+    files_before: int
+    files_after: int
+    files_added: int
+    files_removed: int
+    files_changed: int
+    folders_before: int
+    folders_after: int
+    folders_added: int
+    folders_removed: int
+    bytes_before: int
+    bytes_after: int
+    bytes_added: int
+    bytes_removed: int
+    changed_bytes_before: int
+    changed_bytes_after: int
+    errors_count: int = 0
+
+    @classmethod
+    def from_dict(cls, values: dict[str, int], errors_count: int = 0) -> ScanChanges:
+        return cls(
+            **{
+                field: int(values.get(field, 0))
+                for field in cls.__dataclass_fields__
+                if field != "errors_count"
+            },
+            errors_count=errors_count,
+        )
+
+    @property
+    def has_previous_catalogue(self) -> bool:
+        return self.files_before > 0 or self.folders_before > 0
+
+    @property
+    def has_changes(self) -> bool:
+        return any(
+            (
+                self.files_added,
+                self.files_removed,
+                self.files_changed,
+                self.folders_added,
+                self.folders_removed,
+            )
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            field: int(getattr(self, field))
+            for field in self.__dataclass_fields__
+        }
+
+
+PreviewCallback = Callable[[ScanChanges], bool]
+
+
+@dataclass(frozen=True)
 class ScanResult:
     status: str
     files_seen: int
     folders_seen: int
     errors_count: int
     message: str | None = None
+    changes: ScanChanges | None = None
 
 
 class ScanCancelled(Exception):
+    pass
+
+
+class ScanDiscarded(Exception):
     pass
 
 
@@ -47,15 +108,17 @@ class VolumeScanner:
         progress_callback: ProgressCallback | None = None,
         stats_progress_callback: StatsProgressCallback | None = None,
         cancel_callback: CancelCallback | None = None,
+        preview_callback: PreviewCallback | None = None,
         batch_size: int = 500,
     ) -> None:
         self.db = db
         self.progress_callback = progress_callback
         self.stats_progress_callback = stats_progress_callback
         self.cancel_callback = cancel_callback
+        self.preview_callback = preview_callback
         self.batch_size = batch_size
 
-    def scan(self, volume_id: int, remove_deleted: bool = True) -> ScanResult:
+    def scan(self, volume_id: int) -> ScanResult:
         volume = self.db.get_volume(volume_id)
         if volume is None:
             raise ValueError(f"Volume does not exist: {volume_id}")
@@ -84,6 +147,7 @@ class VolumeScanner:
         errors_count = 0
         status = "completed"
         message: str | None = None
+        changes: ScanChanges | None = None
 
         if not root.exists():
             message = f"Source path is not connected: {root}"
@@ -113,6 +177,7 @@ class VolumeScanner:
                 self.db.add_scan_error(scan_id, volume_id, relative, str(exc))
 
             with self.db.transaction():
+                self.db.prepare_scan_comparison(volume_id)
                 self.db.update_volume_storage(volume_id, capacity, used, free)
                 root_modified = self._modified_at(root)
                 root_id = self.db.ensure_folder(
@@ -213,7 +278,27 @@ class VolumeScanner:
                     raise ScanCancelled(message or "Scan cancelled.")
 
                 if status == "completed":
-                    self.db.finalize_scan_items(volume_id, scanned_at, remove_deleted)
+                    changes = ScanChanges.from_dict(
+                        self.db.scan_change_summary(volume_id, scanned_at),
+                        errors_count=errors_count,
+                    )
+                    had_previous_scan = bool(volume["last_scan_at"]) or changes.has_previous_catalogue
+                    if (
+                        had_previous_scan
+                        and changes.has_changes
+                        and self.preview_callback is not None
+                    ):
+                        self._emit_progress(files_seen, folders_seen, "Reviewing scan changes")
+                        apply_changes = self.preview_callback(changes)
+                        if self._cancelled():
+                            raise ScanCancelled("Scan cancelled.")
+                        if not apply_changes:
+                            status = "discarded"
+                            message = "Catalogue update was not applied."
+                            raise ScanDiscarded(message)
+                    if self._cancelled():
+                        raise ScanCancelled("Scan cancelled.")
+                    self.db.finalize_scan_items(volume_id, scanned_at)
                     self._emit_progress(files_seen, folders_seen, "Preparing folder sizes...")
                     self.db.rebuild_folder_statistics(
                         volume_id,
@@ -231,13 +316,66 @@ class VolumeScanner:
                 else:
                     self.db.refresh_volume_counts(volume_id)
 
-            self.db.finish_scan(scan_id, status, files_seen, folders_seen, errors_count, message)
-            return ScanResult(status, files_seen, folders_seen, errors_count, message)
+            summary = changes.as_dict() if changes is not None else None
+            self.db.finish_scan(
+                scan_id,
+                status,
+                files_seen,
+                folders_seen,
+                errors_count,
+                message,
+                summary,
+            )
+            return ScanResult(status, files_seen, folders_seen, errors_count, message, changes)
+        except ScanDiscarded as exc:
+            summary = changes.as_dict() if changes is not None else None
+            self.db.finish_scan(
+                scan_id,
+                "discarded",
+                files_seen,
+                folders_seen,
+                errors_count,
+                str(exc),
+                summary,
+            )
+            return ScanResult(
+                "discarded",
+                files_seen,
+                folders_seen,
+                errors_count,
+                str(exc),
+                changes,
+            )
         except ScanCancelled as exc:
-            self.db.finish_scan(scan_id, "cancelled", files_seen, folders_seen, errors_count, str(exc))
-            return ScanResult("cancelled", files_seen, folders_seen, errors_count, str(exc))
+            summary = changes.as_dict() if changes is not None else None
+            self.db.finish_scan(
+                scan_id,
+                "cancelled",
+                files_seen,
+                folders_seen,
+                errors_count,
+                str(exc),
+                summary,
+            )
+            return ScanResult(
+                "cancelled",
+                files_seen,
+                folders_seen,
+                errors_count,
+                str(exc),
+                changes,
+            )
         except Exception as exc:
-            self.db.finish_scan(scan_id, "failed", files_seen, folders_seen, errors_count, str(exc))
+            summary = changes.as_dict() if changes is not None else None
+            self.db.finish_scan(
+                scan_id,
+                "failed",
+                files_seen,
+                folders_seen,
+                errors_count,
+                str(exc),
+                summary,
+            )
             raise
 
     def _modified_at(self, path: Path) -> str | None:

@@ -82,22 +82,33 @@ def test_scan_reports_folder_statistics_progress(tmp_path):
         db.close()
 
 
-def test_rescan_removes_deleted_and_updates_changed_files(tmp_path):
+def test_scan_reviews_and_applies_detected_changes(tmp_path):
     source = tmp_path / "drive"
     source.mkdir()
     make_tree(source)
     db = Database(tmp_path / "catalogue.sqlite3")
     try:
         volume_id = db.create_volume("Drive", str(source))
-        scanner = VolumeScanner(db)
+        previews = []
+        scanner = VolumeScanner(
+            db,
+            preview_callback=lambda changes: previews.append(changes) or True,
+        )
         scanner.scan(volume_id)
 
         os.remove(source / "Docs" / "budget.csv")
         (source / "Docs" / "report.txt").write_text("changed content", encoding="utf-8")
         (source / "Docs" / "notes.md").write_text("new", encoding="utf-8")
 
-        result = scanner.scan(volume_id, remove_deleted=True)
+        result = scanner.scan(volume_id)
         assert result.status == "completed"
+        assert len(previews) == 1
+        assert result.changes == previews[0]
+        assert result.changes.files_added == 1
+        assert result.changes.files_removed == 1
+        assert result.changes.files_changed == 1
+        assert result.changes.bytes_before == len("hello") + len("1,2,3") + len(b"jpeg")
+        assert result.changes.bytes_after == len("changed content") + len("new") + len(b"jpeg")
         assert count_rows(db, "files") == 3
         assert not db.search("budget.csv")
 
@@ -115,29 +126,62 @@ def test_rescan_removes_deleted_and_updates_changed_files(tmp_path):
         db.close()
 
 
-def test_rescan_can_mark_deleted_files_missing(tmp_path):
+def test_declining_scan_changes_leaves_catalogue_unchanged(tmp_path):
     source = tmp_path / "drive"
     source.mkdir()
     make_tree(source)
     db = Database(tmp_path / "catalogue.sqlite3")
     try:
         volume_id = db.create_volume("Drive", str(source))
-        scanner = VolumeScanner(db)
-        scanner.scan(volume_id)
+        VolumeScanner(db).scan(volume_id)
+        before = db.get_volume(volume_id)["last_scan_at"]
 
         os.remove(source / "Docs" / "budget.csv")
-        result = scanner.scan(volume_id, remove_deleted=False)
+        previews = []
+        result = VolumeScanner(
+            db,
+            preview_callback=lambda changes: previews.append(changes) or False,
+        ).scan(volume_id)
 
-        assert result.status == "completed"
+        assert result.status == "discarded"
+        assert len(previews) == 1
+        assert result.changes.files_removed == 1
         matches = [row for row in db.search("budget.csv") if row["item_type"] == "file"]
         assert len(matches) == 1
-        assert matches[0]["missing"] == 1
+        assert matches[0]["missing"] == 0
         docs = db.get_folder_by_path(volume_id, "Docs")
-        assert docs["recursive_size_bytes"] == len("hello")
-        assert docs["recursive_file_count"] == 1
-        assert docs["direct_file_count"] == 1
+        assert docs["recursive_size_bytes"] == len("hello") + len("1,2,3")
+        assert docs["recursive_file_count"] == 2
+        assert docs["direct_file_count"] == 2
         volume = db.get_volume(volume_id)
-        assert volume["indexed_file_count"] == 2
+        assert volume["indexed_file_count"] == 3
+        assert volume["last_scan_at"] == before
+        history = db.list_scan_history(volume_id)
+        assert history[0]["status"] == "discarded"
+        assert history[0]["files_removed"] == 1
+    finally:
+        db.close()
+
+
+def test_unchanged_scan_applies_without_requesting_review(tmp_path):
+    source = tmp_path / "drive"
+    source.mkdir()
+    make_tree(source)
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id = db.create_volume("Drive", str(source))
+        VolumeScanner(db).scan(volume_id)
+
+        reviews = []
+        result = VolumeScanner(
+            db,
+            preview_callback=lambda changes: reviews.append(changes) or True,
+        ).scan(volume_id)
+
+        assert result.status == "completed"
+        assert result.changes is not None
+        assert not result.changes.has_changes
+        assert reviews == []
     finally:
         db.close()
 

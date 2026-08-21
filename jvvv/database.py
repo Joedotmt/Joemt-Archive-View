@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 CATALOGUE_EXTENSION = ".jvvv"
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
@@ -25,6 +25,7 @@ UINT64_MAX = UINT64_MODULUS - 1
 DEFAULT_BUSY_TIMEOUT_MS = 2000
 INTERACTIVE_BUSY_TIMEOUT_MS = 250
 AUTOMATIC_INTEGRITY_CHECK_MAX_BYTES = 256 * 1024 * 1024
+SCAN_HISTORY_PER_VOLUME_LIMIT = 100
 WINDOWS_DRIVE_REMOTE = 4
 SQLITE_EXTENDED_ERROR_NAMES = {
     8714: "SQLITE_IOERR_IN_PAGE",
@@ -116,6 +117,13 @@ REQUIRED_COLUMNS = {
         "folders_seen",
         "errors_count",
         "message",
+        "files_added",
+        "files_removed",
+        "files_changed",
+        "folders_added",
+        "folders_removed",
+        "bytes_before",
+        "bytes_after",
     },
     "scan_errors": {
         "id",
@@ -435,6 +443,9 @@ class Database:
                 if version < 8:
                     self._apply_migration_8()
                     version = 8
+                if version < 9:
+                    self._apply_migration_9()
+                    version = 9
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
@@ -851,6 +862,19 @@ class Database:
         self.connection.execute("DROP TABLE IF EXISTS files_fts")
         self.connection.execute("DROP TABLE IF EXISTS folders_fts")
         self._apply_migration_7()
+
+    def _apply_migration_9(self) -> None:
+        scan_history_columns = {
+            "files_added": "INTEGER",
+            "files_removed": "INTEGER",
+            "files_changed": "INTEGER",
+            "folders_added": "INTEGER",
+            "folders_removed": "INTEGER",
+            "bytes_before": "INTEGER",
+            "bytes_after": "INTEGER",
+        }
+        for column, definition in scan_history_columns.items():
+            self._add_column_if_missing("scan_history", column, definition)
 
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column not in self._column_names(table):
@@ -1423,7 +1447,9 @@ class Database:
         folders_seen: int,
         errors_count: int,
         message: str | None = None,
+        changes: dict[str, int] | None = None,
     ) -> None:
+        summary = changes or {}
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -1433,10 +1459,37 @@ class Database:
                     files_seen = ?,
                     folders_seen = ?,
                     errors_count = ?,
-                    message = ?
+                    message = ?,
+                    files_added = ?,
+                    files_removed = ?,
+                    files_changed = ?,
+                    folders_added = ?,
+                    folders_removed = ?,
+                    bytes_before = ?,
+                    bytes_after = ?
                 WHERE id = ?
                 """,
-                (utc_now(), status, files_seen, folders_seen, errors_count, message, scan_id),
+                (
+                    utc_now(),
+                    status,
+                    files_seen,
+                    folders_seen,
+                    errors_count,
+                    message,
+                    summary.get("files_added"),
+                    summary.get("files_removed"),
+                    summary.get("files_changed"),
+                    summary.get("folders_added"),
+                    summary.get("folders_removed"),
+                    summary.get("bytes_before"),
+                    summary.get("bytes_after"),
+                    scan_id,
+                ),
+            )
+            self._prune_scan_history_for_volume(
+                conn,
+                scan_id=scan_id,
+                keep=SCAN_HISTORY_PER_VOLUME_LIMIT,
             )
 
     def add_scan_error(self, scan_id: int, volume_id: int, path: str, message: str) -> None:
@@ -1552,48 +1605,157 @@ class Database:
         )
         return int(cur.fetchone()["id"])
 
+    def prepare_scan_comparison(self, volume_id: int) -> None:
+        """Take a connection-local snapshot used only while reviewing one scan."""
+        self.connection.execute("DROP TABLE IF EXISTS temp.scan_previous_files")
+        self.connection.execute("DROP TABLE IF EXISTS temp.scan_previous_folders")
+        self.connection.execute(
+            """
+            CREATE TEMP TABLE scan_previous_files (
+                relative_path TEXT PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                modified_at TEXT
+            ) WITHOUT ROWID
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO scan_previous_files (relative_path, size_bytes, modified_at)
+            SELECT relative_path, size_bytes, modified_at
+            FROM files
+            WHERE volume_id = ? AND missing = 0
+            """,
+            (volume_id,),
+        )
+        self.connection.execute(
+            """
+            CREATE TEMP TABLE scan_previous_folders (
+                relative_path TEXT PRIMARY KEY
+            ) WITHOUT ROWID
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO scan_previous_folders (relative_path)
+            SELECT relative_path
+            FROM folders
+            WHERE volume_id = ? AND missing = 0
+            """,
+            (volume_id,),
+        )
+
+    def scan_change_summary(self, volume_id: int, scanned_at: str) -> dict[str, int]:
+        file_totals = self.connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM scan_previous_files) AS files_before,
+                (SELECT COALESCE(SUM(size_bytes), 0) FROM scan_previous_files) AS bytes_before,
+                COUNT(*) AS files_after,
+                COALESCE(SUM(f.size_bytes), 0) AS bytes_after
+            FROM files f
+            WHERE f.volume_id = ? AND f.scanned_at = ?
+            """,
+            (volume_id, scanned_at),
+        ).fetchone()
+        file_changes = self.connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN p.relative_path IS NULL THEN 1 ELSE 0 END), 0) AS files_added,
+                COALESCE(SUM(CASE WHEN p.relative_path IS NULL THEN f.size_bytes ELSE 0 END), 0) AS bytes_added,
+                COALESCE(SUM(CASE
+                    WHEN p.relative_path IS NOT NULL
+                     AND (p.size_bytes != f.size_bytes OR p.modified_at IS NOT f.modified_at)
+                    THEN 1 ELSE 0 END), 0) AS files_changed,
+                COALESCE(SUM(CASE
+                    WHEN p.relative_path IS NOT NULL
+                     AND (p.size_bytes != f.size_bytes OR p.modified_at IS NOT f.modified_at)
+                    THEN p.size_bytes ELSE 0 END), 0) AS changed_bytes_before,
+                COALESCE(SUM(CASE
+                    WHEN p.relative_path IS NOT NULL
+                     AND (p.size_bytes != f.size_bytes OR p.modified_at IS NOT f.modified_at)
+                    THEN f.size_bytes ELSE 0 END), 0) AS changed_bytes_after
+            FROM files f
+            LEFT JOIN scan_previous_files p ON p.relative_path = f.relative_path
+            WHERE f.volume_id = ? AND f.scanned_at = ?
+            """,
+            (volume_id, scanned_at),
+        ).fetchone()
+        removed_files = self.connection.execute(
+            """
+            SELECT COUNT(*) AS files_removed, COALESCE(SUM(p.size_bytes), 0) AS bytes_removed
+            FROM scan_previous_files p
+            LEFT JOIN files f
+              ON f.volume_id = ?
+             AND f.relative_path = p.relative_path
+             AND f.scanned_at = ?
+            WHERE f.id IS NULL
+            """,
+            (volume_id, scanned_at),
+        ).fetchone()
+        folder_changes = self.connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM scan_previous_folders) AS folders_before,
+                COUNT(*) AS folders_after,
+                COALESCE(SUM(CASE WHEN p.relative_path IS NULL THEN 1 ELSE 0 END), 0) AS folders_added
+            FROM folders f
+            LEFT JOIN scan_previous_folders p ON p.relative_path = f.relative_path
+            WHERE f.volume_id = ? AND f.scanned_at = ?
+            """,
+            (volume_id, scanned_at),
+        ).fetchone()
+        removed_folders = self.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM scan_previous_folders p
+            LEFT JOIN folders f
+              ON f.volume_id = ?
+             AND f.relative_path = p.relative_path
+             AND f.scanned_at = ?
+            WHERE f.id IS NULL
+            """,
+            (volume_id, scanned_at),
+        ).fetchone()[0]
+        return {
+            "files_before": int(file_totals["files_before"]),
+            "files_after": int(file_totals["files_after"]),
+            "files_added": int(file_changes["files_added"]),
+            "files_removed": int(removed_files["files_removed"]),
+            "files_changed": int(file_changes["files_changed"]),
+            "folders_before": int(folder_changes["folders_before"]),
+            "folders_after": int(folder_changes["folders_after"]),
+            "folders_added": int(folder_changes["folders_added"]),
+            "folders_removed": int(removed_folders),
+            "bytes_before": int(file_totals["bytes_before"]),
+            "bytes_after": int(file_totals["bytes_after"]),
+            "bytes_added": int(file_changes["bytes_added"]),
+            "bytes_removed": int(removed_files["bytes_removed"]),
+            "changed_bytes_before": int(file_changes["changed_bytes_before"]),
+            "changed_bytes_after": int(file_changes["changed_bytes_after"]),
+        }
+
     def finalize_scan_items(
         self,
         volume_id: int,
         scanned_at: str,
-        remove_deleted: bool,
     ) -> None:
-        if remove_deleted:
-            self.connection.execute(
-                """
-                DELETE FROM files
-                WHERE volume_id = ?
-                  AND (scanned_at IS NULL OR scanned_at != ?)
-                """,
-                (volume_id, scanned_at),
-            )
-            self.connection.execute(
-                """
-                DELETE FROM folders
-                WHERE volume_id = ?
-                  AND (scanned_at IS NULL OR scanned_at != ?)
-                  AND relative_path != ''
-                """,
-                (volume_id, scanned_at),
-            )
-        else:
-            self.connection.execute(
-                """
-                UPDATE files SET missing = 1
-                WHERE volume_id = ?
-                  AND (scanned_at IS NULL OR scanned_at != ?)
-                """,
-                (volume_id, scanned_at),
-            )
-            self.connection.execute(
-                """
-                UPDATE folders SET missing = 1
-                WHERE volume_id = ?
-                  AND (scanned_at IS NULL OR scanned_at != ?)
-                  AND relative_path != ''
-                """,
-                (volume_id, scanned_at),
-            )
+        self.connection.execute(
+            """
+            DELETE FROM files
+            WHERE volume_id = ?
+              AND (scanned_at IS NULL OR scanned_at != ?)
+            """,
+            (volume_id, scanned_at),
+        )
+        self.connection.execute(
+            """
+            DELETE FROM folders
+            WHERE volume_id = ?
+              AND (scanned_at IS NULL OR scanned_at != ?)
+              AND relative_path != ''
+            """,
+            (volume_id, scanned_at),
+        )
 
     def rebuild_folder_statistics(
         self,
@@ -2120,22 +2282,46 @@ class Database:
         volume_ids = [row["id"] for row in self.list_volumes()]
         with self.transaction() as conn:
             for volume_id in volume_ids:
-                stale = list(
-                    conn.execute(
-                        """
-                        SELECT id FROM scan_history
-                        WHERE volume_id = ?
-                        ORDER BY id DESC
-                        LIMIT -1 OFFSET ?
-                        """,
-                        (volume_id, keep_per_volume),
-                    )
+                self._prune_scan_history_for_volume(
+                    conn,
+                    volume_id=int(volume_id),
+                    keep=keep_per_volume,
                 )
-                if stale:
-                    conn.executemany(
-                        "DELETE FROM scan_history WHERE id = ?",
-                        [(row["id"],) for row in stale],
-                    )
+
+    def _prune_scan_history_for_volume(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        keep: int,
+        volume_id: int | None = None,
+        scan_id: int | None = None,
+    ) -> None:
+        if volume_id is None:
+            if scan_id is None:
+                raise ValueError("volume_id or scan_id is required")
+            row = conn.execute(
+                "SELECT volume_id FROM scan_history WHERE id = ?",
+                (scan_id,),
+            ).fetchone()
+            if row is None:
+                return
+            volume_id = int(row["volume_id"])
+        stale = list(
+            conn.execute(
+                """
+                SELECT id FROM scan_history
+                WHERE volume_id = ?
+                ORDER BY id DESC
+                LIMIT -1 OFFSET ?
+                """,
+                (volume_id, max(keep, 0)),
+            )
+        )
+        if stale:
+            conn.executemany(
+                "DELETE FROM scan_history WHERE id = ?",
+                [(row["id"],) for row in stale],
+            )
 
 
 def catalogue_path_with_extension(path: str | Path) -> Path:

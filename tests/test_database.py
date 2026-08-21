@@ -37,7 +37,7 @@ def test_database_initializes_schema(tmp_path):
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
         assert "volume_register" in tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 9
         assert {"files_fts", "folders_fts"} <= tables
         folder_indexes = {
             row["name"]
@@ -59,6 +59,19 @@ def test_database_initializes_schema(tmp_path):
         assert "idx_files_folder" in file_indexes
         assert "idx_scan_history_volume" in scan_history_indexes
         assert "idx_scan_errors_volume" in scan_error_indexes
+        scan_history_columns = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA table_info(scan_history)")
+        }
+        assert {
+            "files_added",
+            "files_removed",
+            "files_changed",
+            "folders_added",
+            "folders_removed",
+            "bytes_before",
+            "bytes_after",
+        } <= scan_history_columns
         volume_columns = {
             row["name"]: row
             for row in db.connection.execute("PRAGMA table_info(volumes)")
@@ -97,6 +110,21 @@ def test_database_initializes_schema(tmp_path):
             "date_added",
             "master_volume_id",
         } <= register_columns
+    finally:
+        db.close()
+
+
+def test_finishing_scans_keeps_only_compact_recent_history(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        for _ in range(105):
+            scan_id = db.start_scan(volume_id)
+            db.finish_scan(scan_id, "completed", 10, 2, 0)
+
+        history = db.list_scan_history(volume_id, limit=200)
+        assert len(history) == 100
+        assert all(row["files_seen"] == 10 for row in history)
     finally:
         db.close()
 
@@ -720,7 +748,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 9
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
@@ -798,7 +826,7 @@ def test_version_7_search_index_migrates_to_column_detail(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 9
         definitions = {
             row["name"]: row["sql"]
             for row in migrated.connection.execute(

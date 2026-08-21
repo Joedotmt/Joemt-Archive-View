@@ -11,11 +11,14 @@ component.
 
 ## Features
 
-- Create, edit, delete, scan, and rescan catalogue volumes.
+- Create, edit, delete, and scan catalogue volumes.
 - Store each catalogue as a single SQLite-backed `.jvvv` file.
 - Browse indexed folders and files offline.
 - Search by filename, partial filename, extension, and folder name across all
-  volumes, with optional relative-path matching in **Help > Preferences**.
+  volumes, with optional relative-path matching in **Settings > Preferences**.
+- Choose a custom accent color, light or dark mode, and either JVVV's custom
+  styling or Qt's default Fusion controls in **Settings > Preferences**. Appearance
+  changes preview live and can be reset to the original theme defaults.
 - Show connected/offline status, capacity, used/free space, indexed item counts,
   last scan time, and scan logs.
 - Run scans on a Qt worker thread so the interface remains responsive.
@@ -53,10 +56,11 @@ is a valid SQLite database and contains the full catalogue.
    scanning when the volume is added.
 4. Browse the saved folder tree and file list after the scan completes.
 5. Use the search bar to search across all indexed volumes.
-6. Use **Rescan** to refresh an existing catalogue.
+6. Use **Scan** again to refresh an existing catalogue.
 
-When rescanning, the app asks whether removed files should be deleted from the
-catalogue or marked as missing.
+When an existing catalogue has changed, the app shows the added, changed, and
+no-longer-present file counts and the indexed-size difference before applying
+the update. Cancelling the confirmation leaves the existing catalogue intact.
 
 If a result belongs to a connected volume, use the result buttons to open the
 real file or reveal it in the operating system file manager.
@@ -68,7 +72,7 @@ pytest
 ```
 
 The automated tests cover database initialization, volume operations, scanning,
-rescanning, missing-file handling, and search.
+change review and rollback, and search.
 
 ## Packaging With PyInstaller
 
