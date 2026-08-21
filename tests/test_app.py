@@ -26,6 +26,8 @@ from jvvv.app import (
 )
 from jvvv.database import CatalogueError, create_catalogue
 from jvvv.theme import (
+    ADOBE_ACCENT_COLOR,
+    ADOBE_THEME,
     CUSTOM_THEME,
     DARK_MODE,
     DEFAULT_ACCENT_COLOR,
@@ -478,6 +480,23 @@ def test_reset_theme_restores_all_appearance_defaults():
         == DEFAULT_COLOR_MODE
     )
     assert dialog._accent_color == DEFAULT_ACCENT_COLOR
+    assert events == ["button", "preview"]
+
+
+def test_switching_theme_selects_its_signature_accent():
+    events = []
+    dialog = SimpleNamespace(
+        _last_theme_style=CUSTOM_THEME,
+        _accent_color=DEFAULT_ACCENT_COLOR,
+        theme_style=lambda: ADOBE_THEME,
+        update_accent_button=lambda: events.append("button"),
+        emit_appearance_changed=lambda: events.append("preview"),
+    )
+
+    PreferencesDialog.on_theme_changed(dialog)
+
+    assert dialog._last_theme_style == ADOBE_THEME
+    assert dialog._accent_color == ADOBE_ACCENT_COLOR
     assert events == ["button", "preview"]
 
 

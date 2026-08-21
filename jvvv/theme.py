@@ -8,11 +8,19 @@ from PySide6.QtWidgets import QApplication
 
 CUSTOM_THEME = "custom"
 FUSION_THEME = "fusion"
+ADOBE_THEME = "adobe"
+VSCODE_THEME = "vscode"
 LIGHT_MODE = "light"
 DARK_MODE = "dark"
 DEFAULT_THEME_STYLE = CUSTOM_THEME
 DEFAULT_COLOR_MODE = DARK_MODE
 DEFAULT_ACCENT_COLOR = "#2f9e63"
+ADOBE_ACCENT_COLOR = "#5681ff"
+VSCODE_ACCENT_COLOR = "#0078d4"
+
+THEME_STYLES = frozenset(
+    {CUSTOM_THEME, FUSION_THEME, ADOBE_THEME, VSCODE_THEME}
+)
 
 
 # A compact, neutral dark theme inspired by Blender's workspace chrome and
@@ -378,6 +386,358 @@ QToolTip {
 """
 
 
+# Adobe and VS Code both use flat, layered workspaces, but with different
+# surface ramps and control proportions. This template keeps the app-specific
+# widget coverage in one place while the token sets below preserve each
+# product's recognizable chrome.
+PRESET_STYLESHEET = """
+QWidget {
+    color: __FOREGROUND__;
+    selection-background-color: __SELECTION__;
+    selection-color: __SELECTION_TEXT__;
+}
+
+QMainWindow, QDialog, QStackedWidget,
+QWidget#welcomePage, QWidget#loadingPage {
+    background-color: __WINDOW__;
+}
+
+QWidget#volumePane, QWidget#contentPane {
+    background-color: __WINDOW__;
+}
+
+QLabel#welcomeTitle, QLabel#emptyStateTitle {
+    color: __STRONG_TEXT__;
+}
+
+QLabel#mutedLabel, QLabel#loadingPath, QLabel#propertySubtitle,
+QLabel#detailKey, QLabel#emptyStateDescription {
+    color: __MUTED__;
+}
+
+QLabel#offlineNotice {
+    color: __WARNING_TEXT__;
+    background-color: __WARNING_BACKGROUND__;
+    border: 1px solid __WARNING_BORDER__;
+    border-radius: __RADIUS__px;
+    padding: 4px 7px;
+}
+
+QLabel#emptyStateTitle {
+    font-size: 18px;
+    font-weight: 600;
+}
+
+QMenuBar {
+    background-color: __CHROME__;
+    border-bottom: 1px solid __BORDER__;
+    padding: 0;
+}
+
+QMenuBar::item {
+    background: transparent;
+    padding: 4px 9px;
+}
+
+QMenuBar::item:selected, QMenuBar::item:pressed {
+    background-color: __HOVER__;
+}
+
+QMenu {
+    color: __FOREGROUND__;
+    background-color: __MENU__;
+    border: 1px solid __BORDER__;
+    border-radius: __RADIUS__px;
+    padding: 3px 0;
+}
+
+QMenu::item {
+    padding: 5px 28px 5px 22px;
+}
+
+QMenu::item:selected {
+    color: __ACCENT_TEXT__;
+    background-color: __ACCENT__;
+}
+
+QMenu::item:disabled {
+    color: __DISABLED_TEXT__;
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: __BORDER__;
+    margin: 4px 8px;
+}
+
+QPushButton, QToolButton {
+    color: __FOREGROUND__;
+    background-color: __BUTTON__;
+    border: 1px solid __CONTROL_BORDER__;
+    border-radius: __RADIUS__px;
+    min-height: 20px;
+    padding: 2px 9px;
+}
+
+QPushButton:hover, QToolButton:hover {
+    background-color: __BUTTON_HOVER__;
+}
+
+QPushButton:pressed, QToolButton:pressed,
+QPushButton:checked, QToolButton:checked {
+    background-color: __BUTTON_PRESSED__;
+}
+
+QPushButton:focus, QToolButton:focus {
+    border-color: __ACCENT__;
+}
+
+QPushButton:disabled, QToolButton:disabled {
+    color: __DISABLED_TEXT__;
+    background-color: __DISABLED_BACKGROUND__;
+    border-color: __BORDER__;
+}
+
+QPushButton#primaryButton, QPushButton#searchButton, QPushButton:default {
+    color: __ACCENT_TEXT__;
+    background-color: __ACCENT__;
+    border-color: __ACCENT_BORDER__;
+}
+
+QPushButton#primaryButton:hover, QPushButton#searchButton:hover,
+QPushButton:default:hover {
+    background-color: __ACCENT_HOVER__;
+}
+
+QPushButton#primaryButton:pressed, QPushButton#searchButton:pressed,
+QPushButton:default:pressed {
+    background-color: __ACCENT_PRESSED__;
+}
+
+QToolButton#navigationButton {
+    padding: 2px;
+}
+
+QLineEdit, QComboBox, QDateEdit, QPlainTextEdit, QTextBrowser {
+    color: __FOREGROUND__;
+    background-color: __FIELD__;
+    border: 1px solid __CONTROL_BORDER__;
+    border-radius: __RADIUS__px;
+    min-height: 20px;
+    padding: 2px 6px;
+}
+
+QLineEdit:hover, QComboBox:hover, QDateEdit:hover,
+QPlainTextEdit:hover, QTextBrowser:hover {
+    border-color: __CONTROL_HOVER_BORDER__;
+}
+
+QLineEdit:focus, QComboBox:focus, QDateEdit:focus,
+QPlainTextEdit:focus, QTextBrowser:focus {
+    border-color: __ACCENT__;
+}
+
+QLineEdit:disabled, QComboBox:disabled, QDateEdit:disabled,
+QPlainTextEdit:disabled, QTextBrowser:disabled {
+    color: __DISABLED_TEXT__;
+    background-color: __DISABLED_BACKGROUND__;
+}
+
+QLineEdit#pathField {
+    color: __FOREGROUND__;
+    background-color: __BASE__;
+}
+
+QComboBox::drop-down, QDateEdit::drop-down {
+    width: 20px;
+    border: 0;
+    border-left: 1px solid __CONTROL_BORDER__;
+}
+
+QAbstractItemView {
+    color: __FOREGROUND__;
+    background-color: __BASE__;
+    alternate-background-color: __ALTERNATE__;
+    border: 1px solid __BORDER__;
+    border-radius: __RADIUS__px;
+    outline: 0;
+}
+
+QAbstractItemView::item {
+    padding: 2px 5px;
+    border: 0;
+}
+
+QAbstractItemView::item:hover:!selected {
+    background-color: __LIST_HOVER__;
+}
+
+QAbstractItemView::item:selected {
+    color: __SELECTION_TEXT__;
+    background-color: __SELECTION__;
+}
+
+QAbstractItemView::item:selected:!active {
+    color: __FOREGROUND__;
+    background-color: __INACTIVE_SELECTION__;
+}
+
+QHeaderView, QHeaderView::section {
+    color: __FOREGROUND__;
+    background-color: __HEADER__;
+}
+
+QHeaderView::section {
+    border: 0;
+    border-right: 1px solid __BORDER__;
+    border-bottom: 1px solid __BORDER__;
+    padding: 4px 6px;
+    font-weight: 600;
+}
+
+QHeaderView::section:hover {
+    background-color: __HOVER__;
+}
+
+QTableView {
+    gridline-color: __BORDER__;
+}
+
+QTreeWidget#folderTree {
+    background-color: __SIDEBAR__;
+}
+
+QTabWidget::pane, QStackedWidget#searchResultsStack {
+    background-color: __BASE__;
+    border: 1px solid __BORDER__;
+    border-radius: __RADIUS__px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    color: __MUTED__;
+    background-color: __TAB_INACTIVE__;
+    border: 1px solid __BORDER__;
+    border-bottom: 0;
+    border-radius: 0;
+    padding: 4px 12px;
+    margin-right: 0;
+}
+
+QTabBar::tab:hover {
+    color: __STRONG_TEXT__;
+    background-color: __TAB_HOVER__;
+}
+
+QTabBar::tab:selected {
+    color: __STRONG_TEXT__;
+    background-color: __TAB_ACTIVE__;
+    border-top: 2px solid __ACCENT__;
+    padding-top: 3px;
+}
+
+QGroupBox {
+    color: __FOREGROUND__;
+    background-color: __SURFACE__;
+    border: 1px solid __BORDER__;
+    border-radius: __RADIUS__px;
+    margin-top: 9px;
+    padding-top: 7px;
+    font-weight: 600;
+}
+
+QGroupBox::title {
+    color: __FOREGROUND__;
+    background-color: __HEADER__;
+    border: 1px solid __BORDER__;
+    border-radius: __RADIUS__px;
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 7px;
+    padding: 1px 7px;
+}
+
+QSplitter::handle {
+    background-color: __SPLITTER__;
+}
+
+QSplitter::handle:hover {
+    background-color: __ACCENT__;
+}
+
+QProgressBar {
+    color: __FOREGROUND__;
+    background-color: __PROGRESS_BACKGROUND__;
+    border: 1px solid __BORDER__;
+    border-radius: __RADIUS__px;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background-color: __ACCENT__;
+    border-radius: __RADIUS__px;
+}
+
+QStatusBar {
+    color: __FOREGROUND__;
+    background-color: __CHROME__;
+    border-top: 1px solid __BORDER__;
+}
+
+QStatusBar::item {
+    border: 0;
+}
+
+QScrollBar:vertical {
+    background-color: __SCROLL_TRACK__;
+    width: 12px;
+    margin: 0;
+}
+
+QScrollBar:horizontal {
+    background-color: __SCROLL_TRACK__;
+    height: 12px;
+    margin: 0;
+}
+
+QScrollBar::handle {
+    background-color: __SCROLL_HANDLE__;
+    border-radius: 0;
+    min-width: 24px;
+    min-height: 24px;
+    margin: 2px;
+}
+
+QScrollBar::handle:hover {
+    background-color: __SCROLL_HANDLE_HOVER__;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line,
+QScrollBar::add-page, QScrollBar::sub-page {
+    width: 0;
+    height: 0;
+    background: transparent;
+}
+
+QCheckBox {
+    spacing: 6px;
+}
+
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+}
+
+QToolTip {
+    color: __STRONG_TEXT__;
+    background-color: __TOOLTIP__;
+    border: 1px solid __CONTROL_BORDER__;
+    border-radius: __RADIUS__px;
+    padding: 4px;
+}
+"""
+
+
 # The custom theme was originally designed as a dark theme. Keeping its color
 # tokens in one stylesheet makes the widget geometry shared by both modes; the
 # neutral colors below are translated when light mode is requested.
@@ -432,8 +792,216 @@ _LIGHT_COLOR_REPLACEMENTS = {
 }
 
 
+def theme_default_accent(theme_style: str | None) -> str:
+    """Return the signature accent used when switching to a theme preset."""
+    theme_style = normalize_theme_style(theme_style)
+    if theme_style == ADOBE_THEME:
+        return ADOBE_ACCENT_COLOR
+    if theme_style == VSCODE_THEME:
+        return VSCODE_ACCENT_COLOR
+    return DEFAULT_ACCENT_COLOR
+
+
+def _preset_theme_tokens(
+    theme_style: str,
+    color_mode: str,
+    accent_color: str,
+) -> dict[str, str]:
+    theme_style = normalize_theme_style(theme_style)
+    color_mode = normalize_color_mode(color_mode)
+    accent = QColor(normalize_accent_color(accent_color))
+
+    if theme_style == ADOBE_THEME:
+        # Adobe Spectrum 2 gray stops provide the surface ramp. Premiere's
+        # dense workspace adds the near-black dividers between those layers.
+        if color_mode == LIGHT_MODE:
+            tokens = {
+                "FOREGROUND": "#292929",
+                "STRONG_TEXT": "#131313",
+                "MUTED": "#717171",
+                "WINDOW": "#f3f3f3",
+                "CHROME": "#e9e9e9",
+                "MENU": "#ffffff",
+                "SURFACE": "#f8f8f8",
+                "BASE": "#ffffff",
+                "ALTERNATE": "#f8f8f8",
+                "SIDEBAR": "#f3f3f3",
+                "FIELD": "#ffffff",
+                "BUTTON": "#e1e1e1",
+                "BUTTON_HOVER": "#dadada",
+                "BUTTON_PRESSED": "#c6c6c6",
+                "DISABLED_BACKGROUND": "#e9e9e9",
+                "DISABLED_TEXT": "#8f8f8f",
+                "BORDER": "#c6c6c6",
+                "CONTROL_BORDER": "#8f8f8f",
+                "CONTROL_HOVER_BORDER": "#505050",
+                "HEADER": "#e9e9e9",
+                "HOVER": "#dadada",
+                "LIST_HOVER": "#e9e9e9",
+                "TAB_INACTIVE": "#e9e9e9",
+                "TAB_HOVER": "#f3f3f3",
+                "TAB_ACTIVE": "#ffffff",
+                "SPLITTER": "#c6c6c6",
+                "PROGRESS_BACKGROUND": "#e1e1e1",
+                "SCROLL_TRACK": "#f3f3f3",
+                "SCROLL_HANDLE": "#8f8f8f",
+                "SCROLL_HANDLE_HOVER": "#717171",
+                "TOOLTIP": "#ffffff",
+                "WARNING_TEXT": "#6d4b00",
+                "WARNING_BACKGROUND": "#fff1c2",
+                "WARNING_BORDER": "#d5a000",
+                "RADIUS": "3",
+            }
+        else:
+            tokens = {
+                "FOREGROUND": "#dbdbdb",
+                "STRONG_TEXT": "#f2f2f2",
+                "MUTED": "#afafaf",
+                "WINDOW": "#1b1b1b",
+                "CHROME": "#222222",
+                "MENU": "#2c2c2c",
+                "SURFACE": "#222222",
+                "BASE": "#1b1b1b",
+                "ALTERNATE": "#202020",
+                "SIDEBAR": "#222222",
+                "FIELD": "#2c2c2c",
+                "BUTTON": "#393939",
+                "BUTTON_HOVER": "#444444",
+                "BUTTON_PRESSED": "#323232",
+                "DISABLED_BACKGROUND": "#222222",
+                "DISABLED_TEXT": "#6d6d6d",
+                "BORDER": "#111111",
+                "CONTROL_BORDER": "#444444",
+                "CONTROL_HOVER_BORDER": "#6d6d6d",
+                "HEADER": "#2c2c2c",
+                "HOVER": "#393939",
+                "LIST_HOVER": "#323232",
+                "TAB_INACTIVE": "#222222",
+                "TAB_HOVER": "#2c2c2c",
+                "TAB_ACTIVE": "#2c2c2c",
+                "SPLITTER": "#111111",
+                "PROGRESS_BACKGROUND": "#111111",
+                "SCROLL_TRACK": "#1b1b1b",
+                "SCROLL_HANDLE": "#444444",
+                "SCROLL_HANDLE_HOVER": "#6d6d6d",
+                "TOOLTIP": "#2c2c2c",
+                "WARNING_TEXT": "#f5c451",
+                "WARNING_BACKGROUND": "#352900",
+                "WARNING_BORDER": "#6b5100",
+                "RADIUS": "3",
+            }
+        selection = accent.name()
+        selection_text = contrasting_text_color(accent)
+    elif theme_style == VSCODE_THEME:
+        # These values mirror VS Code's built-in Light Modern and Dark Modern
+        # workbench themes, including the distinct side-bar and editor layers.
+        if color_mode == LIGHT_MODE:
+            tokens = {
+                "FOREGROUND": "#3b3b3b",
+                "STRONG_TEXT": "#1f1f1f",
+                "MUTED": "#616161",
+                "WINDOW": "#ffffff",
+                "CHROME": "#f8f8f8",
+                "MENU": "#ffffff",
+                "SURFACE": "#f8f8f8",
+                "BASE": "#ffffff",
+                "ALTERNATE": "#fafafa",
+                "SIDEBAR": "#f8f8f8",
+                "FIELD": "#ffffff",
+                "BUTTON": "#e5e5e5",
+                "BUTTON_HOVER": "#cccccc",
+                "BUTTON_PRESSED": "#bdbdbd",
+                "DISABLED_BACKGROUND": "#f2f2f2",
+                "DISABLED_TEXT": "#868686",
+                "BORDER": "#e5e5e5",
+                "CONTROL_BORDER": "#cecece",
+                "CONTROL_HOVER_BORDER": "#8b949e",
+                "HEADER": "#f8f8f8",
+                "HOVER": "#f2f2f2",
+                "LIST_HOVER": "#f2f2f2",
+                "TAB_INACTIVE": "#f8f8f8",
+                "TAB_HOVER": "#ffffff",
+                "TAB_ACTIVE": "#ffffff",
+                "SPLITTER": "#e5e5e5",
+                "PROGRESS_BACKGROUND": "#e5e5e5",
+                "SCROLL_TRACK": "#ffffff",
+                "SCROLL_HANDLE": "#c1c1c1",
+                "SCROLL_HANDLE_HOVER": "#a8a8a8",
+                "TOOLTIP": "#f8f8f8",
+                "WARNING_TEXT": "#895503",
+                "WARNING_BACKGROUND": "#fff4ce",
+                "WARNING_BORDER": "#d6b656",
+                "RADIUS": "2",
+            }
+            selection = "#e8e8e8"
+            selection_text = "#000000"
+        else:
+            tokens = {
+                "FOREGROUND": "#cccccc",
+                "STRONG_TEXT": "#ffffff",
+                "MUTED": "#9d9d9d",
+                "WINDOW": "#1f1f1f",
+                "CHROME": "#181818",
+                "MENU": "#1f1f1f",
+                "SURFACE": "#181818",
+                "BASE": "#1f1f1f",
+                "ALTERNATE": "#232323",
+                "SIDEBAR": "#181818",
+                "FIELD": "#313131",
+                "BUTTON": "#313131",
+                "BUTTON_HOVER": "#2b2b2b",
+                "BUTTON_PRESSED": "#3c3c3c",
+                "DISABLED_BACKGROUND": "#202020",
+                "DISABLED_TEXT": "#868686",
+                "BORDER": "#2b2b2b",
+                "CONTROL_BORDER": "#3c3c3c",
+                "CONTROL_HOVER_BORDER": "#616161",
+                "HEADER": "#181818",
+                "HOVER": "#2b2b2b",
+                "LIST_HOVER": "#2a2d2e",
+                "TAB_INACTIVE": "#181818",
+                "TAB_HOVER": "#1f1f1f",
+                "TAB_ACTIVE": "#1f1f1f",
+                "SPLITTER": "#2b2b2b",
+                "PROGRESS_BACKGROUND": "#313131",
+                "SCROLL_TRACK": "#1f1f1f",
+                "SCROLL_HANDLE": "#424242",
+                "SCROLL_HANDLE_HOVER": "#4f4f4f",
+                "TOOLTIP": "#202020",
+                "WARNING_TEXT": "#e2c08d",
+                "WARNING_BACKGROUND": "#352a18",
+                "WARNING_BORDER": "#6a5126",
+                "RADIUS": "2",
+            }
+            selection = _blend(accent, QColor("#1f1f1f"), 0.45).name()
+            selection_text = "#ffffff"
+    else:
+        raise ValueError(f"{theme_style!r} is not a styled preset theme")
+
+    tokens.update(
+        {
+            "ACCENT": accent.name(),
+            "ACCENT_TEXT": contrasting_text_color(accent),
+            "ACCENT_BORDER": accent.darker(118).name(),
+            "ACCENT_HOVER": (
+                accent.darker(110).name()
+                if color_mode == LIGHT_MODE
+                else accent.lighter(112).name()
+            ),
+            "ACCENT_PRESSED": accent.darker(120).name(),
+            "SELECTION": selection,
+            "SELECTION_TEXT": selection_text,
+            "INACTIVE_SELECTION": _blend(
+                QColor(selection), QColor(tokens["BASE"]), 0.55
+            ).name(),
+        }
+    )
+    return tokens
+
+
 def normalize_theme_style(theme_style: str | None) -> str:
-    return FUSION_THEME if str(theme_style).lower() == FUSION_THEME else CUSTOM_THEME
+    normalized = str(theme_style).strip().lower()
+    return normalized if normalized in THEME_STYLES else CUSTOM_THEME
 
 
 def normalize_color_mode(color_mode: str | None) -> str:
@@ -487,6 +1055,20 @@ def _accent_replacements(accent_color: str, color_mode: str) -> dict[str, str]:
 _PIXEL_METRIC_RE = re.compile(r"(?<![\w#])(-?\d+)px")
 
 
+def _scale_stylesheet(stylesheet: str, scale: float) -> str:
+    scale = max(0.1, float(scale))
+
+    def replace_metric(match: re.Match[str]) -> str:
+        value = int(match.group(1))
+        if value == 0:
+            return "0px"
+        direction = -1 if value < 0 else 1
+        scaled = max(1, round(abs(value) * scale)) * direction
+        return f"{scaled}px"
+
+    return _PIXEL_METRIC_RE.sub(replace_metric, stylesheet)
+
+
 def application_stylesheet(
     scale: float = 1.0,
     color_mode: str = DEFAULT_COLOR_MODE,
@@ -509,15 +1091,21 @@ def application_stylesheet(
         stylesheet = stylesheet.replace(source, replacement)
     stylesheet = stylesheet.replace("__ACCENT_TEXT__", contrasting_text_color(accent_color))
 
-    def replace_metric(match: re.Match[str]) -> str:
-        value = int(match.group(1))
-        if value == 0:
-            return "0px"
-        direction = -1 if value < 0 else 1
-        scaled = max(1, round(abs(value) * scale)) * direction
-        return f"{scaled}px"
+    return _scale_stylesheet(stylesheet, scale)
 
-    return _PIXEL_METRIC_RE.sub(replace_metric, stylesheet)
+
+def preset_stylesheet(
+    theme_style: str,
+    scale: float = 1.0,
+    color_mode: str = DEFAULT_COLOR_MODE,
+    accent_color: str = DEFAULT_ACCENT_COLOR,
+) -> str:
+    """Return an Adobe- or VS Code-inspired stylesheet."""
+    tokens = _preset_theme_tokens(theme_style, color_mode, accent_color)
+    stylesheet = PRESET_STYLESHEET
+    for name, value in tokens.items():
+        stylesheet = stylesheet.replace(f"__{name}__", value)
+    return _scale_stylesheet(stylesheet, scale)
 
 
 def application_palette(
@@ -585,6 +1173,62 @@ def application_palette(
     return palette
 
 
+def preset_palette(
+    theme_style: str,
+    color_mode: str = DEFAULT_COLOR_MODE,
+    accent_color: str = DEFAULT_ACCENT_COLOR,
+) -> QPalette:
+    """Return the palette backing an Adobe or VS Code preset."""
+    tokens = _preset_theme_tokens(theme_style, color_mode, accent_color)
+    palette = QPalette()
+    colors = {
+        QPalette.ColorRole.Window: tokens["WINDOW"],
+        QPalette.ColorRole.WindowText: tokens["FOREGROUND"],
+        QPalette.ColorRole.Base: tokens["BASE"],
+        QPalette.ColorRole.AlternateBase: tokens["ALTERNATE"],
+        QPalette.ColorRole.ToolTipBase: tokens["TOOLTIP"],
+        QPalette.ColorRole.ToolTipText: tokens["STRONG_TEXT"],
+        QPalette.ColorRole.Text: tokens["FOREGROUND"],
+        QPalette.ColorRole.Button: tokens["BUTTON"],
+        QPalette.ColorRole.ButtonText: tokens["FOREGROUND"],
+        QPalette.ColorRole.BrightText: tokens["STRONG_TEXT"],
+        QPalette.ColorRole.Light: tokens["CONTROL_HOVER_BORDER"],
+        QPalette.ColorRole.Midlight: tokens["BUTTON_HOVER"],
+        QPalette.ColorRole.Mid: tokens["BORDER"],
+        QPalette.ColorRole.Dark: tokens["SPLITTER"],
+        QPalette.ColorRole.Shadow: tokens["BORDER"],
+        QPalette.ColorRole.Highlight: tokens["SELECTION"],
+        QPalette.ColorRole.HighlightedText: tokens["SELECTION_TEXT"],
+        QPalette.ColorRole.Link: tokens["ACCENT"],
+        QPalette.ColorRole.LinkVisited: QColor(tokens["ACCENT"]).lighter(125).name(),
+        QPalette.ColorRole.PlaceholderText: tokens["MUTED"],
+    }
+    for role, color in colors.items():
+        palette.setColor(role, QColor(color))
+
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+    ):
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            role,
+            QColor(tokens["DISABLED_TEXT"]),
+        )
+    palette.setColor(
+        QPalette.ColorGroup.Disabled,
+        QPalette.ColorRole.Highlight,
+        QColor(tokens["INACTIVE_SELECTION"]),
+    )
+    palette.setColor(
+        QPalette.ColorGroup.Disabled,
+        QPalette.ColorRole.HighlightedText,
+        QColor(tokens["DISABLED_TEXT"]),
+    )
+    return palette
+
+
 def fusion_palette(
     app: QApplication,
     color_mode: str = DEFAULT_COLOR_MODE,
@@ -630,9 +1274,19 @@ def apply_application_theme(
         if theme_style == CUSTOM_THEME:
             app.setPalette(application_palette(color_mode, accent_color))
             app.setStyleSheet(application_stylesheet(normalized_scale, color_mode, accent_color))
-        else:
+        elif theme_style == FUSION_THEME:
             app.setStyleSheet("")
             app.setPalette(fusion_palette(app, color_mode, accent_color))
+        else:
+            app.setPalette(preset_palette(theme_style, color_mode, accent_color))
+            app.setStyleSheet(
+                preset_stylesheet(
+                    theme_style,
+                    normalized_scale,
+                    color_mode,
+                    accent_color,
+                )
+            )
         app.setProperty("jvvvThemeKey", theme_key)
         app.setProperty("jvvvThemeScale", normalized_scale)
         return
@@ -641,4 +1295,13 @@ def apply_application_theme(
         return
     if theme_style == CUSTOM_THEME:
         app.setStyleSheet(application_stylesheet(normalized_scale, color_mode, accent_color))
+    elif theme_style != FUSION_THEME:
+        app.setStyleSheet(
+            preset_stylesheet(
+                theme_style,
+                normalized_scale,
+                color_mode,
+                accent_color,
+            )
+        )
     app.setProperty("jvvvThemeScale", normalized_scale)

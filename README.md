@@ -16,9 +16,9 @@ component.
 - Browse indexed folders and files offline.
 - Search by filename, partial filename, extension, and folder name across all
   volumes, with optional relative-path matching in **Settings > Preferences**.
-- Choose a custom accent color, light or dark mode, and either JVVV's custom
-  styling or Qt's default Fusion controls in **Settings > Preferences**. Appearance
-  changes preview live and can be reset to the original theme defaults.
+- Choose a custom accent color, light or dark mode, and JVVV, Adobe, VS Code,
+  or Qt Fusion styling in **Settings > Preferences**. Appearance changes preview
+  live and can be reset to the original theme defaults.
 - Show connected/offline status, capacity, used/free space, indexed item counts,
   last scan time, and scan logs.
 - Run scans on a Qt worker thread so the interface remains responsive.

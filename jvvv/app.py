@@ -94,6 +94,7 @@ from .database import (
 )
 from .scanner import VolumeScanner
 from .theme import (
+    ADOBE_THEME,
     CUSTOM_THEME,
     DARK_MODE,
     DEFAULT_ACCENT_COLOR,
@@ -101,11 +102,13 @@ from .theme import (
     DEFAULT_THEME_STYLE,
     FUSION_THEME,
     LIGHT_MODE,
+    VSCODE_THEME,
     apply_application_theme,
     contrasting_text_color,
     normalize_accent_color,
     normalize_color_mode,
     normalize_theme_style,
+    theme_default_accent,
 )
 from .utils import (
     ConnectedVolumeResolver,
@@ -1561,10 +1564,14 @@ class PreferencesDialog(QDialog):
 
         appearance_group = QGroupBox("Appearance")
         self.theme_combo = QComboBox()
-        self.theme_combo.addItem("Custom", CUSTOM_THEME)
-        self.theme_combo.addItem("Fusion (default)", FUSION_THEME)
-        theme_index = self.theme_combo.findData(normalize_theme_style(theme_style))
+        self.theme_combo.addItem("JVVV (default)", CUSTOM_THEME)
+        self.theme_combo.addItem("Adobe", ADOBE_THEME)
+        self.theme_combo.addItem("VS Code", VSCODE_THEME)
+        self.theme_combo.addItem("Fusion (Qt default)", FUSION_THEME)
+        normalized_theme_style = normalize_theme_style(theme_style)
+        theme_index = self.theme_combo.findData(normalized_theme_style)
         self.theme_combo.setCurrentIndex(max(0, theme_index))
+        self._last_theme_style = normalized_theme_style
 
         self.color_mode_combo = QComboBox()
         self.color_mode_combo.addItem("Dark", DARK_MODE)
@@ -1591,7 +1598,7 @@ class PreferencesDialog(QDialog):
         self.reset_theme_button.clicked.connect(self.reset_theme)
         appearance_form.addRow("", self.reset_theme_button)
 
-        self.theme_combo.currentIndexChanged.connect(self.emit_appearance_changed)
+        self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
         self.color_mode_combo.currentIndexChanged.connect(self.emit_appearance_changed)
 
         buttons = QDialogButtonBox(
@@ -1640,7 +1647,16 @@ class PreferencesDialog(QDialog):
         self.theme_combo.blockSignals(theme_was_blocked)
         self.color_mode_combo.blockSignals(mode_was_blocked)
         self._accent_color = DEFAULT_ACCENT_COLOR
+        self._last_theme_style = DEFAULT_THEME_STYLE
         self.update_accent_button()
+        self.emit_appearance_changed()
+
+    def on_theme_changed(self, *_args: object) -> None:
+        theme_style = self.theme_style()
+        if theme_style != self._last_theme_style:
+            self._last_theme_style = theme_style
+            self._accent_color = theme_default_accent(theme_style)
+            self.update_accent_button()
         self.emit_appearance_changed()
 
     def emit_appearance_changed(self, *_args: object) -> None:
