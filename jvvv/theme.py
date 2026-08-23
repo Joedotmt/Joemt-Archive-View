@@ -6,21 +6,16 @@ from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 
-CUSTOM_THEME = "custom"
 FUSION_THEME = "fusion"
 ADOBE_THEME = "adobe"
-VSCODE_THEME = "vscode"
 LIGHT_MODE = "light"
 DARK_MODE = "dark"
-DEFAULT_THEME_STYLE = CUSTOM_THEME
+DEFAULT_THEME_STYLE = ADOBE_THEME
 DEFAULT_COLOR_MODE = DARK_MODE
-DEFAULT_ACCENT_COLOR = "#2f9e63"
 ADOBE_ACCENT_COLOR = "#5681ff"
-VSCODE_ACCENT_COLOR = "#0078d4"
+DEFAULT_ACCENT_COLOR = ADOBE_ACCENT_COLOR
 
-THEME_STYLES = frozenset(
-    {CUSTOM_THEME, FUSION_THEME, ADOBE_THEME, VSCODE_THEME}
-)
+THEME_STYLES = frozenset({ADOBE_THEME, FUSION_THEME})
 
 
 # A compact, neutral dark theme inspired by Blender's workspace chrome and
@@ -386,10 +381,9 @@ QToolTip {
 """
 
 
-# Adobe and VS Code both use flat, layered workspaces, but with different
-# surface ramps and control proportions. This template keeps the app-specific
-# widget coverage in one place while the token sets below preserve each
-# product's recognizable chrome.
+# The default Adobe theme uses flat, layered workspace surfaces. This template
+# keeps the app-specific widget coverage separate from its light and dark token
+# sets.
 PRESET_STYLESHEET = """
 QWidget {
     color: __FOREGROUND__;
@@ -797,8 +791,6 @@ def theme_default_accent(theme_style: str | None) -> str:
     theme_style = normalize_theme_style(theme_style)
     if theme_style == ADOBE_THEME:
         return ADOBE_ACCENT_COLOR
-    if theme_style == VSCODE_THEME:
-        return VSCODE_ACCENT_COLOR
     return DEFAULT_ACCENT_COLOR
 
 
@@ -892,89 +884,6 @@ def _preset_theme_tokens(
             }
         selection = accent.name()
         selection_text = contrasting_text_color(accent)
-    elif theme_style == VSCODE_THEME:
-        # These values mirror VS Code's built-in Light Modern and Dark Modern
-        # workbench themes, including the distinct side-bar and editor layers.
-        if color_mode == LIGHT_MODE:
-            tokens = {
-                "FOREGROUND": "#3b3b3b",
-                "STRONG_TEXT": "#1f1f1f",
-                "MUTED": "#616161",
-                "WINDOW": "#ffffff",
-                "CHROME": "#f8f8f8",
-                "MENU": "#ffffff",
-                "SURFACE": "#f8f8f8",
-                "BASE": "#ffffff",
-                "ALTERNATE": "#fafafa",
-                "SIDEBAR": "#f8f8f8",
-                "FIELD": "#ffffff",
-                "BUTTON": "#e5e5e5",
-                "BUTTON_HOVER": "#cccccc",
-                "BUTTON_PRESSED": "#bdbdbd",
-                "DISABLED_BACKGROUND": "#f2f2f2",
-                "DISABLED_TEXT": "#868686",
-                "BORDER": "#e5e5e5",
-                "CONTROL_BORDER": "#cecece",
-                "CONTROL_HOVER_BORDER": "#8b949e",
-                "HEADER": "#f8f8f8",
-                "HOVER": "#f2f2f2",
-                "LIST_HOVER": "#f2f2f2",
-                "TAB_INACTIVE": "#f8f8f8",
-                "TAB_HOVER": "#ffffff",
-                "TAB_ACTIVE": "#ffffff",
-                "SPLITTER": "#e5e5e5",
-                "PROGRESS_BACKGROUND": "#e5e5e5",
-                "SCROLL_TRACK": "#ffffff",
-                "SCROLL_HANDLE": "#c1c1c1",
-                "SCROLL_HANDLE_HOVER": "#a8a8a8",
-                "TOOLTIP": "#f8f8f8",
-                "WARNING_TEXT": "#895503",
-                "WARNING_BACKGROUND": "#fff4ce",
-                "WARNING_BORDER": "#d6b656",
-                "RADIUS": "2",
-            }
-            selection = "#e8e8e8"
-            selection_text = "#000000"
-        else:
-            tokens = {
-                "FOREGROUND": "#cccccc",
-                "STRONG_TEXT": "#ffffff",
-                "MUTED": "#9d9d9d",
-                "WINDOW": "#1f1f1f",
-                "CHROME": "#181818",
-                "MENU": "#1f1f1f",
-                "SURFACE": "#181818",
-                "BASE": "#1f1f1f",
-                "ALTERNATE": "#232323",
-                "SIDEBAR": "#181818",
-                "FIELD": "#313131",
-                "BUTTON": "#313131",
-                "BUTTON_HOVER": "#2b2b2b",
-                "BUTTON_PRESSED": "#3c3c3c",
-                "DISABLED_BACKGROUND": "#202020",
-                "DISABLED_TEXT": "#868686",
-                "BORDER": "#2b2b2b",
-                "CONTROL_BORDER": "#3c3c3c",
-                "CONTROL_HOVER_BORDER": "#616161",
-                "HEADER": "#181818",
-                "HOVER": "#2b2b2b",
-                "LIST_HOVER": "#2a2d2e",
-                "TAB_INACTIVE": "#181818",
-                "TAB_HOVER": "#1f1f1f",
-                "TAB_ACTIVE": "#1f1f1f",
-                "SPLITTER": "#2b2b2b",
-                "PROGRESS_BACKGROUND": "#313131",
-                "SCROLL_TRACK": "#1f1f1f",
-                "SCROLL_HANDLE": "#424242",
-                "SCROLL_HANDLE_HOVER": "#4f4f4f",
-                "TOOLTIP": "#202020",
-                "WARNING_TEXT": "#e2c08d",
-                "WARNING_BACKGROUND": "#352a18",
-                "WARNING_BORDER": "#6a5126",
-                "RADIUS": "2",
-            }
-            selection = _blend(accent, QColor("#1f1f1f"), 0.45).name()
-            selection_text = "#ffffff"
     else:
         raise ValueError(f"{theme_style!r} is not a styled preset theme")
 
@@ -1001,7 +910,7 @@ def _preset_theme_tokens(
 
 def normalize_theme_style(theme_style: str | None) -> str:
     normalized = str(theme_style).strip().lower()
-    return normalized if normalized in THEME_STYLES else CUSTOM_THEME
+    return normalized if normalized in THEME_STYLES else DEFAULT_THEME_STYLE
 
 
 def normalize_color_mode(color_mode: str | None) -> str:
@@ -1100,7 +1009,7 @@ def preset_stylesheet(
     color_mode: str = DEFAULT_COLOR_MODE,
     accent_color: str = DEFAULT_ACCENT_COLOR,
 ) -> str:
-    """Return an Adobe- or VS Code-inspired stylesheet."""
+    """Return the Adobe-inspired default stylesheet."""
     tokens = _preset_theme_tokens(theme_style, color_mode, accent_color)
     stylesheet = PRESET_STYLESHEET
     for name, value in tokens.items():
@@ -1178,7 +1087,7 @@ def preset_palette(
     color_mode: str = DEFAULT_COLOR_MODE,
     accent_color: str = DEFAULT_ACCENT_COLOR,
 ) -> QPalette:
-    """Return the palette backing an Adobe or VS Code preset."""
+    """Return the palette backing the Adobe default theme."""
     tokens = _preset_theme_tokens(theme_style, color_mode, accent_color)
     palette = QPalette()
     colors = {
@@ -1262,7 +1171,7 @@ def apply_application_theme(
     color_mode: str = DEFAULT_COLOR_MODE,
     accent_color: str = DEFAULT_ACCENT_COLOR,
 ) -> None:
-    """Apply the selected theme, mode, accent, or custom-theme scale."""
+    """Apply the selected theme, mode, accent, or theme scale."""
     normalized_scale = round(max(0.1, float(scale)), 2)
     theme_style = normalize_theme_style(theme_style)
     color_mode = normalize_color_mode(color_mode)
@@ -1271,10 +1180,7 @@ def apply_application_theme(
 
     if app.property("jvvvThemeKey") != theme_key:
         app.setStyle("Fusion")
-        if theme_style == CUSTOM_THEME:
-            app.setPalette(application_palette(color_mode, accent_color))
-            app.setStyleSheet(application_stylesheet(normalized_scale, color_mode, accent_color))
-        elif theme_style == FUSION_THEME:
+        if theme_style == FUSION_THEME:
             app.setStyleSheet("")
             app.setPalette(fusion_palette(app, color_mode, accent_color))
         else:
@@ -1293,9 +1199,7 @@ def apply_application_theme(
 
     if app.property("jvvvThemeScale") == normalized_scale:
         return
-    if theme_style == CUSTOM_THEME:
-        app.setStyleSheet(application_stylesheet(normalized_scale, color_mode, accent_color))
-    elif theme_style != FUSION_THEME:
+    if theme_style != FUSION_THEME:
         app.setStyleSheet(
             preset_stylesheet(
                 theme_style,

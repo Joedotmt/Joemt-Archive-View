@@ -5,13 +5,10 @@ from PySide6.QtGui import QColor, QPalette
 from jvvv.theme import (
     ADOBE_ACCENT_COLOR,
     ADOBE_THEME,
-    CUSTOM_THEME,
     DARK_MODE,
     DEFAULT_ACCENT_COLOR,
     FUSION_THEME,
     LIGHT_MODE,
-    VSCODE_ACCENT_COLOR,
-    VSCODE_THEME,
     application_palette,
     application_stylesheet,
     contrasting_text_color,
@@ -27,8 +24,9 @@ from jvvv.theme import (
 def test_theme_preferences_are_normalized_to_safe_defaults():
     assert normalize_theme_style(FUSION_THEME) == FUSION_THEME
     assert normalize_theme_style(" Adobe ") == ADOBE_THEME
-    assert normalize_theme_style("VSCode") == VSCODE_THEME
-    assert normalize_theme_style("unknown") == CUSTOM_THEME
+    assert normalize_theme_style("custom") == ADOBE_THEME
+    assert normalize_theme_style("VSCode") == ADOBE_THEME
+    assert normalize_theme_style("unknown") == ADOBE_THEME
     assert normalize_color_mode(LIGHT_MODE) == LIGHT_MODE
     assert normalize_color_mode("unknown") == DARK_MODE
     assert normalize_accent_color("not-a-color") == DEFAULT_ACCENT_COLOR
@@ -37,7 +35,6 @@ def test_theme_preferences_are_normalized_to_safe_defaults():
 
 def test_preset_themes_have_recognizable_default_accents():
     assert theme_default_accent(ADOBE_THEME) == ADOBE_ACCENT_COLOR
-    assert theme_default_accent(VSCODE_THEME) == VSCODE_ACCENT_COLOR
     assert theme_default_accent(FUSION_THEME) == DEFAULT_ACCENT_COLOR
 
 
@@ -51,26 +48,11 @@ def test_adobe_stylesheet_uses_spectrum_workspace_layers():
     assert "__WINDOW__" not in stylesheet
 
 
-def test_vscode_stylesheet_matches_modern_workbench_colors_and_scales():
-    dark = preset_stylesheet(VSCODE_THEME, 1.5, DARK_MODE, VSCODE_ACCENT_COLOR)
-    light = preset_stylesheet(VSCODE_THEME, 1.0, LIGHT_MODE, "#005fb8")
-
-    assert "background-color: #181818" in dark
-    assert "background-color: #1f1f1f" in dark
-    assert "background-color: #313131" in dark
-    assert "border-top: 3px solid #0078d4" in dark
-    assert "selection-background-color: #e8e8e8" in light
-    assert "__ACCENT__" not in dark
-
-
 def test_preset_palettes_preserve_theme_surface_hierarchy():
     adobe = preset_palette(ADOBE_THEME, DARK_MODE, ADOBE_ACCENT_COLOR)
-    vscode = preset_palette(VSCODE_THEME, LIGHT_MODE, "#005fb8")
 
     assert adobe.color(QPalette.ColorRole.Window) == QColor("#1b1b1b")
     assert adobe.color(QPalette.ColorRole.Base) == QColor("#1b1b1b")
-    assert vscode.color(QPalette.ColorRole.Window) == QColor("#ffffff")
-    assert vscode.color(QPalette.ColorRole.Highlight) == QColor("#e8e8e8")
 
 
 def test_custom_stylesheet_applies_light_mode_accent_and_scale():

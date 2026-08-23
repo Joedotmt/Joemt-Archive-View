@@ -28,7 +28,6 @@ from jvvv.database import CatalogueError, create_catalogue
 from jvvv.theme import (
     ADOBE_ACCENT_COLOR,
     ADOBE_THEME,
-    CUSTOM_THEME,
     DARK_MODE,
     DEFAULT_ACCENT_COLOR,
     DEFAULT_COLOR_MODE,
@@ -292,7 +291,7 @@ def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch
             return True
 
         def theme_style(self):
-            return CUSTOM_THEME
+            return ADOBE_THEME
 
         def color_mode(self):
             return DARK_MODE
@@ -321,7 +320,7 @@ def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch
     monkeypatch.setattr("jvvv.app.PreferencesDialog", FakePreferencesDialog)
     window = SimpleNamespace(
         search_include_paths=False,
-        theme_style=CUSTOM_THEME,
+        theme_style=ADOBE_THEME,
         color_mode=DARK_MODE,
         accent_color=DEFAULT_ACCENT_COLOR,
         ui_zoom=1.0,
@@ -337,7 +336,7 @@ def test_preferences_persist_path_search_and_refresh_current_results(monkeypatch
 
     assert window.search_include_paths is True
     assert ("setting", SEARCH_INCLUDE_PATHS_SETTING, True) in events
-    assert ("setting", THEME_STYLE_SETTING, CUSTOM_THEME) in events
+    assert ("setting", THEME_STYLE_SETTING, ADOBE_THEME) in events
     assert ("setting", COLOR_MODE_SETTING, DARK_MODE) in events
     assert ("setting", ACCENT_COLOR_SETTING, DEFAULT_ACCENT_COLOR) in events
     assert ("placeholder", "Search with paths") in events
@@ -383,7 +382,7 @@ def test_preferences_persist_appearance_choices(monkeypatch):
     monkeypatch.setattr("jvvv.app.PreferencesDialog", FakePreferencesDialog)
     window = SimpleNamespace(
         search_include_paths=False,
-        theme_style=CUSTOM_THEME,
+        theme_style=ADOBE_THEME,
         color_mode=DARK_MODE,
         accent_color=DEFAULT_ACCENT_COLOR,
         ui_zoom=1.0,
@@ -428,7 +427,7 @@ def test_preferences_preview_is_rolled_back_when_cancelled(monkeypatch):
     )
     window = SimpleNamespace(
         search_include_paths=False,
-        theme_style=CUSTOM_THEME,
+        theme_style=ADOBE_THEME,
         color_mode=DARK_MODE,
         accent_color=DEFAULT_ACCENT_COLOR,
     )
@@ -437,7 +436,7 @@ def test_preferences_preview_is_rolled_back_when_cancelled(monkeypatch):
 
     assert events == [
         ("appearance", FUSION_THEME, LIGHT_MODE, "#3366cc"),
-        ("appearance", CUSTOM_THEME, DARK_MODE, DEFAULT_ACCENT_COLOR),
+        ("appearance", ADOBE_THEME, DARK_MODE, DEFAULT_ACCENT_COLOR),
     ]
 
 
@@ -462,7 +461,7 @@ def test_reset_theme_restores_all_appearance_defaults():
             self.current_index = index
 
     dialog = SimpleNamespace(
-        theme_combo=FakeCombo([CUSTOM_THEME, FUSION_THEME], 1),
+        theme_combo=FakeCombo([ADOBE_THEME, FUSION_THEME], 1),
         color_mode_combo=FakeCombo([DARK_MODE, LIGHT_MODE], 1),
         _accent_color="#3366cc",
         update_accent_button=lambda: events.append("button"),
@@ -486,8 +485,8 @@ def test_reset_theme_restores_all_appearance_defaults():
 def test_switching_theme_selects_its_signature_accent():
     events = []
     dialog = SimpleNamespace(
-        _last_theme_style=CUSTOM_THEME,
-        _accent_color=DEFAULT_ACCENT_COLOR,
+        _last_theme_style=FUSION_THEME,
+        _accent_color="#3366cc",
         theme_style=lambda: ADOBE_THEME,
         update_accent_button=lambda: events.append("button"),
         emit_appearance_changed=lambda: events.append("preview"),

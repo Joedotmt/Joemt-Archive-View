@@ -95,14 +95,12 @@ from .database import (
 from .scanner import VolumeScanner
 from .theme import (
     ADOBE_THEME,
-    CUSTOM_THEME,
     DARK_MODE,
     DEFAULT_ACCENT_COLOR,
     DEFAULT_COLOR_MODE,
     DEFAULT_THEME_STYLE,
     FUSION_THEME,
     LIGHT_MODE,
-    VSCODE_THEME,
     apply_application_theme,
     contrasting_text_color,
     normalize_accent_color,
@@ -1564,10 +1562,8 @@ class PreferencesDialog(QDialog):
 
         appearance_group = QGroupBox("Appearance")
         self.theme_combo = QComboBox()
-        self.theme_combo.addItem("JVVV (default)", CUSTOM_THEME)
-        self.theme_combo.addItem("Adobe", ADOBE_THEME)
-        self.theme_combo.addItem("VS Code", VSCODE_THEME)
-        self.theme_combo.addItem("Fusion (Qt default)", FUSION_THEME)
+        self.theme_combo.addItem("Default", ADOBE_THEME)
+        self.theme_combo.addItem("Fusion (Qt)", FUSION_THEME)
         normalized_theme_style = normalize_theme_style(theme_style)
         theme_index = self.theme_combo.findData(normalized_theme_style)
         self.theme_combo.setCurrentIndex(max(0, theme_index))
@@ -1593,7 +1589,7 @@ class PreferencesDialog(QDialog):
         self.reset_theme_button = QPushButton("Reset Theme")
         self.reset_theme_button.setObjectName("resetThemeButton")
         self.reset_theme_button.setToolTip(
-            "Restore the custom dark theme and its original green accent"
+            "Restore the default Adobe dark theme and its blue accent"
         )
         self.reset_theme_button.clicked.connect(self.reset_theme)
         appearance_form.addRow("", self.reset_theme_button)
