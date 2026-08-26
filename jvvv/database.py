@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 CATALOGUE_EXTENSION = ".jvvv"
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
@@ -31,6 +31,15 @@ SQLITE_EXTENDED_ERROR_NAMES = {
     8714: "SQLITE_IOERR_IN_PAGE",
 }
 REQUIRED_TABLES = {
+    "backup_analysis_invalidations",
+    "backup_analysis_runs",
+    "backup_analysis_state",
+    "backup_analysis_volume_snapshots",
+    "backup_file_results",
+    "backup_folder_drive_matches",
+    "backup_folder_results",
+    "backup_mirror_candidates",
+    "backup_volume_results",
     "volumes",
     "volume_register",
     "folders",
@@ -41,6 +50,111 @@ REQUIRED_TABLES = {
     "scan_errors",
 }
 REQUIRED_COLUMNS = {
+    "backup_analysis_runs": {
+        "id",
+        "started_at",
+        "completed_at",
+        "status",
+        "rules_version",
+        "source_signature",
+        "files_analyzed",
+        "folders_analyzed",
+        "likely_files",
+        "possible_files",
+        "ambiguous_files",
+        "excluded_files",
+        "single_files",
+        "message",
+    },
+    "backup_analysis_state": {
+        "id",
+        "active_run_id",
+        "forced_stale",
+        "stale_reason",
+        "updated_at",
+    },
+    "backup_analysis_volume_snapshots": {
+        "run_id",
+        "volume_id",
+        "drive_id",
+        "last_scan_at",
+        "indexed_file_count",
+        "indexed_folder_count",
+    },
+    "backup_file_results": {
+        "run_id",
+        "file_id",
+        "volume_id",
+        "status",
+        "other_volume_ids",
+        "evidence_text",
+        "strong_volume_ids",
+        "possible_volume_ids",
+    },
+    "backup_folder_results": {
+        "run_id",
+        "folder_id",
+        "volume_id",
+        "status",
+        "other_volume_ids",
+        "evidence_text",
+        "best_target_volume_id",
+        "matched_files",
+        "total_files",
+        "matched_bytes",
+        "total_bytes",
+        "best_coverage_files_percent",
+        "best_coverage_bytes_percent",
+        "scattered",
+    },
+    "backup_folder_drive_matches": {
+        "run_id",
+        "folder_id",
+        "target_volume_id",
+        "status",
+        "matched_files",
+        "total_files",
+        "matched_bytes",
+        "total_bytes",
+        "evidence_text",
+    },
+    "backup_volume_results": {
+        "run_id",
+        "volume_id",
+        "status",
+        "health_status",
+        "coverage_eligible",
+        "total_files",
+        "total_bytes",
+        "coverage_files",
+        "coverage_bytes",
+        "likely_files",
+        "likely_bytes",
+        "possible_files",
+        "possible_bytes",
+        "ambiguous_files",
+        "ambiguous_bytes",
+        "excluded_files",
+        "excluded_bytes",
+        "single_files",
+        "single_bytes",
+        "likely_files_percent",
+        "likely_bytes_percent",
+        "latest_scan_status",
+        "latest_scan_errors",
+    },
+    "backup_mirror_candidates": {
+        "run_id",
+        "source_volume_id",
+        "target_volume_id",
+        "source_coverage_percent",
+        "target_coverage_percent",
+        "matched_files",
+        "complete_structure",
+        "evidence_text",
+        "manual_mirror_link",
+    },
+    "backup_analysis_invalidations": {"id", "volume_id", "reason", "created_at"},
     "volumes": {
         "id",
         "name",
@@ -446,6 +560,9 @@ class Database:
                 if version < 9:
                     self._apply_migration_9()
                     version = 9
+                if version < 10:
+                    self._apply_migration_10()
+                    version = 10
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
@@ -875,6 +992,22 @@ class Database:
         }
         for column, definition in scan_history_columns.items():
             self._add_column_if_missing("scan_history", column, definition)
+
+    def _apply_migration_10(self) -> None:
+        # Imported here to keep the core database module independent from the
+        # optional analysis implementation during normal module loading.
+        from .backup_analysis import ANALYSIS_SCHEMA_SQL
+
+        for statement in ANALYSIS_SCHEMA_SQL:
+            self.connection.execute(statement)
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO backup_analysis_state (
+                id, active_run_id, forced_stale, stale_reason, updated_at
+            ) VALUES (1, NULL, 0, '', ?)
+            """,
+            (utc_now(),),
+        )
 
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column not in self._column_names(table):

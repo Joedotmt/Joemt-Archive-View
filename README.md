@@ -23,6 +23,18 @@ component.
   last scan time, and scan logs.
 - Run scans on a Qt worker thread so the interface remains responsive.
 - Cancel scans and record inaccessible files/folders as scan errors.
+- Analyse saved catalogue metadata for evidence that files and folders also
+  exist on other registered drives, without reconnecting or rescanning those
+  drives.
+- Show explicit **Strong**, **Possible/Partial**, **None found**, and
+  **Unknown/Outdated** copy-evidence states with the matching drive IDs and the
+  exact metadata used for each conclusion.
+- Report per-volume other-copy coverage, potential whole-drive copies, and the
+  latest scan health. Successfully scanned empty drives are shown as
+  **Empty / N/A**, not as unprotected or unhealthy.
+- Keep expected protected Windows metadata warnings (such as
+  `System Volume Information`) visible in the scan report without treating
+  them as missing user content.
 
 ## Installation
 
@@ -57,6 +69,23 @@ is a valid SQLite database and contains the full catalogue.
 4. Browse the saved folder tree and file list after the scan completes.
 5. Use the search bar to search across all indexed volumes.
 6. Use **Scan** again to refresh an existing catalogue.
+
+Use **Catalogue > Backup Evidence** to compare records already stored in the
+catalogue. This analysis reads the `.jvvv` database only: it does not access
+source drives, read file contents, or calculate content checksums. A strong
+match is therefore strong metadata evidence of another copy, not byte-for-byte
+verification. Re-run the analysis when the application marks its results as
+outdated after catalogue contents change.
+
+The labels are deliberately conservative and explain their evidence in the
+interface. **Strong** file evidence requires the normalized filename, exact
+byte size, modified time, and parent path to agree on another drive.
+**Possible** means only normalized filename and exact size agree. A folder is
+**Complete** only when a bounded, same-named structure containing at least two
+content files matches on one other drive and both scan denominators are
+trustworthy. Renamed or partial structures remain Possible. Overly common or
+competing metadata is shown as **Too common** rather than being guessed, and
+known operating-system bookkeeping is excluded from coverage.
 
 While a scan is running, use **Cancel Scan** beside the progress bar to cancel
 it. Partial results are discarded, so the existing catalogue remains intact.

@@ -37,7 +37,15 @@ def test_database_initializes_schema(tmp_path):
         }
         assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
         assert "volume_register" in tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert {
+            "backup_analysis_runs",
+            "backup_analysis_state",
+            "backup_file_results",
+            "backup_folder_results",
+            "backup_volume_results",
+            "backup_mirror_candidates",
+        } <= tables
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert {"files_fts", "folders_fts"} <= tables
         folder_indexes = {
             row["name"]
@@ -748,7 +756,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 10
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
@@ -826,7 +834,7 @@ def test_version_7_search_index_migrates_to_column_detail(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 10
         definitions = {
             row["name"]: row["sql"]
             for row in migrated.connection.execute(

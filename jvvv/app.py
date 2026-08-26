@@ -67,6 +67,8 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStackedWidget,
     QTableView,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextBrowser,
     QToolButton,
@@ -77,6 +79,13 @@ from PySide6.QtWidgets import (
 )
 
 from .config import APP_NAME
+from .backup_analysis import (
+    AnalysisState,
+    BackupAnalysisEngine,
+    ItemBackupStatus,
+    MirrorCandidate,
+    VolumeBackupSummary,
+)
 from .database import (
     ARCHIVE_STATUSES,
     CATALOGUE_EXTENSION,
@@ -242,6 +251,8 @@ class TableColumn:
     sort_key: Callable[[Any], Any] | None = None
     alignment: Qt.AlignmentFlag | None = None
     decoration: Callable[[Any], QIcon | None] | None = None
+    tooltip: Callable[[Any], str | None] | None = None
+    header_tooltip: str | None = None
 
 
 class StandardTableModel(QAbstractTableModel):
@@ -266,6 +277,8 @@ class StandardTableModel(QAbstractTableModel):
     ) -> Any:  # type: ignore[override]
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
             return self.columns[section].title
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.ToolTipRole:
+            return self.columns[section].header_tooltip
         return None
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:  # type: ignore[override]
@@ -283,6 +296,9 @@ class StandardTableModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.TextAlignmentRole and column.alignment is not None:
             return column.alignment | Qt.AlignmentFlag.AlignVCenter
+
+        if role == Qt.ItemDataRole.ToolTipRole and column.tooltip is not None:
+            return column.tooltip(item)
 
         return self.role_value(item, role)
 
@@ -373,6 +389,530 @@ OFFICE_EXTENSIONS = {
 ARCHIVE_EXTENSIONS = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"}
 EXECUTABLE_EXTENSIONS = {"exe", "msi", "app", "bat", "cmd", "com", "sh", "run", "deb", "rpm", "dmg"}
 
+BACKUP_METADATA_DISCLAIMER = (
+    "Saved catalogue metadata only; drives and file contents were not read, "
+    "and no checksum verification was performed."
+)
+BACKUP_COLUMN_HEADER_TOOLTIP = (
+    "Evidence that another catalogue volume contains the same item.\n"
+    "Green: strong metadata match. Amber: possible or partial match. "
+    "Red: none found. Grey: not analysed, outdated, or unknown.\n\n"
+    f"{BACKUP_METADATA_DISCLAIMER}"
+)
+BACKUP_FILTER_OPTIONS = (
+    ("All items", "all"),
+    ("Needs attention", "attention"),
+    ("No other copy found", "none"),
+    ("Possible or partial", "possible"),
+    ("Strong or complete", "strong"),
+    ("Unknown / not analysed", "unknown"),
+)
+
+
+def object_value(value: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a dataclass, mapping, or sqlite row."""
+    if value is None:
+        return default
+    if hasattr(value, name):
+        return getattr(value, name)
+    try:
+        return value[name]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def first_object_value(value: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        candidate = object_value(value, name, None)
+        if candidate is not None:
+            return candidate
+    return default
+
+
+def enum_value(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().casefold().replace("-", "_").replace(" ", "_")
+
+
+@dataclass(frozen=True)
+class BackupDisplay:
+    state: str
+    text: str
+    tooltip: str
+    sort_rank: int
+
+
+NOT_ANALYSED_BACKUP_DISPLAY = BackupDisplay(
+    state="unknown",
+    text="Not analysed",
+    tooltip=(
+        "Backup evidence has not been analysed for this catalogue.\n\n"
+        f"{BACKUP_METADATA_DISCLAIMER}"
+    ),
+    sort_rank=2,
+)
+
+
+def plural_other_drives(count: int) -> str:
+    return f"{count} other drive" + ("" if count == 1 else "s")
+
+
+def backup_drive_references(
+    volume_ids: Any,
+    volume_references: dict[int, str],
+) -> list[str]:
+    references = []
+    for raw_volume_id in volume_ids or ():
+        try:
+            volume_id = int(raw_volume_id)
+        except (TypeError, ValueError):
+            continue
+        references.append(volume_references.get(volume_id, f"Volume {volume_id}"))
+    return references
+
+
+def summarized_backup_drive_references(references: list[str], limit: int = 5) -> str:
+    shown = references[:limit]
+    remaining = len(references) - len(shown)
+    suffix = f" (+{remaining} more)" if remaining else ""
+    return f"{', '.join(shown)}{suffix}"
+
+
+def backup_evidence_label(label: str, stale: bool) -> str:
+    if not stale:
+        return label
+    return f"Last-analysed {label[:1].lower()}{label[1:]}"
+
+
+def item_backup_display(
+    status: Any,
+    volume_references: dict[int, str] | None = None,
+    *,
+    item_type: str | None = None,
+) -> BackupDisplay:
+    if status is None:
+        return NOT_ANALYSED_BACKUP_DISPLAY
+
+    references = volume_references or {}
+    stale = bool(object_value(status, "is_stale", False))
+    stale_reason = str(object_value(status, "stale_reason", "") or "").strip()
+    raw_state = enum_value(object_value(status, "status", "unknown"))
+    resolved_type = item_type or str(object_value(status, "item_type", "") or "")
+    other_ids = object_value(status, "other_volume_ids", ()) or ()
+    other_count = int(object_value(status, "other_drive_count", len(other_ids)) or 0)
+    drive_refs = backup_drive_references(other_ids, references)
+    strong_ids = object_value(status, "strong_volume_ids", None)
+    possible_ids = object_value(status, "possible_volume_ids", None)
+    has_target_breakdown = strong_ids is not None or possible_ids is not None
+    strong_refs = backup_drive_references(strong_ids or (), references)
+    possible_refs = backup_drive_references(possible_ids or (), references)
+    evidence = str(object_value(status, "evidence_text", "") or "").strip()
+    analysed_at = object_value(status, "analysed_at")
+
+    if stale:
+        lines = [
+            "The saved backup analysis is out of date for this item.",
+            stale_reason or "The catalogue changed after this item was analysed.",
+        ]
+        state = "unknown"
+        text = "Outdated"
+        rank = 2
+    elif raw_state == "empty":
+        state = "unknown"
+        text = "N/A · empty"
+        rank = 2
+        lines = [
+            "This folder contains no indexed files, so other-copy coverage is not applicable."
+        ]
+    elif raw_state == "excluded":
+        state = "unknown"
+        text = "N/A · system metadata"
+        rank = 2
+        lines = [
+            "Known operating-system bookkeeping is deliberately excluded from copy coverage."
+        ]
+    elif raw_state == "ambiguous":
+        state = "unknown"
+        text = "Too common"
+        rank = 2
+        lines = [
+            (
+                "This folder structure occurs too often to identify a useful copy."
+                if resolved_type == "folder"
+                else "This filename-and-size combination is too common to identify a useful copy."
+            )
+        ]
+    elif raw_state in {"strong", "complete", "likely", "matched"}:
+        state = "strong"
+        complete_count = (
+            len(strong_ids or ())
+            if has_target_breakdown
+            else other_count
+        )
+        text = (
+            f"Complete · {plural_other_drives(complete_count)}"
+            if resolved_type == "folder"
+            else f"Strong · {plural_other_drives(complete_count)}"
+        )
+        rank = 3
+        lines = [
+            "Complete structural metadata match on another drive."
+            if resolved_type == "folder"
+            else "Strong file metadata match on another drive."
+        ]
+    elif raw_state in {"possible", "partial", "probable", "scattered"}:
+        state = "possible"
+        files_percent = object_value(status, "best_coverage_files_percent")
+        bytes_percent = object_value(status, "best_coverage_bytes_percent")
+        if resolved_type == "folder" and (
+            files_percent is not None or bytes_percent is not None
+        ):
+            parts = []
+            if files_percent is not None:
+                parts.append(f"{float(files_percent):.0f}% files")
+            if bytes_percent is not None:
+                parts.append(f"{float(bytes_percent):.0f}% data")
+            text = "Possible · " + " · ".join(parts)
+        else:
+            text = f"Possible · {plural_other_drives(other_count)}"
+        rank = 1
+        lines = [
+            "This folder has possible or partial metadata evidence on another drive."
+            if resolved_type == "folder"
+            else "A possible metadata match is recorded on another drive."
+        ]
+        if bool(object_value(status, "scattered", False)):
+            lines.append(
+                "Matching files are spread across drives; no single drive has a complete folder copy."
+            )
+        best_target_id = object_value(status, "best_target_volume_id")
+        if best_target_id is not None:
+            try:
+                best_target = references.get(
+                    int(best_target_id), f"Volume {int(best_target_id)}"
+                )
+                lines.append(f"Best single matching drive: {best_target}.")
+            except (TypeError, ValueError):
+                pass
+        if files_percent is not None:
+            lines.append(f"Best single-drive file coverage: {float(files_percent):.0f}%.")
+        if bytes_percent is not None:
+            lines.append(f"Best single-drive byte coverage: {float(bytes_percent):.0f}%.")
+    elif raw_state in {"none", "no_match", "unprotected", "single", "single_copy"}:
+        state = "none"
+        text = "None found"
+        rank = 0
+        lines = [
+            "No matching copy was found on another volume in this catalogue."
+        ]
+    else:
+        state = "unknown"
+        text = (
+            "Not analysed"
+            if raw_state in {"not_analysed", "not_analyzed", ""}
+            or (raw_state == "unknown" and analysed_at is None)
+            else "Unknown"
+        )
+        rank = 2
+        lines = [
+            stale_reason
+            or "There is not enough current catalogue information to assess another copy."
+        ]
+
+    if has_target_breakdown:
+        if resolved_type == "folder":
+            if strong_refs:
+                lines.append(
+                    f"{backup_evidence_label('Complete structure drives', stale)}: "
+                    f"{summarized_backup_drive_references(strong_refs)}."
+                )
+            if possible_refs:
+                lines.append(
+                    f"{backup_evidence_label('Possible or partial drives', stale)}: "
+                    f"{summarized_backup_drive_references(possible_refs)}."
+                )
+        else:
+            if strong_refs:
+                lines.append(
+                    f"{backup_evidence_label('Strong match drives', stale)}: "
+                    f"{summarized_backup_drive_references(strong_refs)}."
+                )
+            if possible_refs:
+                lines.append(
+                    f"{backup_evidence_label('Possible-only drives', stale)}: "
+                    f"{summarized_backup_drive_references(possible_refs)}."
+                )
+    elif drive_refs:
+        lines.append(
+            f"{backup_evidence_label('Other catalogue drives', stale)}: "
+            f"{summarized_backup_drive_references(drive_refs)}."
+        )
+    if evidence:
+        evidence_label = "Last-analysed evidence" if stale else "Evidence"
+        lines.append(f"{evidence_label}: {evidence}")
+    if analysed_at:
+        lines.append(f"Analysed: {display_db_time(str(analysed_at))}.")
+    lines.extend(["", BACKUP_METADATA_DISCLAIMER])
+    return BackupDisplay(state, text, "\n".join(lines), rank)
+
+
+def backup_filter_matches(display: BackupDisplay, filter_key: str) -> bool:
+    if filter_key == "all":
+        return True
+    if display.text.startswith("N/A"):
+        return False
+    if filter_key == "attention":
+        return display.state != "strong"
+    if filter_key == "possible":
+        return display.state == "possible"
+    if filter_key == "strong":
+        return display.state == "strong"
+    if filter_key == "none":
+        return display.state == "none"
+    if filter_key == "unknown":
+        return display.state == "unknown"
+    return True
+
+
+def volume_backup_display(
+    summary: Any,
+    indexed_file_count: int,
+    scan_record: Any = None,
+    analysis_state: Any = None,
+) -> BackupDisplay:
+    current_scan_health = enum_value(
+        first_object_value(scan_record, "health_status", default="")
+    )
+    analysed_health = enum_value(
+        first_object_value(summary, "health_status", "scan_health", default="")
+    )
+    # The report row belongs to the last backup-analysis run, while scan_record
+    # describes the catalogue now.  An empty drive's label must follow the live
+    # scan record so it cannot repeat an obsolete clean/error classification.
+    health = current_scan_health or analysed_health
+    if indexed_file_count == 0 and health in {"empty", "healthy_empty", "completed_empty"}:
+        return BackupDisplay(
+            "unknown",
+            "N/A · empty",
+            "The last applied scan found no user-content access errors and the catalogue "
+            "contains no files. Protected system-metadata warnings, if any, remain in "
+            "the scan report. Empty drives are excluded from other-copy coverage.\n\n"
+            f"{BACKUP_METADATA_DISCLAIMER}",
+            2,
+        )
+    if indexed_file_count == 0 and health in {
+        "unknown",
+        "check_scan",
+        "completed_with_errors",
+        "scan_errors",
+        "incomplete",
+    }:
+        return BackupDisplay(
+            "unknown",
+            "Check scan",
+            "The applied scan recorded access errors or incomplete information, so this "
+            "cannot be treated as a confirmed empty drive.\n\n"
+            f"{BACKUP_METADATA_DISCLAIMER}",
+            2,
+        )
+    if indexed_file_count == 0 and health in {"not_scanned", "no_applied_scan"}:
+        return BackupDisplay(
+            "unknown",
+            "Not scanned",
+            "No successfully applied scan establishes whether this drive is empty.\n\n"
+            f"{BACKUP_METADATA_DISCLAIMER}",
+            2,
+        )
+    latest_status = enum_value(
+        first_object_value(scan_record, "latest_attempt_status", "status", default="")
+    )
+    latest_errors = int(
+        first_object_value(
+            scan_record,
+            "latest_attempt_errors",
+            "errors_count",
+            "access_errors",
+            default=0,
+        )
+        or 0
+    )
+    latest_ignored_errors = int(
+        object_value(scan_record, "latest_attempt_ignored_errors", 0) or 0
+    )
+    actionable_latest_errors = max(0, latest_errors - latest_ignored_errors)
+    if indexed_file_count == 0 and latest_status == "completed" and actionable_latest_errors > 0:
+        return BackupDisplay(
+            "unknown",
+            "Check scan",
+            "The completed scan recorded access errors, so an empty catalogue cannot be "
+            f"treated as a confirmed empty drive.\n\n{BACKUP_METADATA_DISCLAIMER}",
+            2,
+        )
+    if indexed_file_count == 0 and latest_status == "completed":
+        return BackupDisplay(
+            "unknown",
+            "N/A · empty",
+            "The last applied scan completed and the catalogue contains no files. "
+            "Empty drives are excluded from other-copy coverage.\n\n"
+            f"{BACKUP_METADATA_DISCLAIMER}",
+            2,
+        )
+    if summary is None:
+        return NOT_ANALYSED_BACKUP_DISPLAY
+    if bool(object_value(summary, "is_stale", False)) or bool(
+        object_value(analysis_state, "is_stale", False)
+    ):
+        reason = str(
+            object_value(summary, "stale_reason", "")
+            or object_value(analysis_state, "stale_reason", "")
+            or ""
+        )
+        return BackupDisplay(
+            "unknown",
+            "Outdated",
+            (reason or "The catalogue changed after this volume was analysed.")
+            + f"\n\n{BACKUP_METADATA_DISCLAIMER}",
+            2,
+        )
+
+    summary_status = enum_value(object_value(summary, "status", ""))
+    excluded_files = int(object_value(summary, "excluded_files", 0) or 0)
+    coverage_files = int(
+        object_value(
+            summary,
+            "coverage_files",
+            max(0, indexed_file_count - excluded_files),
+        )
+        or 0
+    )
+    if summary_status == "excluded" or (
+        indexed_file_count > 0 and coverage_files == 0 and excluded_files > 0
+    ):
+        return BackupDisplay(
+            "unknown",
+            "N/A · system metadata",
+            (
+                f"All {excluded_files:,} indexed files are known operating-system "
+                "bookkeeping and are excluded from copy coverage.\n\n"
+                f"{BACKUP_METADATA_DISCLAIMER}"
+            ),
+            2,
+        )
+
+    coverage_eligible = bool(object_value(summary, "coverage_eligible", True))
+    if indexed_file_count > 0 and not coverage_eligible:
+        if health in {"not_scanned", "no_applied_scan"}:
+            text = "Not scanned"
+            reason = "No successfully applied scan provides a trustworthy coverage denominator."
+        else:
+            text = "Check scan"
+            reason = (
+                "The latest scan record is incomplete or contains access errors, so "
+                "other-copy percentages are withheld."
+            )
+        return BackupDisplay(
+            "unknown",
+            text,
+            f"{reason}\n\n{BACKUP_METADATA_DISCLAIMER}",
+            2,
+        )
+
+    total_files = int(
+        first_object_value(summary, "total_files", "indexed_files", "file_count", default=indexed_file_count)
+        or 0
+    )
+    strong_files = int(
+        first_object_value(
+            summary,
+            "likely_files",
+            "strong_files",
+            "matched_files",
+            "protected_files",
+            default=0,
+        )
+        or 0
+    )
+    total_bytes = int(first_object_value(summary, "total_bytes", "indexed_bytes", default=0) or 0)
+    strong_bytes = int(
+        first_object_value(
+            summary,
+            "likely_bytes",
+            "strong_bytes",
+            "matched_bytes",
+            "protected_bytes",
+            default=0,
+        )
+        or 0
+    )
+    files_percent = first_object_value(
+        summary,
+        "likely_files_percent",
+        "strong_files_percent",
+        "file_coverage_percent",
+        "coverage_files_percent",
+    )
+    bytes_percent = first_object_value(
+        summary,
+        "likely_bytes_percent",
+        "strong_bytes_percent",
+        "byte_coverage_percent",
+        "coverage_bytes_percent",
+    )
+    coverage_bytes = int(
+        object_value(summary, "coverage_bytes", max(0, total_bytes)) or 0
+    )
+    if files_percent is None and coverage_files:
+        files_percent = strong_files * 100.0 / coverage_files
+    if bytes_percent is None and coverage_bytes:
+        bytes_percent = strong_bytes * 100.0 / coverage_bytes
+    if files_percent is None:
+        return NOT_ANALYSED_BACKUP_DISPLAY
+
+    files_value = float(files_percent)
+    bytes_value = float(bytes_percent) if bytes_percent is not None else None
+    if summary_status in {"likely", "strong", "complete"}:
+        state, rank = "strong", 3
+    elif summary_status in {"possible", "partial"}:
+        state, rank = "possible", 1
+    elif summary_status in {"single", "none", "no_match"}:
+        state, rank = "none", 0
+    elif summary_status in {"ambiguous", "unknown"}:
+        state, rank = "unknown", 2
+    elif files_value >= 100 and (bytes_value is None or bytes_value >= 100):
+        state, rank = "strong", 3
+    elif files_value > 0 or (bytes_value is not None and bytes_value > 0):
+        state, rank = "possible", 1
+    else:
+        state, rank = "none", 0
+    possible_files = int(object_value(summary, "possible_files", 0) or 0)
+    ambiguous_files = int(object_value(summary, "ambiguous_files", 0) or 0)
+    if state == "unknown" and ambiguous_files:
+        text = f"Too common · {ambiguous_files:,} files"
+    elif state == "possible" and files_value <= 0 and possible_files:
+        text = f"Possible · {possible_files:,} files"
+    else:
+        text = f"{files_value:.0f}% files"
+        if bytes_value is not None:
+            text += f" · {bytes_value:.0f}% data"
+    tooltip = (
+        f"Strong metadata matches on another drive: {strong_files:,} of "
+        f"{coverage_files:,} coverage-eligible files"
+    )
+    if coverage_bytes:
+        tooltip += f", {format_size(strong_bytes)} of {format_size(coverage_bytes)}"
+    if possible_files:
+        tooltip += f". Possible-only matches not counted as coverage: {possible_files:,} files"
+    if ambiguous_files:
+        tooltip += f". Too-common metadata excluded from matching: {ambiguous_files:,} files"
+    if excluded_files:
+        tooltip += f". Operating-system metadata excluded: {excluded_files:,} files"
+    tooltip += (
+        ". Coverage is aggregated across all other drives; 100% here does not by "
+        "itself prove that one complete mirror drive exists"
+    )
+    tooltip += f".\n\n{BACKUP_METADATA_DISCLAIMER}"
+    return BackupDisplay(state, text, tooltip, rank)
+
 
 def file_type_label(extension: str) -> str:
     ext = extension.lower().lstrip(".")
@@ -431,6 +971,7 @@ class BrowserItem:
     missing: bool = False
     parent_id: int | None = None
     is_parent_entry: bool = False
+    backup: BackupDisplay = NOT_ANALYSED_BACKUP_DISPLAY
 
     @property
     def is_folder(self) -> bool:
@@ -526,6 +1067,34 @@ class CatalogueIconProvider:
         return icon
 
 
+class BackupStatusIconProvider:
+    COLORS = {
+        "strong": "#2e9b4b",
+        "possible": "#d18a00",
+        "none": "#cf3f3f",
+        "unknown": "#7b8794",
+    }
+
+    def __init__(self) -> None:
+        self.cache: dict[str, QIcon] = {}
+
+    def icon_for(self, display: BackupDisplay) -> QIcon:
+        state = display.state if display.state in self.COLORS else "unknown"
+        if state in self.cache:
+            return self.cache[state]
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#39424c"))
+        painter.setBrush(QColor(self.COLORS[state]))
+        painter.drawEllipse(QRectF(3, 3, 10, 10))
+        painter.end()
+        icon = QIcon(pixmap)
+        self.cache[state] = icon
+        return icon
+
+
 @dataclass(frozen=True)
 class VolumeItem:
     id: int
@@ -553,9 +1122,16 @@ class VolumeItem:
     last_scan_at: str | None
     connected: bool
     percent_full: int
+    backup: BackupDisplay = NOT_ANALYSED_BACKUP_DISPLAY
 
 
-def volume_item_from_record(volume: Any, connected: bool) -> VolumeItem:
+def volume_item_from_record(
+    volume: Any,
+    connected: bool,
+    backup_summary: Any = None,
+    scan_record: Any = None,
+    analysis_state: Any = None,
+) -> VolumeItem:
     return VolumeItem(
         id=volume["id"],
         drive_id=volume["drive_id"] or "",
@@ -582,6 +1158,12 @@ def volume_item_from_record(volume: Any, connected: bool) -> VolumeItem:
         last_scan_at=volume["last_scan_at"],
         connected=connected,
         percent_full=percentage_full(volume["used_bytes"], volume["capacity_bytes"]),
+        backup=volume_backup_display(
+            backup_summary,
+            int(volume["indexed_file_count"] or 0),
+            scan_record,
+            analysis_state,
+        ),
     )
 
 
@@ -599,6 +1181,7 @@ class SearchResultItem:
     missing: bool
     source_path: str
     connected: bool
+    backup: BackupDisplay = NOT_ANALYSED_BACKUP_DISPLAY
 
     @property
     def is_folder(self) -> bool:
@@ -606,11 +1189,27 @@ class SearchResultItem:
 
 
 class BrowserTableModel(StandardTableModel):
-    def __init__(self, icons: CatalogueIconProvider, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        icons: CatalogueIconProvider,
+        parent: QObject | None = None,
+        backup_icons: BackupStatusIconProvider | None = None,
+    ) -> None:
         self.icons = icons
+        self.backup_icons = backup_icons or BackupStatusIconProvider()
         super().__init__(
             [
                 TableColumn("Name", lambda item: item.name, decoration=self.icons.icon_for),
+                TableColumn(
+                    "Other copies",
+                    lambda item: "N/A" if item.is_parent_entry else item.backup.text,
+                    sort_key=lambda item: item.backup.sort_rank,
+                    decoration=lambda item: None
+                    if item.is_parent_entry
+                    else self.backup_icons.icon_for(item.backup),
+                    tooltip=lambda item: None if item.is_parent_entry else item.backup.tooltip,
+                    header_tooltip=BACKUP_COLUMN_HEADER_TOOLTIP,
+                ),
                 TableColumn("Type", lambda item: item.type_label),
                 TableColumn(
                     "Size",
@@ -643,7 +1242,12 @@ class BrowserTableModel(StandardTableModel):
 
 
 class VolumeTableModel(StandardTableModel):
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        backup_icons: BackupStatusIconProvider | None = None,
+    ) -> None:
+        self.backup_icons = backup_icons or BackupStatusIconProvider()
         super().__init__(
             [
                 TableColumn(
@@ -710,6 +1314,18 @@ class VolumeTableModel(StandardTableModel):
                     alignment=Qt.AlignmentFlag.AlignRight,
                 ),
                 TableColumn("Last Scan", lambda item: display_db_time(item.last_scan_at), sort_key=lambda item: item.last_scan_at or ""),
+                TableColumn(
+                    "Other-copy coverage",
+                    lambda item: item.backup.text,
+                    sort_key=lambda item: item.backup.sort_rank,
+                    decoration=lambda item: self.backup_icons.icon_for(item.backup),
+                    tooltip=lambda item: item.backup.tooltip,
+                    header_tooltip=(
+                        "The share of this volume's indexed files and bytes with a strong "
+                        "metadata match on another catalogue drive. Empty volumes are N/A.\n\n"
+                        f"{BACKUP_METADATA_DISCLAIMER}"
+                    ),
+                ),
             ],
             parent,
         )
@@ -733,11 +1349,25 @@ class VolumeTableView(QTableView):
 
 
 class SearchResultsTableModel(StandardTableModel):
-    def __init__(self, icons: CatalogueIconProvider, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        icons: CatalogueIconProvider,
+        parent: QObject | None = None,
+        backup_icons: BackupStatusIconProvider | None = None,
+    ) -> None:
         self.icons = icons
+        self.backup_icons = backup_icons or BackupStatusIconProvider()
         super().__init__(
             [
                 TableColumn("Name", lambda item: item.name, decoration=self.icon_for),
+                TableColumn(
+                    "Other copies",
+                    lambda item: item.backup.text,
+                    sort_key=lambda item: item.backup.sort_rank,
+                    decoration=lambda item: self.backup_icons.icon_for(item.backup),
+                    tooltip=lambda item: item.backup.tooltip,
+                    header_tooltip=BACKUP_COLUMN_HEADER_TOOLTIP,
+                ),
                 TableColumn("Kind", lambda item: item.item_type.title()),
                 TableColumn("Volume", lambda item: display_volume_name(item.volume_name)),
                 TableColumn(
@@ -904,6 +1534,7 @@ def volume_matches_filter(item: VolumeItem, query: str) -> bool:
             item.mirror_date or "",
             str(item.indexed_file_count),
             str(item.indexed_folder_count),
+            item.backup.text,
         ]
     ).casefold()
     return all(term in haystack for term in text.split())
@@ -1574,6 +2205,551 @@ class ItemPropertiesDialog(QDialog):
         QApplication.clipboard().setText(self.copy_text)
 
 
+class BackupEvidenceDialog(QDialog):
+    analyse_requested = Signal()
+    cancel_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Backup Evidence - catalogue metadata")
+        self.resize(980, 680)
+        self.setMinimumSize(760, 520)
+
+        explanation = QLabel(
+            "This compares records already saved in the catalogue. It does not reconnect "
+            "or rescan drives, read file contents, or calculate checksums. A strong match "
+            "is evidence of another copy, not byte-for-byte verification."
+        )
+        explanation.setObjectName("offlineNotice")
+        explanation.setWordWrap(True)
+
+        self.tabs = QTabWidget()
+        self.overview_tab = QWidget()
+        overview_layout = QVBoxLayout(self.overview_tab)
+        self.analysis_state_label = QLabel("Not analysed")
+        self.analysis_state_label.setObjectName("emptyStateTitle")
+        self.analysis_state_label.setWordWrap(True)
+        self.analysis_summary_label = QLabel("")
+        self.analysis_summary_label.setWordWrap(True)
+        self.analysis_summary_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        legend = QLabel(
+            "Green — strong file match or complete folder structure on another drive\n"
+            "Amber — possible file match or partial folder on the best single drive\n"
+            "Red — no other catalogue match found\n"
+            "Grey — not analysed, outdated, too common, excluded system metadata, "
+            "or insufficient scan information"
+        )
+        legend.setWordWrap(True)
+        rules = QLabel(
+            "What the labels mean:\n"
+            "• Strong file: normalized filename, exact byte size, non-empty exact "
+            "modified time, and the same normalized parent path on another drive.\n"
+            "• Possible file: normalized filename and exact byte size on another "
+            "drive, but path or modified time differs or is unavailable.\n"
+            "• Too common: weak name-and-size evidence is suppressed when it spans "
+            "more than 8 drives, 64 records, or 256 projected file-to-drive links. "
+            "Exact path-and-time subgroups use separate bounded limits (32 drives, "
+            "512 records, or 4,096 links), so even strong evidence cannot expand "
+            "without limit.\n"
+            "• Complete folder: the folder name and a content-bearing subtree with at "
+            "least two files match one other drive by descendant names, exact sizes, and "
+            "layout, and both applied scans have trustworthy denominators. A one-file, "
+            "renamed, overly common, error-bearing, or partial subtree stays amber or "
+            "grey.\n"
+            "• Known OS bookkeeping such as .DS_Store, Thumbs.db, desktop.ini, "
+            "$RECYCLE.BIN, and System Volume Information is shown but excluded from "
+            "coverage."
+        )
+        rules.setWordWrap(True)
+        scale_note = QLabel(
+            "Large catalogues can take several minutes and may use substantial "
+            "temporary disk space while indexes are built. The operation is cancellable; "
+            "the previous completed analysis remains active until the new one is saved."
+        )
+        scale_note.setWordWrap(True)
+        overview_layout.addWidget(self.analysis_state_label)
+        overview_layout.addWidget(self.analysis_summary_label)
+        overview_layout.addSpacing(10)
+        overview_layout.addWidget(legend)
+        overview_layout.addSpacing(10)
+        overview_layout.addWidget(rules)
+        overview_layout.addSpacing(10)
+        overview_layout.addWidget(scale_note)
+        overview_layout.addStretch(1)
+
+        self.volume_table = self._report_table(
+            [
+                "Drive",
+                "Indexed files",
+                "Strong matches",
+                "Possible",
+                "Too common",
+                "OS metadata",
+                "File coverage",
+                "Byte coverage",
+                "Status",
+            ]
+        )
+        self.mirror_table = self._report_table(
+            [
+                "Drive A",
+                "Drive B",
+                "A found on B",
+                "B found on A",
+                "Structure",
+                "Why suggested",
+            ]
+        )
+        self.scan_table = self._report_table(
+            [
+                "Drive",
+                "Latest attempt",
+                "Outcome",
+                "Last applied",
+                "Files",
+                "Folders",
+                "Access errors",
+                "Meaning",
+            ]
+        )
+
+        volume_page = QWidget()
+        volume_layout = QVBoxLayout(volume_page)
+        volume_note = QLabel(
+            "Coverage counts only strong metadata matches on a different drive. "
+            "Empty successfully scanned drives are N/A."
+        )
+        volume_note.setWordWrap(True)
+        volume_layout.addWidget(volume_note)
+        volume_layout.addWidget(self.volume_table, 1)
+
+        mirror_page = QWidget()
+        mirror_layout = QVBoxLayout(mirror_page)
+        mirror_note = QLabel(
+            "These are metadata-overlap suggestions only. They do not create or change the "
+            "manual mirror relationship in the volume register."
+        )
+        mirror_note.setWordWrap(True)
+        mirror_layout.addWidget(mirror_note)
+        mirror_layout.addWidget(self.mirror_table, 1)
+
+        scan_page = QWidget()
+        scan_layout = QVBoxLayout(scan_page)
+        scan_note = QLabel(
+            "The latest scan attempt is reported separately from the last successfully "
+            "applied catalogue data. A failed or cancelled attempt does not invalidate a "
+            "previous successful backup analysis."
+        )
+        scan_note.setWordWrap(True)
+        scan_layout.addWidget(scan_note)
+        scan_layout.addWidget(self.scan_table, 1)
+
+        self.tabs.addTab(self.overview_tab, "Overview")
+        self.tabs.addTab(volume_page, "Volumes")
+        self.tabs.addTab(mirror_page, "Potential drive copies")
+        self.tabs.addTab(scan_page, "Scan records")
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setFormat("Ready")
+        configure_progress_bar(self.progress)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.analyse_button = buttons.addButton(
+            "Analyse saved metadata",
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.cancel_button = buttons.addButton(
+            "Cancel analysis",
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.cancel_button.setEnabled(False)
+        self.analyse_button.clicked.connect(self.analyse_requested.emit)
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(explanation)
+        layout.addWidget(self.tabs, 1)
+        layout.addWidget(self.progress)
+        layout.addWidget(buttons)
+
+    def _report_table(self, headers: list[str]) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setSortingEnabled(True)
+        return table
+
+    def set_analysis_running(self, running: bool) -> None:
+        self.analyse_button.setEnabled(not running)
+        self.cancel_button.setEnabled(running)
+        if running:
+            self.analysis_state_label.setText(
+                "Analysis running · the last completed results remain visible"
+            )
+            self.progress.setRange(0, 0)
+            self.progress.setFormat("Preparing saved catalogue metadata…")
+
+    def set_analysis_progress(self, completed: int, total: int, message: str) -> None:
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(min(max(completed, 0), total))
+            self.progress.setFormat(f"{message} — %p%")
+        else:
+            self.progress.setRange(0, 0)
+            self.progress.setFormat(message)
+
+    def set_records(
+        self,
+        state: Any,
+        summaries: list[Any],
+        mirrors: list[Any],
+        scans: list[Any],
+        volume_references: dict[int, str],
+    ) -> None:
+        status = enum_value(object_value(state, "status"))
+        stale = bool(object_value(state, "is_stale", False))
+        analysed_at = object_value(state, "analysed_at")
+        stale_reason = str(object_value(state, "stale_reason", "") or "")
+        if stale:
+            state_text = "Analysis outdated"
+        elif status in {"complete", "completed", "current", "ready"}:
+            state_text = "Analysis current"
+        elif status in {"running", "analysing", "analyzing"}:
+            state_text = "Analysis running"
+        else:
+            state_text = "Not analysed"
+        if analysed_at:
+            state_text += f" · {display_db_time(str(analysed_at))}"
+        self.analysis_state_label.setText(state_text)
+
+        total_files = sum(
+            int(first_object_value(row, "total_files", "indexed_files", "file_count", default=0) or 0)
+            for row in summaries
+        )
+        strong_files = sum(
+            int(
+                first_object_value(
+                    row,
+                    "likely_files",
+                    "strong_files",
+                    "matched_files",
+                    "protected_files",
+                    default=0,
+                )
+                or 0
+            )
+            for row in summaries
+        )
+        possible_files = sum(
+            int(object_value(row, "possible_files", 0) or 0) for row in summaries
+        )
+        ambiguous_files = sum(
+            int(object_value(row, "ambiguous_files", 0) or 0) for row in summaries
+        )
+        excluded_files = sum(
+            int(object_value(row, "excluded_files", 0) or 0) for row in summaries
+        )
+        if not analysed_at and not summaries:
+            indexed_records = sum(
+                int(object_value(scan, "indexed_file_count", 0) or 0)
+                for scan in scans
+            )
+            drive_word = "drive" if len(scans) == 1 else "drives"
+            summary_parts = [
+                "No backup evidence has been analysed yet. Choose Analyse saved metadata "
+                f"to compare {indexed_records:,} indexed file records across "
+                f"{len(scans):,} catalogue {drive_word}."
+            ]
+        else:
+            summary_parts = [
+                f"The last completed analysis found a strong metadata match on another "
+                f"drive for {strong_files:,} of {total_files:,} indexed file records.",
+                f"Possible: {possible_files:,}. Too common to use: "
+                f"{ambiguous_files:,}. Excluded OS metadata: {excluded_files:,}.",
+            ]
+        if stale_reason:
+            summary_parts.append(stale_reason)
+        summary_parts.append(BACKUP_METADATA_DISCLAIMER)
+        self.analysis_summary_label.setText("\n\n".join(summary_parts))
+        self.analyse_button.setText(
+            "Update saved metadata analysis" if analysed_at else "Analyse saved metadata"
+        )
+
+        self._populate_volumes(summaries, volume_references, stale)
+        self._populate_mirrors(mirrors, volume_references, stale)
+        self._populate_scans(scans, volume_references)
+
+    def _set_table_rows(self, table: QTableWidget, rows: list[list[str]]) -> None:
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        for row_index, values in enumerate(rows):
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                table.setItem(row_index, column_index, item)
+        table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
+
+    def _populate_volumes(
+        self,
+        summaries: list[Any],
+        volume_references: dict[int, str],
+        analysis_stale: bool = False,
+    ) -> None:
+        rows = []
+        for summary in summaries:
+            volume_id = int(object_value(summary, "volume_id", 0) or 0)
+            total_files = int(first_object_value(summary, "total_files", "indexed_files", "file_count", default=0) or 0)
+            strong_files = int(
+                first_object_value(
+                    summary,
+                    "likely_files",
+                    "strong_files",
+                    "matched_files",
+                    "protected_files",
+                    default=0,
+                )
+                or 0
+            )
+            possible_files = int(object_value(summary, "possible_files", 0) or 0)
+            ambiguous_files = int(object_value(summary, "ambiguous_files", 0) or 0)
+            excluded_files = int(object_value(summary, "excluded_files", 0) or 0)
+            summary_status = enum_value(object_value(summary, "status", ""))
+            files_percent = first_object_value(
+                summary,
+                "likely_files_percent",
+                "strong_files_percent",
+                "file_coverage_percent",
+                "coverage_files_percent",
+            )
+            bytes_percent = first_object_value(
+                summary,
+                "likely_bytes_percent",
+                "strong_bytes_percent",
+                "byte_coverage_percent",
+                "coverage_bytes_percent",
+            )
+            stale = analysis_stale or bool(object_value(summary, "is_stale", False))
+            health = enum_value(
+                first_object_value(summary, "health_status", "scan_health", default="")
+            )
+            if stale:
+                status_text = "Outdated"
+                file_text = "Outdated"
+                byte_text = "Outdated"
+            elif total_files == 0 and health in {"empty", "healthy_empty", "completed_empty"}:
+                status_text = "N/A · empty"
+                file_text = "N/A"
+                byte_text = "N/A"
+            elif total_files == 0 and health in {
+                "unknown",
+                "check_scan",
+                "completed_with_errors",
+                "scan_errors",
+                "incomplete",
+            }:
+                status_text = "Check scan"
+                file_text = "Unknown"
+                byte_text = "Unknown"
+            elif total_files == 0 and health in {"not_scanned", "no_applied_scan"}:
+                status_text = "Not scanned"
+                file_text = "Unknown"
+                byte_text = "Unknown"
+            elif summary_status == "excluded":
+                status_text = "N/A · system metadata"
+                file_text = "N/A"
+                byte_text = "N/A"
+            elif total_files > 0 and not bool(
+                object_value(summary, "coverage_eligible", True)
+            ):
+                status_text = "Not scanned" if health in {"not_scanned", "no_applied_scan"} else "Check scan"
+                file_text = "Unknown"
+                byte_text = "Unknown"
+            elif files_percent is None:
+                status_text = "Not analysed"
+                file_text = "Not analysed"
+                byte_text = "Not analysed"
+            else:
+                status_text = "Current"
+                file_text = f"{float(files_percent):.0f}%"
+                byte_text = f"{float(bytes_percent):.0f}%" if bytes_percent is not None else "N/A"
+            rows.append(
+                [
+                    volume_references.get(volume_id, f"Volume {volume_id}"),
+                    f"{total_files:,}",
+                    f"{strong_files:,}",
+                    f"{possible_files:,}",
+                    f"{ambiguous_files:,}",
+                    f"{excluded_files:,}",
+                    file_text,
+                    byte_text,
+                    status_text,
+                ]
+            )
+        self._set_table_rows(self.volume_table, rows)
+
+    def _populate_mirrors(
+        self,
+        mirrors: list[Any],
+        volume_references: dict[int, str],
+        analysis_stale: bool = False,
+    ) -> None:
+        rows = []
+        for candidate in mirrors:
+            first_id = int(first_object_value(candidate, "volume_a_id", "first_volume_id", "source_volume_id", default=0) or 0)
+            second_id = int(first_object_value(candidate, "volume_b_id", "second_volume_id", "target_volume_id", default=0) or 0)
+            a_on_b = first_object_value(
+                candidate,
+                "a_on_b_percent",
+                "first_on_second_percent",
+                "source_coverage_percent",
+            )
+            b_on_a = first_object_value(
+                candidate,
+                "b_on_a_percent",
+                "second_on_first_percent",
+                "target_coverage_percent",
+            )
+            complete = bool(
+                first_object_value(
+                    candidate,
+                    "complete_structure",
+                    "complete",
+                    "is_complete",
+                    "exact",
+                    default=False,
+                )
+            )
+            reason = str(first_object_value(candidate, "evidence_text", "reason", default="Metadata overlap") or "Metadata overlap")
+            if (
+                bool(object_value(candidate, "manual_mirror_link", False))
+                and "manual mirror relationship" not in reason.casefold()
+            ):
+                reason = f"Existing manual mirror relationship. {reason}"
+            if analysis_stale:
+                reason = f"OUTDATED — {reason}"
+            rows.append(
+                [
+                    volume_references.get(first_id, f"Volume {first_id}"),
+                    volume_references.get(second_id, f"Volume {second_id}"),
+                    f"{float(a_on_b):.0f}%" if a_on_b is not None else "N/A",
+                    f"{float(b_on_a):.0f}%" if b_on_a is not None else "N/A",
+                    "Outdated"
+                    if analysis_stale
+                    else ("Complete structural match" if complete else "Partial overlap"),
+                    reason,
+                ]
+            )
+        self._set_table_rows(self.mirror_table, rows)
+
+    def _populate_scans(
+        self,
+        scans: list[Any],
+        volume_references: dict[int, str],
+    ) -> None:
+        rows = []
+        for scan in scans:
+            volume_id = int(object_value(scan, "volume_id", 0) or 0)
+            status = enum_value(first_object_value(scan, "latest_attempt_status", "status", default="not_scanned"))
+            files = int(
+                first_object_value(
+                    scan,
+                    "latest_attempt_files",
+                    "files_seen",
+                    "indexed_files",
+                    default=0,
+                )
+                or 0
+            )
+            folders = int(
+                first_object_value(
+                    scan,
+                    "latest_attempt_folders",
+                    "folders_seen",
+                    "indexed_folders",
+                    default=0,
+                )
+                or 0
+            )
+            errors = int(
+                first_object_value(
+                    scan,
+                    "latest_attempt_errors",
+                    "errors_count",
+                    "access_errors",
+                    default=0,
+                )
+                or 0
+            )
+            ignored_errors = int(
+                object_value(scan, "latest_attempt_ignored_errors", 0) or 0
+            )
+            health = enum_value(object_value(scan, "health_status", ""))
+            attempted_at = first_object_value(scan, "started_at", "latest_attempt_at", "last_scan_at")
+            applied_at = first_object_value(
+                scan,
+                "last_applied_at",
+                "applied_scan_at",
+                "catalogue_scan_at",
+            )
+            applied = bool(first_object_value(scan, "applied", "is_applied", default=status == "completed"))
+            if status == "completed" and errors and ignored_errors >= errors:
+                outcome = "Completed with system warning" + ("s" if errors != 1 else "")
+                if health in {"empty", "healthy_empty", "completed_empty"}:
+                    outcome += " · empty"
+                    meaning = (
+                        "Only protected drive metadata was skipped; the empty drive remains "
+                        "confirmed and coverage is N/A"
+                    )
+                else:
+                    meaning = (
+                        "Only protected drive metadata was skipped; copy coverage remains usable"
+                    )
+            elif status == "completed" and health in {"empty", "healthy_empty", "completed_empty"}:
+                outcome = "Completed · empty"
+                meaning = "Healthy empty catalogue; coverage N/A"
+            elif status == "completed" and errors:
+                outcome = "Completed with access errors"
+                meaning = "Check scan; catalogue areas may be incomplete"
+            elif status == "completed" and files == 0:
+                outcome = "Completed · empty"
+                meaning = "Healthy empty catalogue; coverage N/A"
+            elif status == "completed":
+                outcome = "Completed"
+                meaning = "Latest attempt was applied"
+            elif status in {"failed", "cancelled", "discarded"}:
+                outcome = status.title()
+                meaning = "Not applied; prior catalogue evidence remains in effect"
+            else:
+                outcome = "Not scanned" if status in {"", "not_scanned", "none"} else status.title()
+                meaning = "No applied scan data" if not applied else "See scan log"
+            rows.append(
+                [
+                    volume_references.get(volume_id, f"Volume {volume_id}"),
+                    display_db_time(str(attempted_at)) if attempted_at else "Never",
+                    outcome,
+                    display_db_time(str(applied_at)) if applied_at else "Never",
+                    f"{files:,}",
+                    f"{folders:,}",
+                    f"{errors:,}",
+                    meaning,
+                ]
+            )
+        self._set_table_rows(self.scan_table, rows)
+
+
 class PreferencesDialog(QDialog):
     appearance_changed = Signal(str, str, str)
 
@@ -1781,6 +2957,11 @@ class HelpDialog(QDialog):
             ("4. Search",
              "Find files and folders by name or extension across the stored catalogue. "
              "Path matching can be enabled under <b>Settings &gt; Preferences</b>."),
+            ("5. Review copy evidence",
+             "Choose <b>Catalogue &gt; Backup Evidence</b> to compare saved metadata. "
+             "The analysis does not reconnect or rescan drives, read file contents, or "
+             "calculate checksums. Green means a strong metadata match, not byte-for-byte "
+             "verification."),
         ]
         section_html = "".join(
             f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
@@ -1956,6 +3137,86 @@ class CatalogueInfoWorker(QObject):
                 pass
 
 
+class BackupAnalysisWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__()
+        self.db_path = db_path
+        self.cancel_requested = False
+        self._active_db: Database | None = None
+
+    @Slot()
+    def run(self) -> None:
+        db: Database | None = None
+        summary: Any = None
+        error_details: str | None = None
+        try:
+            if BackupAnalysisEngine is None:
+                raise RuntimeError("Backup analysis support is unavailable in this build.")
+            db = Database(
+                self.db_path,
+                initialize=False,
+                create=False,
+                read_only=False,
+            )
+            self._active_db = db
+            db.connection.set_progress_handler(
+                lambda: 1 if self.cancel_requested else 0,
+                1000,
+            )
+            engine = BackupAnalysisEngine(db)
+
+            def report(value: Any) -> None:
+                self.progress.emit(
+                    int(object_value(value, "completed", 0) or 0),
+                    int(object_value(value, "total", 0) or 0),
+                    str(
+                        object_value(value, "message", "")
+                        or object_value(value, "phase", "Analysing saved metadata")
+                    ),
+                )
+
+            summary = engine.analyse(
+                progress_callback=report,
+                cancel_callback=lambda: self.cancel_requested,
+            )
+        except Exception:
+            if not self.cancel_requested:
+                error_details = traceback.format_exc()
+        finally:
+            if db is not None:
+                try:
+                    db.connection.set_progress_handler(None, 0)
+                except Exception:
+                    pass
+                db.close()
+            self._active_db = None
+
+        summary_status = enum_value(object_value(summary, "status"))
+        cancelled = summary_status == "cancelled" or (
+            summary is None and self.cancel_requested
+        )
+        if cancelled:
+            self.cancelled.emit()
+        elif error_details is not None:
+            self.failed.emit(error_details)
+        else:
+            self.finished.emit(summary)
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        db = self._active_db
+        if db is not None:
+            try:
+                db.connection.interrupt()
+            except Exception:
+                pass
+
+
 class SearchWorker(QObject):
     batch_ready = Signal(int, list)
     finished = Signal(int, int)
@@ -1970,6 +3231,7 @@ class SearchWorker(QObject):
         connected_volume_snapshots: list[VolumeSnapshot] | None = None,
         *,
         include_paths: bool = False,
+        backup_filter_key: str = "all",
     ) -> None:
         super().__init__()
         self.db_path = db_path
@@ -1977,7 +3239,65 @@ class SearchWorker(QObject):
         self.request_id = request_id
         self.connected_volume_snapshots = connected_volume_snapshots
         self.include_paths = include_paths
+        self.backup_filter_key = backup_filter_key
         self.cancel_requested = False
+
+    def _build_batch(
+        self,
+        rows: list[Any],
+        engine: Any,
+        resolver: ConnectedVolumeResolver,
+        connected_by_volume: dict[int, bool],
+        volume_references: dict[int, str],
+    ) -> list[SearchResultItem]:
+        statuses: dict[tuple[str, int], Any] = {}
+        if engine is not None:
+            for item_type in ("folder", "file"):
+                ids = [int(row["item_id"]) for row in rows if row["item_type"] == item_type]
+                if not ids:
+                    continue
+                try:
+                    for item_id, status in engine.item_statuses(item_type, ids).items():
+                        statuses[(item_type, int(item_id))] = status
+                except Exception:
+                    # Search remains usable if an older catalogue has not had its
+                    # auxiliary analysis schema initialized yet.
+                    pass
+
+        items: list[SearchResultItem] = []
+        for result in rows:
+            volume_id = int(result["volume_id"])
+            connected = connected_by_volume.get(volume_id)
+            if connected is None:
+                connected = resolver.resolve(result) is not None
+                connected_by_volume[volume_id] = connected
+            item_type = str(result["item_type"])
+            item_id = int(result["item_id"])
+            backup = item_backup_display(
+                statuses.get((item_type, item_id)),
+                volume_references,
+                item_type=item_type,
+            )
+            if not backup_filter_matches(backup, self.backup_filter_key):
+                continue
+            items.append(
+                SearchResultItem(
+                    item_type=item_type,
+                    item_id=item_id,
+                    name=result["name"],
+                    volume_id=volume_id,
+                    drive_id=result["drive_id"],
+                    volume_name=result["volume_name"],
+                    relative_path=result["relative_path"],
+                    size_bytes=result["size_bytes"],
+                    modified_at=result["modified_at"],
+                    missing=bool(result["missing"]),
+                    source_path=result["source_path"],
+                    connected=connected,
+                    backup=backup,
+                )
+            )
+        return items
 
     @Slot()
     def run(self) -> None:
@@ -1999,41 +3319,46 @@ class SearchWorker(QObject):
                 self.connected_volume_snapshots,
                 check_source_path=self.connected_volume_snapshots is None,
             )
+            try:
+                volume_references = {
+                    int(volume["id"]): volume_reference(volume["drive_id"], volume["name"])
+                    for volume in db.list_volumes()
+                }
+            except (AttributeError, TypeError):
+                volume_references = {}
+            engine = BackupAnalysisEngine(db) if BackupAnalysisEngine is not None else None
             connected_by_volume: dict[int, bool] = {}
-            batch: list[SearchResultItem] = []
+            raw_batch: list[Any] = []
             for result in db.iter_search(
                 self.query,
                 include_paths=self.include_paths,
             ):
                 if self.cancel_requested:
                     break
-                volume_id = result["volume_id"]
-                connected = connected_by_volume.get(volume_id)
-                if connected is None:
-                    connected = resolver.resolve(result) is not None
-                    connected_by_volume[volume_id] = connected
-                batch.append(
-                    SearchResultItem(
-                        item_type=result["item_type"],
-                        item_id=result["item_id"],
-                        name=result["name"],
-                        volume_id=volume_id,
-                        drive_id=result["drive_id"],
-                        volume_name=result["volume_name"],
-                        relative_path=result["relative_path"],
-                        size_bytes=result["size_bytes"],
-                        modified_at=result["modified_at"],
-                        missing=bool(result["missing"]),
-                        source_path=result["source_path"],
-                        connected=connected,
+                raw_batch.append(result)
+                if len(raw_batch) >= SEARCH_RESULT_BATCH_SIZE:
+                    batch = self._build_batch(
+                        raw_batch,
+                        engine,
+                        resolver,
+                        connected_by_volume,
+                        volume_references,
                     )
+                    if batch:
+                        self.batch_ready.emit(self.request_id, batch)
+                        result_count += len(batch)
+                    raw_batch = []
+            if raw_batch and not self.cancel_requested:
+                batch = self._build_batch(
+                    raw_batch,
+                    engine,
+                    resolver,
+                    connected_by_volume,
+                    volume_references,
                 )
-                result_count += 1
-                if len(batch) >= SEARCH_RESULT_BATCH_SIZE:
+                if batch:
                     self.batch_ready.emit(self.request_id, batch)
-                    batch = []
-            if batch and not self.cancel_requested:
-                self.batch_ready.emit(self.request_id, batch)
+                    result_count += len(batch)
         except Exception:
             if not self.cancel_requested:
                 error_details = traceback.format_exc()
@@ -2238,6 +3563,9 @@ class MainWindow(QMainWindow):
         self.delete_worker: DeleteVolumeWorker | None = None
         self.catalogue_info_thread: QThread | None = None
         self.catalogue_info_worker: CatalogueInfoWorker | None = None
+        self.backup_analysis_thread: QThread | None = None
+        self.backup_analysis_worker: BackupAnalysisWorker | None = None
+        self.backup_evidence_dialog: BackupEvidenceDialog | None = None
         self.search_thread: QThread | None = None
         self.search_worker: SearchWorker | None = None
         self.catalogue_probe_process: QProcess | None = None
@@ -2251,9 +3579,24 @@ class MainWindow(QMainWindow):
         self.search_request_id = 0
         self.browser_shortcuts: list[QShortcut] = []
         self.browser_icons = CatalogueIconProvider()
-        self.volume_model = VolumeTableModel(self)
-        self.browser_model = BrowserTableModel(self.browser_icons, self)
-        self.search_model = SearchResultsTableModel(self.browser_icons, self)
+        self.backup_status_icons = BackupStatusIconProvider()
+        self.volume_model = VolumeTableModel(self, self.backup_status_icons)
+        self.browser_model = BrowserTableModel(
+            self.browser_icons,
+            self,
+            self.backup_status_icons,
+        )
+        self.search_model = SearchResultsTableModel(
+            self.browser_icons,
+            self,
+            self.backup_status_icons,
+        )
+        self.current_directory_items: list[BrowserItem] = []
+        self.backup_engine: Any = None
+        self.backup_volume_references: dict[int, str] = {}
+        self.backup_volume_summaries: dict[int, Any] = {}
+        self.backup_scan_records: dict[int, Any] = {}
+        self.backup_analysis_state: Any = None
         self.volume_full_delegate = VolumeFullDelegate(self)
         self.catalogue_actions: list[QAction] = []
         self.catalogue_widgets: list[QWidget] = []
@@ -2352,6 +3695,13 @@ class MainWindow(QMainWindow):
         catalogue_menu.addAction(self.new_volume_action)
 
         catalogue_menu.addSeparator()
+
+        self.backup_evidence_action = QAction("Backup Evidence\u2026", self)
+        self.backup_evidence_action.triggered.connect(self.show_backup_evidence)
+        self.backup_evidence_action.setToolTip(
+            "Compare metadata already saved in this catalogue; no drives are rescanned"
+        )
+        catalogue_menu.addAction(self.backup_evidence_action)
 
         self.catalogue_info_action = QAction("Catalogue Info\u2026", self)
         self.catalogue_info_action.triggered.connect(self.show_catalogue_info)
@@ -2617,6 +3967,7 @@ class MainWindow(QMainWindow):
                     19: 80,
                     20: 85,
                     21: 145,
+                    22: 165,
                 },
                 stretch_column=2,
             ),
@@ -2697,7 +4048,7 @@ class MainWindow(QMainWindow):
     def _build_details_box(self) -> QGroupBox:
         box = QGroupBox("Selected Volume")
         box.setObjectName("detailsPanel")
-        box.setMaximumHeight(self.scaled_ui_value(150))
+        box.setMaximumHeight(self.scaled_ui_value(180))
         self.detail_labels: dict[str, QLabel] = {}
         self.detail_full = QProgressBar()
         self.detail_full.setRange(0, 100)
@@ -2732,7 +4083,16 @@ class MainWindow(QMainWindow):
         grid.addWidget(scan_path_label, path_row, 0)
         grid.addWidget(self._detail_value_label("path"), path_row, 1, 1, 5)
 
-        full_row = 3
+        coverage_row = 3
+        coverage_label = QLabel("Other-copy coverage")
+        coverage_label.setObjectName("detailKey")
+        coverage_label.setToolTip(BACKUP_COLUMN_HEADER_TOOLTIP)
+        grid.addWidget(coverage_label, coverage_row, 0)
+        coverage_value = self._detail_value_label("backup_coverage")
+        coverage_value.setToolTip(BACKUP_COLUMN_HEADER_TOOLTIP)
+        grid.addWidget(coverage_value, coverage_row, 1, 1, 5)
+
+        full_row = 4
         full_label = QLabel("Full")
         full_label.setObjectName("detailKey")
         grid.addWidget(full_label, full_row, 0)
@@ -2781,6 +4141,29 @@ class MainWindow(QMainWindow):
         path_row.addWidget(self.up_button)
         path_row.addWidget(self.current_path_label, 1)
 
+        backup_filter_label = QLabel("Other-copy status")
+        backup_filter_label.setObjectName("detailKey")
+        self.browser_backup_filter_combo = QComboBox()
+        self.browser_backup_filter_combo.setObjectName("browserBackupFilter")
+        for label, key in BACKUP_FILTER_OPTIONS:
+            self.browser_backup_filter_combo.addItem(label, key)
+        self.browser_backup_filter_combo.setToolTip(
+            "Filter by catalogue-metadata copy evidence. 'Needs attention' includes "
+            "possible, partial, none found, outdated, and unknown items."
+        )
+        self.browser_backup_help_button = QPushButton("How matching works")
+        self.browser_backup_help_button.setToolTip(
+            "Explain what the coloured copy-evidence indicators mean"
+        )
+
+        backup_filter_row = QHBoxLayout()
+        backup_filter_row.setContentsMargins(0, 0, 0, 0)
+        backup_filter_row.setSpacing(4)
+        backup_filter_row.addWidget(backup_filter_label)
+        backup_filter_row.addWidget(self.browser_backup_filter_combo)
+        backup_filter_row.addStretch(1)
+        backup_filter_row.addWidget(self.browser_backup_help_button)
+
         self.file_table = QTableView()
         self.file_table.setObjectName("fileTable")
         self.file_table.setModel(self.browser_model)
@@ -2791,7 +4174,7 @@ class MainWindow(QMainWindow):
             0,
             lambda: self.apply_table_default_columns(
                 self.file_table,
-                {1: 140, 2: 95, 3: 155, 4: 280, 5: 90},
+                {1: 165, 2: 140, 3: 95, 4: 155, 5: 280, 6: 90},
             ),
         )
 
@@ -2812,6 +4195,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(5)
         layout.addWidget(self.offline_label)
         layout.addLayout(path_row)
+        layout.addLayout(backup_filter_row)
         layout.addWidget(browser_splitter, 1)
         return widget
 
@@ -2943,12 +4327,21 @@ class MainWindow(QMainWindow):
         self.reveal_file_button = QPushButton("Reveal")
         self.open_file_button.setEnabled(False)
         self.reveal_file_button.setEnabled(False)
+        self.search_backup_filter_combo = QComboBox()
+        self.search_backup_filter_combo.setObjectName("searchBackupFilter")
+        for label, key in BACKUP_FILTER_OPTIONS:
+            self.search_backup_filter_combo.addItem(label, key)
+        self.search_backup_filter_combo.setToolTip(
+            "Limit results by catalogue-metadata copy evidence"
+        )
 
         search_row = QHBoxLayout()
         self.search_controls_layout = search_row
         search_row.setContentsMargins(0, 0, 0, 0)
         search_row.setSpacing(4)
         search_row.addWidget(self.search_edit, 1)
+        search_row.addWidget(QLabel("Other-copy status"))
+        search_row.addWidget(self.search_backup_filter_combo)
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.open_file_button)
         search_row.addWidget(self.reveal_file_button)
@@ -2963,7 +4356,7 @@ class MainWindow(QMainWindow):
             0,
             lambda: self.apply_table_default_columns(
                 self.search_table,
-                {1: 80, 2: 150, 3: 85, 4: 280, 5: 95, 6: 155, 7: 120},
+                {1: 165, 2: 80, 3: 150, 4: 85, 5: 280, 6: 95, 7: 155, 8: 120},
             ),
         )
 
@@ -3021,11 +4414,18 @@ class MainWindow(QMainWindow):
         self.folder_tree.currentItemChanged.connect(self.on_folder_changed)
         self.folder_tree.customContextMenuRequested.connect(self.show_folder_tree_context_menu)
         self.up_button.clicked.connect(self.navigate_parent_folder)
+        self.browser_backup_filter_combo.currentIndexChanged.connect(
+            lambda _index: self.apply_browser_backup_filter()
+        )
+        self.browser_backup_help_button.clicked.connect(self.show_backup_evidence)
         self.file_table.doubleClicked.connect(self.open_browser_index)
         self.file_table.customContextMenuRequested.connect(self.show_browser_context_menu)
         self.search_button.clicked.connect(self.perform_search)
         self.stop_scan_button.clicked.connect(self.cancel_scan)
         self.search_edit.returnPressed.connect(self.perform_search)
+        self.search_backup_filter_combo.currentIndexChanged.connect(
+            lambda _index: self.perform_search()
+        )
         self.search_table.selectionModel().selectionChanged.connect(self.on_search_selection_changed)
         self.search_table.doubleClicked.connect(self.open_search_index)
         self.search_table.customContextMenuRequested.connect(self.show_search_context_menu)
@@ -3040,10 +4440,17 @@ class MainWindow(QMainWindow):
             self.close_catalogue_action,
             self.open_catalogue_location_action,
             self.new_volume_action,
+            self.backup_evidence_action,
             self.catalogue_info_action,
             self.refresh_action,
         ]
-        self.catalogue_widgets = [self.volume_filter_edit, self.search_edit, self.search_button]
+        self.catalogue_widgets = [
+            self.volume_filter_edit,
+            self.search_edit,
+            self.search_button,
+            self.browser_backup_filter_combo,
+            self.search_backup_filter_combo,
+        ]
         self.scan_blocked_actions = [self.new_volume_action]
         self.scan_blocked_widgets = []
 
@@ -3167,6 +4574,203 @@ class MainWindow(QMainWindow):
                 "Open Catalogue Location Failed",
                 str(exc),
             )
+
+    def show_backup_evidence(self) -> None:
+        if self.db is None:
+            return
+        if self.backup_evidence_dialog is None:
+            dialog = BackupEvidenceDialog(self)
+            dialog.analyse_requested.connect(self.start_backup_analysis)
+            dialog.cancel_requested.connect(self.cancel_backup_analysis)
+            self.backup_evidence_dialog = dialog
+        self.refresh_backup_evidence_dialog()
+        self.backup_evidence_dialog.show()
+        self.backup_evidence_dialog.raise_()
+        self.backup_evidence_dialog.activateWindow()
+
+    def refresh_backup_evidence_dialog(self) -> None:
+        dialog = self.backup_evidence_dialog
+        if dialog is None or self.db is None:
+            return
+        engine = getattr(self, "backup_engine", None)
+        if engine is None and BackupAnalysisEngine is not None:
+            try:
+                engine = BackupAnalysisEngine(self.db)
+                engine.ensure_schema()
+                self.backup_engine = engine
+            except Exception:
+                engine = None
+        volumes = self.db.list_volumes()
+        self.backup_volume_references = {
+            int(volume["id"]): volume_reference(volume["drive_id"], volume["name"])
+            for volume in volumes
+        }
+        if engine is None:
+            dialog.set_records(None, [], [], [], self.backup_volume_references)
+            dialog.analysis_state_label.setText("Backup analysis support is unavailable")
+            dialog.analyse_button.setEnabled(False)
+            return
+        try:
+            state = engine.state()
+            summaries = list(engine.volume_summaries())
+            mirrors = list(engine.mirror_candidates())
+            scans = list(engine.scan_records())
+        except Exception as exc:
+            dialog.set_records(None, [], [], [], self.backup_volume_references)
+            dialog.analysis_state_label.setText("Backup evidence could not be loaded")
+            dialog.analysis_summary_label.setText(
+                f"{exc}\n\n{BACKUP_METADATA_DISCLAIMER}"
+            )
+            return
+        dialog.set_records(
+            state,
+            summaries,
+            mirrors,
+            scans,
+            self.backup_volume_references,
+        )
+        running = self.backup_analysis_worker is not None
+        dialog.set_analysis_running(running)
+        if not running:
+            dialog.analyse_button.setEnabled(
+                self.scan_worker is None and self.delete_worker is None
+            )
+
+    def start_backup_analysis(self) -> None:
+        if self.db is None or self.backup_analysis_worker is not None:
+            return
+        if self.scan_worker is not None or self.delete_worker is not None:
+            self._show_catalogue_job_running_message()
+            return
+        if BackupAnalysisEngine is None:
+            QMessageBox.warning(
+                self,
+                "Backup Analysis Unavailable",
+                "Backup analysis support is unavailable in this build.",
+            )
+            return
+
+        if self.backup_evidence_dialog is not None:
+            self.backup_evidence_dialog.set_analysis_running(True)
+        self.scan_progress.setRange(0, 0)
+        self.scan_progress.setFormat("Analysing saved catalogue metadata…")
+        self.statusBar().showMessage(
+            "Analysing saved catalogue metadata; no drives are being read…"
+        )
+
+        self.backup_analysis_thread = QThread(self)
+        self.backup_analysis_worker = BackupAnalysisWorker(self.db.path)
+        self.backup_analysis_worker.moveToThread(self.backup_analysis_thread)
+        self.backup_analysis_thread.started.connect(self.backup_analysis_worker.run)
+        self.backup_analysis_worker.progress.connect(self.on_backup_analysis_progress)
+        self.backup_analysis_worker.finished.connect(self.on_backup_analysis_finished)
+        self.backup_analysis_worker.cancelled.connect(self.on_backup_analysis_cancelled)
+        self.backup_analysis_worker.failed.connect(self.on_backup_analysis_failed)
+        self.backup_analysis_worker.finished.connect(self.backup_analysis_thread.quit)
+        self.backup_analysis_worker.cancelled.connect(self.backup_analysis_thread.quit)
+        self.backup_analysis_worker.failed.connect(self.backup_analysis_thread.quit)
+        self.backup_analysis_worker.finished.connect(self.backup_analysis_worker.deleteLater)
+        self.backup_analysis_worker.cancelled.connect(self.backup_analysis_worker.deleteLater)
+        self.backup_analysis_worker.failed.connect(self.backup_analysis_worker.deleteLater)
+        self.backup_analysis_thread.finished.connect(self.backup_analysis_thread.deleteLater)
+        self.backup_analysis_thread.finished.connect(self.clear_backup_analysis_worker)
+        self.backup_analysis_thread.start()
+
+    @Slot(int, int, str)
+    def on_backup_analysis_progress(self, completed: int, total: int, message: str) -> None:
+        label = message or "Analysing saved catalogue metadata"
+        if total > 0:
+            self.scan_progress.setRange(0, total)
+            self.scan_progress.setValue(min(max(completed, 0), total))
+            self.scan_progress.setFormat(f"{label} — %p%")
+        else:
+            self.scan_progress.setRange(0, 0)
+            self.scan_progress.setFormat(label)
+        if self.backup_evidence_dialog is not None:
+            self.backup_evidence_dialog.set_analysis_progress(completed, total, label)
+        self.statusBar().showMessage(f"{label}; no drives are being read.")
+
+    def cancel_backup_analysis(self) -> None:
+        worker = self.backup_analysis_worker
+        if worker is None:
+            return
+        worker.cancel()
+        self.scan_progress.setRange(0, 0)
+        self.scan_progress.setFormat("Cancelling saved-metadata analysis…")
+        if self.backup_evidence_dialog is not None:
+            self.backup_evidence_dialog.cancel_button.setEnabled(False)
+            self.backup_evidence_dialog.progress.setRange(0, 0)
+            self.backup_evidence_dialog.progress.setFormat("Cancelling…")
+        self.statusBar().showMessage("Cancelling backup analysis…")
+
+    @Slot(object)
+    def on_backup_analysis_finished(self, summary: Any) -> None:
+        if enum_value(object_value(summary, "status")) == "discarded":
+            self.scan_progress.setRange(0, 1)
+            self.scan_progress.setValue(0)
+            self.scan_progress.setFormat("Backup analysis not applied")
+            self.statusBar().showMessage(
+                str(
+                    object_value(summary, "message", "")
+                    or "The catalogue changed during analysis; results were not applied."
+                ),
+                8000,
+            )
+            self.refresh_backup_evidence_views()
+            return
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_progress.setFormat("Backup evidence updated")
+        self.statusBar().showMessage(
+            "Backup evidence updated from saved catalogue metadata.",
+            6000,
+        )
+        self.refresh_backup_evidence_views()
+
+    @Slot()
+    def on_backup_analysis_cancelled(self) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Backup analysis cancelled")
+        self.statusBar().showMessage(
+            "Backup analysis cancelled; incomplete results were not applied.",
+            5000,
+        )
+        self.refresh_backup_evidence_dialog()
+
+    @Slot(str)
+    def on_backup_analysis_failed(self, details: str) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Backup analysis failed")
+        self.statusBar().showMessage("Backup analysis failed.", 5000)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setWindowTitle("Backup Analysis Failed")
+        dialog.setText("Saved catalogue metadata could not be analysed.")
+        dialog.setInformativeText(
+            "No source drive was scanned, and incomplete analysis results were not applied."
+        )
+        dialog.setDetailedText(details)
+        dialog.exec()
+        self.refresh_backup_evidence_dialog()
+
+    def refresh_backup_evidence_views(self) -> None:
+        if self.db is None:
+            return
+        self.refresh_volumes()
+        if self.current_volume_id is not None and self.current_folder_id is not None:
+            self.load_directory_items(self.current_volume_id, self.current_folder_id)
+        if self.search_edit.text().strip():
+            self.perform_search()
+        self.refresh_backup_evidence_dialog()
+
+    @Slot()
+    def clear_backup_analysis_worker(self) -> None:
+        self.backup_analysis_worker = None
+        self.backup_analysis_thread = None
+        if getattr(self, "backup_evidence_dialog", None) is not None:
+            self.refresh_backup_evidence_dialog()
 
     def show_catalogue_info(self) -> None:
         if self.db is None or self.catalogue_info_thread is not None:
@@ -3565,6 +5169,8 @@ class MainWindow(QMainWindow):
             )
             return False
 
+        if not self._stop_backup_analysis_for_close():
+            return False
         if not self._stop_catalogue_info_for_close():
             return False
         if not self._stop_scan_for_catalogue_close():
@@ -3577,6 +5183,11 @@ class MainWindow(QMainWindow):
         self.db = None
         self.catalogue_path = None
         self.catalogue_lock = None
+        self.backup_engine = None
+        self.backup_volume_references = {}
+        if self.backup_evidence_dialog is not None:
+            self.backup_evidence_dialog.close()
+            self.backup_evidence_dialog = None
         self._set_catalogue_open(False)
 
         try:
@@ -3629,12 +5240,18 @@ class MainWindow(QMainWindow):
         connected_volume_snapshots: list[VolumeSnapshot] | None = None,
     ) -> None:
         self.db = db
+        if BackupAnalysisEngine is not None:
+            try:
+                self.backup_engine = BackupAnalysisEngine(db)
+                self.backup_engine.ensure_schema()
+            except Exception:
+                self.backup_engine = None
         self.catalogue_path = path
         self.catalogue_lock = lock
         self.settings.setValue(LAST_CATALOGUE_PATH_SETTING, str(path.resolve(strict=False)))
         self._set_catalogue_open(True)
         self.start_connected_volume_monitor(connected_volume_snapshots)
-        if initial_volume_items is None:
+        if initial_volume_items is None or self.backup_engine is not None:
             self.refresh_volumes()
         else:
             self._apply_volume_items(initial_volume_items)
@@ -3765,8 +5382,40 @@ class MainWindow(QMainWindow):
         )
         return False
 
+    def _stop_backup_analysis_for_close(self) -> bool:
+        worker = getattr(self, "backup_analysis_worker", None)
+        thread = getattr(self, "backup_analysis_thread", None)
+        if worker is None or thread is None or not thread.isRunning():
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Backup Analysis Running",
+            "Saved catalogue metadata is still being analysed. Cancel it before closing?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        worker.cancel()
+        self.statusBar().showMessage("Cancelling backup analysis…")
+        for _ in range(50):
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+            if self.backup_analysis_thread is None or not self.backup_analysis_thread.isRunning():
+                return True
+            self.backup_analysis_thread.wait(100)
+        QMessageBox.information(
+            self,
+            "Backup Analysis Cancelling",
+            "Cancellation has been requested. Close the catalogue after analysis stops.",
+        )
+        return False
+
     def _catalogue_job_running(self) -> bool:
-        return self.scan_worker is not None or self.delete_worker is not None
+        return (
+            self.scan_worker is not None
+            or self.delete_worker is not None
+            or getattr(self, "backup_analysis_worker", None) is not None
+        )
 
     def _show_catalogue_job_running_message(self) -> None:
         if self.delete_worker is not None:
@@ -3774,6 +5423,12 @@ class MainWindow(QMainWindow):
                 self,
                 "Volume Deleting",
                 "Wait for the current volume delete to finish.",
+            )
+        elif getattr(self, "backup_analysis_worker", None) is not None:
+            QMessageBox.information(
+                self,
+                "Backup Analysis Running",
+                "Wait for the saved-metadata analysis to finish or cancel it in Backup Evidence.",
             )
         else:
             QMessageBox.information(
@@ -3825,6 +5480,10 @@ class MainWindow(QMainWindow):
         self.current_volume_id = None
         self.current_folder_id = None
         self.post_scan_edit_volume_id = None
+        self.current_directory_items = []
+        self.backup_volume_summaries = {}
+        self.backup_scan_records = {}
+        self.backup_analysis_state = None
         self.volume_model.set_items([])
         self.browser_model.set_items([])
         self.search_model.set_items([])
@@ -3867,6 +5526,32 @@ class MainWindow(QMainWindow):
             self._clear_catalogue_views()
             return
         volumes = self.db.list_volumes()
+        self.backup_volume_references = {
+            int(volume["id"]): volume_reference(volume["drive_id"], volume["name"])
+            for volume in volumes
+        }
+        summaries: dict[int, Any] = {}
+        scans: dict[int, Any] = {}
+        analysis_state: Any = None
+        engine = getattr(self, "backup_engine", None)
+        if engine is not None:
+            try:
+                analysis_state = engine.state()
+                summaries = {
+                    int(object_value(summary, "volume_id")): summary
+                    for summary in engine.volume_summaries()
+                }
+                scans = {
+                    int(object_value(scan, "volume_id")): scan
+                    for scan in engine.scan_records()
+                }
+            except Exception:
+                summaries = {}
+                scans = {}
+                analysis_state = None
+        self.backup_volume_summaries = summaries
+        self.backup_scan_records = scans
+        self.backup_analysis_state = analysis_state
         resolver = ConnectedVolumeResolver(
             self._connected_volume_snapshots,
             check_source_path=False,
@@ -3875,6 +5560,9 @@ class MainWindow(QMainWindow):
             volume_item_from_record(
                 volume,
                 self.current_source_path_for_volume(volume, resolver) is not None,
+                summaries.get(int(volume["id"])),
+                scans.get(int(volume["id"])),
+                analysis_state,
             )
             for volume in volumes
         ]
@@ -3989,6 +5677,13 @@ class MainWindow(QMainWindow):
         current_source_path = self.current_source_path_for_volume(volume)
         connected = current_source_path is not None
         full = percentage_full(volume["used_bytes"], volume["capacity_bytes"])
+        volume_id = int(volume["id"])
+        backup = volume_backup_display(
+            getattr(self, "backup_volume_summaries", {}).get(volume_id),
+            int(volume["indexed_file_count"] or 0),
+            getattr(self, "backup_scan_records", {}).get(volume_id),
+            getattr(self, "backup_analysis_state", None),
+        )
         values = {
             "drive_id": volume["drive_id"] or "-",
             "name": display_volume_name(volume["name"]),
@@ -3997,9 +5692,11 @@ class MainWindow(QMainWindow):
             "register_status": volume["register_status"],
             "condition": volume["condition"],
             "last_scan": self._display_time(volume["last_scan_at"]),
+            "backup_coverage": backup.text,
         }
         for key, value in values.items():
             self.detail_labels[key].setText(value)
+        self.detail_labels["backup_coverage"].setToolTip(backup.tooltip)
         self.detail_full.setValue(full)
 
     def add_volume(self) -> None:
@@ -4380,6 +6077,8 @@ class MainWindow(QMainWindow):
         self.scan_thread = None
         self.scan_cancel_requested = False
         self._set_scan_running_ui(False)
+        if self.backup_evidence_dialog is not None:
+            self.refresh_backup_evidence_dialog()
         if self.post_scan_edit_volume_id is not None:
             volume_id = self.post_scan_edit_volume_id
             self.post_scan_edit_volume_id = None
@@ -4410,6 +6109,8 @@ class MainWindow(QMainWindow):
         self.delete_worker = None
         self.delete_thread = None
         self._set_catalogue_busy(False)
+        if self.backup_evidence_dialog is not None:
+            self.refresh_backup_evidence_dialog()
 
     def refresh_after_catalogue_write(self) -> None:
         if self.db is None:
@@ -4421,6 +6122,8 @@ class MainWindow(QMainWindow):
         # as a scan finishes.
         self.refresh_volumes()
         self.perform_search()
+        if getattr(self, "backup_evidence_dialog", None) is not None:
+            self.refresh_backup_evidence_dialog()
 
     def select_volume(self, volume_id: int) -> bool:
         for row, item in enumerate(self.volume_model.items):
@@ -4456,6 +6159,7 @@ class MainWindow(QMainWindow):
     def clear_browser(self) -> None:
         self.set_browser_notice("")
         self.folder_tree.clear()
+        self.current_directory_items = []
         self.browser_model.set_items([])
         self.current_folder_id = None
         self.current_path_label.setText("/")
@@ -4513,6 +6217,7 @@ class MainWindow(QMainWindow):
             return
         folder = self.db.get_folder(folder_id)
         if folder is None:
+            self.current_directory_items = []
             self.browser_model.set_items([])
             self.current_path_label.setText("/")
             self.up_button.setEnabled(False)
@@ -4537,7 +6242,27 @@ class MainWindow(QMainWindow):
                     )
                 )
 
-        for child in self.db.list_child_folders(volume_id, folder_id):
+        child_folders = self.db.list_child_folders(volume_id, folder_id)
+        files = self.db.list_files(volume_id, folder_id)
+        folder_statuses: dict[int, Any] = {}
+        file_statuses: dict[int, Any] = {}
+        engine = getattr(self, "backup_engine", None)
+        if engine is not None:
+            try:
+                folder_statuses = engine.item_statuses(
+                    "folder",
+                    [int(child["id"]) for child in child_folders],
+                )
+                file_statuses = engine.item_statuses(
+                    "file",
+                    [int(file_row["id"]) for file_row in files],
+                )
+            except Exception:
+                folder_statuses = {}
+                file_statuses = {}
+
+        volume_references = getattr(self, "backup_volume_references", {})
+        for child in child_folders:
             items.append(
                 BrowserItem(
                     item_type="folder",
@@ -4549,10 +6274,15 @@ class MainWindow(QMainWindow):
                     modified_at=child["modified_at"],
                     missing=bool(child["missing"]),
                     parent_id=child["parent_id"],
+                    backup=item_backup_display(
+                        folder_statuses.get(int(child["id"])),
+                        volume_references,
+                        item_type="folder",
+                    ),
                 )
             )
 
-        for file_row in self.db.list_files(volume_id, folder_id):
+        for file_row in files:
             extension = file_row["extension"] or ""
             items.append(
                 BrowserItem(
@@ -4566,17 +6296,45 @@ class MainWindow(QMainWindow):
                     modified_at=file_row["modified_at"],
                     missing=bool(file_row["missing"]),
                     parent_id=file_row["folder_id"],
+                    backup=item_backup_display(
+                        file_statuses.get(int(file_row["id"])),
+                        volume_references,
+                        item_type="file",
+                    ),
                 )
             )
 
-        self.browser_model.set_items(items)
+        self.current_directory_items = items
+        MainWindow.apply_browser_backup_filter(self)
         self.current_path_label.setText(relative_path_for_display(folder["relative_path"]))
         self.up_button.setEnabled(folder["parent_id"] is not None)
         self.apply_table_default_columns(
             self.file_table,
-            {1: 140, 2: 95, 3: 155, 4: 280, 5: 90},
+            {1: 165, 2: 140, 3: 95, 4: 155, 5: 280, 6: 90},
             only_if_empty=True,
         )
+
+    def browser_backup_filter_key(self) -> str:
+        combo = getattr(self, "browser_backup_filter_combo", None)
+        if combo is None:
+            return "all"
+        return str(combo.currentData() or "all")
+
+    def search_backup_filter_key(self) -> str:
+        combo = getattr(self, "search_backup_filter_combo", None)
+        if combo is None:
+            return "all"
+        return str(combo.currentData() or "all")
+
+    def apply_browser_backup_filter(self) -> None:
+        items = getattr(self, "current_directory_items", [])
+        filter_key = MainWindow.browser_backup_filter_key(self)
+        visible = [
+            item
+            for item in items
+            if item.is_parent_entry or backup_filter_matches(item.backup, filter_key)
+        ]
+        self.browser_model.set_items(visible)
 
     def selected_browser_item(self) -> BrowserItem | None:
         return self.browser_model.item_at(self.file_table.currentIndex())
@@ -4875,6 +6633,113 @@ class MainWindow(QMainWindow):
                 ("Last recorded by scan", self._display_time(record["scanned_at"])),
             ]
         )
+        status = None
+        engine = getattr(self, "backup_engine", None)
+        if engine is not None:
+            try:
+                status = (
+                    engine.folder_status(int(record["item_id"]))
+                    if item_type == "folder"
+                    else engine.file_status(int(record["item_id"]))
+                )
+            except Exception:
+                status = None
+        display = item_backup_display(
+            status,
+            getattr(self, "backup_volume_references", {}),
+            item_type=item_type,
+        )
+        other_refs = backup_drive_references(
+            object_value(status, "other_volume_ids", ()) if status is not None else (),
+            getattr(self, "backup_volume_references", {}),
+        )
+        stale_status = bool(object_value(status, "is_stale", False))
+        properties.extend(
+            [
+                ("Other-copy status", display.text),
+                (
+                    backup_evidence_label("Matching catalogue drives", stale_status),
+                    ", ".join(other_refs) if other_refs else "None listed",
+                ),
+                (
+                    backup_evidence_label("Metadata evidence", stale_status),
+                    str(object_value(status, "evidence_text", "") or "Unavailable"),
+                ),
+            ]
+        )
+        if item_type == "file" and status is not None:
+            strong_refs = backup_drive_references(
+                object_value(status, "strong_volume_ids", ()) or (),
+                getattr(self, "backup_volume_references", {}),
+            )
+            possible_refs = backup_drive_references(
+                object_value(status, "possible_volume_ids", ()) or (),
+                getattr(self, "backup_volume_references", {}),
+            )
+            if strong_refs:
+                properties.append(
+                    (
+                        backup_evidence_label("Strong match drives", stale_status),
+                        ", ".join(strong_refs),
+                    )
+                )
+            if possible_refs:
+                properties.append(
+                    (
+                        backup_evidence_label("Possible-only drives", stale_status),
+                        ", ".join(possible_refs),
+                    )
+                )
+        if item_type == "folder" and status is not None:
+            strong_refs = backup_drive_references(
+                object_value(status, "strong_volume_ids", ()) or (),
+                getattr(self, "backup_volume_references", {}),
+            )
+            possible_refs = backup_drive_references(
+                object_value(status, "possible_volume_ids", ()) or (),
+                getattr(self, "backup_volume_references", {}),
+            )
+            if strong_refs:
+                properties.append(
+                    (
+                        backup_evidence_label("Complete structure drives", stale_status),
+                        ", ".join(strong_refs),
+                    )
+                )
+            if possible_refs:
+                properties.append(
+                    (
+                        backup_evidence_label("Possible or partial drives", stale_status),
+                        ", ".join(possible_refs),
+                    )
+                )
+            files_percent = object_value(status, "best_coverage_files_percent")
+            bytes_percent = object_value(status, "best_coverage_bytes_percent")
+            if files_percent is not None or bytes_percent is not None:
+                parts = []
+                if files_percent is not None:
+                    parts.append(f"{float(files_percent):.0f}% of files")
+                if bytes_percent is not None:
+                    parts.append(f"{float(bytes_percent):.0f}% of bytes")
+                properties.append(
+                    (
+                        backup_evidence_label(
+                            "Best single-drive folder coverage", stale_status
+                        ),
+                        ", ".join(parts),
+                    )
+                )
+        properties.extend(
+            [
+                (
+                    "Backup analysis",
+                    self._display_time(object_value(status, "analysed_at"))
+                    if status is not None
+                    else "Not run",
+                ),
+                ("Verification", BACKUP_METADATA_DISCLAIMER),
+            ]
+        )
         return properties
 
     def parent_folder_display(self, record) -> str:
@@ -5001,6 +6866,7 @@ class MainWindow(QMainWindow):
             request_id,
             list(self._connected_volume_snapshots),
             include_paths=include_paths,
+            backup_filter_key=MainWindow.search_backup_filter_key(self),
         )
         self.search_worker.moveToThread(self.search_thread)
         self.search_thread.started.connect(self.search_worker.run)
