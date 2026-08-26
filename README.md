@@ -58,6 +58,9 @@ is a valid SQLite database and contains the full catalogue.
 5. Use the search bar to search across all indexed volumes.
 6. Use **Scan** again to refresh an existing catalogue.
 
+While a scan is running, use **Cancel Scan** beside the progress bar to cancel
+it. Partial results are discarded, so the existing catalogue remains intact.
+
 When an existing catalogue has changed, the app shows the added, changed, and
 no-longer-present file counts and the indexed-size difference before applying
 the update. Cancelling the confirmation leaves the existing catalogue intact.

@@ -64,7 +64,7 @@ def test_drive_id_dialog_updates_and_unlocks_the_volume_label(monkeypatch):
         allow_volume_label_rename=True,
     )
 
-    assert dialog.rename_volume_label_check.text() == "Rename Volume Label to Drive id"
+    assert dialog.rename_volume_label_check.text() == "Rename volume label to match Drive ID"
     assert dialog.rename_volume_label_check.isChecked()
     assert dialog.volume_label_edit.text() == "AID-042"
     assert not dialog.volume_label_edit.isEnabled()
@@ -811,6 +811,65 @@ def test_catalogue_open_worker_can_be_cancelled_before_opening(monkeypatch):
 
     assert opened == []
     assert cancelled == [True]
+
+
+def test_cancel_scan_requests_cancellation_once_and_updates_controls():
+    events = []
+
+    class FakeWorker:
+        def cancel(self):
+            events.append("cancel")
+
+    class FakeControl:
+        def setEnabled(self, enabled):
+            events.append(("enabled", enabled))
+
+        def setFormat(self, message):
+            events.append(("format", message))
+
+    class FakeStatusBar:
+        def showMessage(self, message):
+            events.append(("status", message))
+
+    window = SimpleNamespace(
+        scan_worker=FakeWorker(),
+        scan_cancel_requested=False,
+        stop_scan_button=FakeControl(),
+        scan_progress=FakeControl(),
+        statusBar=lambda: FakeStatusBar(),
+    )
+
+    MainWindow.cancel_scan(window)
+    MainWindow.cancel_scan(window)
+
+    assert window.scan_cancel_requested is True
+    assert events == [
+        "cancel",
+        ("enabled", False),
+        ("format", "Cancelling scan..."),
+        ("status", "Cancelling scan..."),
+    ]
+
+
+def test_scan_running_ui_only_enables_stop_button_during_active_scan():
+    enabled_states = []
+
+    class FakeControl:
+        def setEnabled(self, enabled):
+            enabled_states.append(enabled)
+
+    window = SimpleNamespace(
+        db=object(),
+        scan_cancel_requested=False,
+        scan_blocked_actions=[],
+        scan_blocked_widgets=[],
+        stop_scan_button=FakeControl(),
+    )
+
+    MainWindow._set_scan_running_ui(window, True)
+    MainWindow._set_scan_running_ui(window, False)
+
+    assert enabled_states == [True, False]
 
 
 def test_catalogue_open_worker_cancel_interrupts_and_releases_resources(monkeypatch):

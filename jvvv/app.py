@@ -1073,7 +1073,7 @@ class DriveIdDialog(QDialog):
         self._custom_volume_label = volume_label
         self.volume_label_edit = QLineEdit(volume_label)
         self.rename_volume_label_check = QCheckBox(
-            "Rename Volume Label to Drive id"
+            "Rename volume label to match Drive ID"
         )
         self.rename_volume_label_check.setEnabled(allow_volume_label_rename)
         self.rename_volume_label_check.setChecked(allow_volume_label_rename)
@@ -2232,6 +2232,7 @@ class MainWindow(QMainWindow):
         self.current_folder_id: int | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: ScanWorker | None = None
+        self.scan_cancel_requested = False
         self.post_scan_edit_volume_id: int | None = None
         self.delete_thread: QThread | None = None
         self.delete_worker: DeleteVolumeWorker | None = None
@@ -2651,6 +2652,17 @@ class MainWindow(QMainWindow):
         self.scan_progress.setTextVisible(True)
         configure_progress_bar(self.scan_progress)
 
+        self.stop_scan_button = QPushButton("Cancel Scan")
+        self.stop_scan_button.setEnabled(False)
+        self.stop_scan_button.setToolTip("Cancel the active scan and discard its partial results")
+
+        scan_status_layout = QHBoxLayout()
+        self.scan_status_layout = scan_status_layout
+        scan_status_layout.setContentsMargins(0, 0, 0, 0)
+        scan_status_layout.setSpacing(5)
+        scan_status_layout.addWidget(self.stop_scan_button)
+        scan_status_layout.addWidget(self.scan_progress, 1)
+
         right = QWidget()
         right.setObjectName("contentPane")
         right_layout = QVBoxLayout(right)
@@ -2659,7 +2671,7 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(5)
         right_layout.addWidget(self.details_box)
         right_layout.addWidget(self.tabs, 1)
-        right_layout.addWidget(self.scan_progress)
+        right_layout.addLayout(scan_status_layout)
 
         splitter = QSplitter()
         self.workspace_splitter = splitter
@@ -3012,6 +3024,7 @@ class MainWindow(QMainWindow):
         self.file_table.doubleClicked.connect(self.open_browser_index)
         self.file_table.customContextMenuRequested.connect(self.show_browser_context_menu)
         self.search_button.clicked.connect(self.perform_search)
+        self.stop_scan_button.clicked.connect(self.cancel_scan)
         self.search_edit.returnPressed.connect(self.perform_search)
         self.search_table.selectionModel().selectionChanged.connect(self.on_search_selection_changed)
         self.search_table.doubleClicked.connect(self.open_search_index)
@@ -3686,9 +3699,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return False
 
-        self.scan_worker.cancel()
-        self.scan_progress.setFormat("Cancelling...")
-        self.statusBar().showMessage("Cancelling scan...")
+        self.cancel_scan()
 
         for _ in range(50):
             QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
@@ -3791,6 +3802,8 @@ class MainWindow(QMainWindow):
             action.setEnabled(enabled)
         for widget in self.scan_blocked_widgets:
             widget.setEnabled(enabled)
+        if hasattr(self, "stop_scan_button"):
+            self.stop_scan_button.setEnabled(running and not self.scan_cancel_requested)
 
     def _set_catalogue_open(self, is_open: bool) -> None:
         if hasattr(self, "stack"):
@@ -4193,6 +4206,7 @@ class MainWindow(QMainWindow):
         self.scan_progress.setRange(0, 0)
         self.scan_progress.setFormat("Starting scan...")
         self.statusBar().showMessage("Scanning...")
+        self.scan_cancel_requested = False
         self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
         self._set_scan_running_ui(True)
 
@@ -4220,13 +4234,18 @@ class MainWindow(QMainWindow):
         return directory or None
 
     def cancel_scan(self) -> None:
-        if self.scan_worker is not None:
-            self.scan_worker.cancel()
-            self.scan_progress.setFormat("Cancelling...")
-            self.statusBar().showMessage("Cancelling scan...")
+        if self.scan_worker is None or self.scan_cancel_requested:
+            return
+        self.scan_cancel_requested = True
+        self.scan_worker.cancel()
+        self.stop_scan_button.setEnabled(False)
+        self.scan_progress.setFormat("Cancelling scan...")
+        self.statusBar().showMessage("Cancelling scan...")
 
     @Slot(int, int, str)
     def on_scan_progress(self, files_seen: int, folders_seen: int, current_path: str) -> None:
+        if self.scan_cancel_requested:
+            return
         if self.scan_progress.maximum() != 0:
             self.scan_progress.setRange(0, 0)
         self.scan_progress.setFormat(
@@ -4237,6 +4256,9 @@ class MainWindow(QMainWindow):
     def on_scan_review_requested(self, changes: dict) -> None:
         worker = self.scan_worker
         if worker is None:
+            return
+        if self.scan_cancel_requested:
+            worker.resolve_review(False)
             return
 
         self.scan_progress.setRange(0, 1)
@@ -4303,6 +4325,8 @@ class MainWindow(QMainWindow):
         done: int,
         total: int,
     ) -> None:
+        if self.scan_cancel_requested:
+            return
         label = self.scan_stats_progress_label(message)
         if total > 0:
             value = min(max(done, 0), total)
@@ -4354,6 +4378,7 @@ class MainWindow(QMainWindow):
     def clear_scan_worker(self) -> None:
         self.scan_worker = None
         self.scan_thread = None
+        self.scan_cancel_requested = False
         self._set_scan_running_ui(False)
         if self.post_scan_edit_volume_id is not None:
             volume_id = self.post_scan_edit_volume_id
