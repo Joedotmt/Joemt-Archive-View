@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from PySide6.QtWidgets import QDialog
+from PySide6.QtWidgets import QApplication, QDialog
 
 from jvvv.app import (
     ACCENT_COLOR_SETTING,
@@ -19,6 +19,7 @@ from jvvv.app import (
     SearchWorker,
     THEME_STYLE_SETTING,
     connected_volume_signature,
+    DriveIdDialog,
     format_exception_diagnostics,
     include_content_timestamp,
     probe_catalogue_location,
@@ -50,6 +51,131 @@ def test_new_volume_drive_id_prefers_aid_volume_label():
     assert suggested_new_volume_drive_id("aid-042", "AID-999") == "AID-042"
     assert suggested_new_volume_drive_id("Archive Drive", "AID-999") == "AID-999"
     assert suggested_new_volume_drive_id("AID-42", "AID-999") == "AID-999"
+
+
+def test_drive_id_dialog_updates_and_unlocks_the_volume_label(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    dialog = DriveIdDialog(
+        None,
+        suggested_drive_id="AID-042",
+        source_path="E:\\",
+        volume_label="Archive",
+        allow_volume_label_rename=True,
+    )
+
+    assert dialog.rename_volume_label_check.text() == "Rename Volume Label to Drive id"
+    assert dialog.rename_volume_label_check.isChecked()
+    assert dialog.volume_label_edit.text() == "AID-042"
+    assert not dialog.volume_label_edit.isEnabled()
+
+    dialog.drive_id_edit.setText("AID-043")
+    assert dialog.volume_label_edit.text() == "AID-043"
+
+    dialog.rename_volume_label_check.setChecked(False)
+    assert dialog.volume_label_edit.text() == "Archive"
+    assert dialog.volume_label_edit.isEnabled()
+
+    dialog.volume_label_edit.setText("Custom Archive")
+    dialog.rename_volume_label_check.setChecked(True)
+    assert dialog.volume_label_edit.text() == "AID-043"
+    assert not dialog.volume_label_edit.isEnabled()
+
+    dialog.rename_volume_label_check.setChecked(False)
+    assert dialog.volume_label_edit.text() == "Custom Archive"
+    assert app is not None
+
+
+def test_new_volume_drive_id_can_rename_the_actual_volume(monkeypatch):
+    renamed = []
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["allow_volume_label_rename"] is True
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def value(self):
+            return "AID-042"
+
+        def should_rename_volume_label(self):
+            return True
+
+        def volume_label_value(self):
+            return "Archive"
+
+    window = SimpleNamespace(
+        db=SimpleNamespace(
+            next_drive_id=lambda: "AID-042",
+            list_volumes=lambda: [],
+        )
+    )
+    snapshot = VolumeSnapshot(
+        source_path="E:\\",
+        mount_root="E:\\",
+        source_relative_path="",
+        identity_kind="windows-volume-guid",
+        identity_token="volume-42",
+        identity_label="Archive",
+    )
+    monkeypatch.setattr("jvvv.app.sys.platform", "win32")
+    monkeypatch.setattr("jvvv.app.DriveIdDialog", FakeDialog)
+    monkeypatch.setattr(
+        "jvvv.app.rename_volume_label",
+        lambda source_path, label: renamed.append((source_path, label)),
+    )
+
+    drive_id = MainWindow.choose_new_volume_drive_id(window, "E:\\", snapshot)
+
+    assert drive_id == "AID-042"
+    assert renamed == [("E:\\", "AID-042")]
+
+
+def test_new_volume_drive_id_can_apply_an_edited_volume_label(monkeypatch):
+    renamed = []
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def value(self):
+            return "AID-042"
+
+        def should_rename_volume_label(self):
+            return False
+
+        def volume_label_value(self):
+            return "Custom Archive"
+
+    window = SimpleNamespace(
+        db=SimpleNamespace(
+            next_drive_id=lambda: "AID-042",
+            list_volumes=lambda: [],
+        )
+    )
+    snapshot = VolumeSnapshot(
+        source_path="E:\\",
+        mount_root="E:\\",
+        source_relative_path="",
+        identity_kind="windows-volume-guid",
+        identity_token="volume-42",
+        identity_label="Archive",
+    )
+    monkeypatch.setattr("jvvv.app.sys.platform", "win32")
+    monkeypatch.setattr("jvvv.app.DriveIdDialog", FakeDialog)
+    monkeypatch.setattr(
+        "jvvv.app.rename_volume_label",
+        lambda source_path, label: renamed.append((source_path, label)),
+    )
+
+    drive_id = MainWindow.choose_new_volume_drive_id(window, "E:\\", snapshot)
+
+    assert drive_id == "AID-042"
+    assert renamed == [("E:\\", "Custom Archive")]
 
 
 def test_connected_volume_signature_detects_identity_and_mount_root():

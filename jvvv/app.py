@@ -116,6 +116,7 @@ from .utils import (
     list_connected_volume_snapshots,
     open_in_file_manager,
     percentage_full,
+    rename_volume_label,
     relative_path_for_display,
     resolve_volume_source_path,
 )
@@ -1041,6 +1042,7 @@ class DriveIdDialog(QDialog):
         source_path: str,
         volume_label: str = "",
         existing_volumes: list[Any] | None = None,
+        allow_volume_label_rename: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Confirm Drive ID")
@@ -1066,14 +1068,28 @@ class DriveIdDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Drive or folder", path_label)
-        if volume_label:
-            label_widget = QLabel(volume_label)
-            label_widget.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-                | Qt.TextInteractionFlag.TextSelectableByKeyboard
-            )
-            form.addRow("Volume Label", label_widget)
         form.addRow("Drive ID", self.drive_id_edit)
+
+        self._custom_volume_label = volume_label
+        self.volume_label_edit = QLineEdit(volume_label)
+        self.rename_volume_label_check = QCheckBox(
+            "Rename Volume Label to Drive id"
+        )
+        self.rename_volume_label_check.setEnabled(allow_volume_label_rename)
+        self.rename_volume_label_check.setChecked(allow_volume_label_rename)
+        if not allow_volume_label_rename:
+            self.rename_volume_label_check.setToolTip(
+                "Volume-label renaming is available for connected Windows volumes."
+            )
+        form.addRow("Volume Label", self.volume_label_edit)
+        form.addRow("", self.rename_volume_label_check)
+
+        self.rename_volume_label_check.toggled.connect(
+            self.on_rename_volume_label_toggled
+        )
+        self.drive_id_edit.textChanged.connect(self.on_drive_id_changed)
+        self.volume_label_edit.textEdited.connect(self.remember_custom_volume_label)
+        self.sync_volume_label_controls()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1088,6 +1104,34 @@ class DriveIdDialog(QDialog):
 
     def value(self) -> str:
         return self.drive_id_edit.text().strip()
+
+    def should_rename_volume_label(self) -> bool:
+        return self.rename_volume_label_check.isChecked()
+
+    def volume_label_value(self) -> str:
+        return self.volume_label_edit.text().strip()
+
+    def remember_custom_volume_label(self, label: str) -> None:
+        self._custom_volume_label = label
+
+    def on_rename_volume_label_toggled(self, checked: bool) -> None:
+        if checked:
+            self._custom_volume_label = self.volume_label_edit.text()
+        self.sync_volume_label_controls()
+
+    def on_drive_id_changed(self, drive_id: str) -> None:
+        if self.rename_volume_label_check.isChecked():
+            self.volume_label_edit.setText(drive_id)
+
+    def sync_volume_label_controls(self) -> None:
+        rename_to_drive_id = self.rename_volume_label_check.isChecked()
+        if rename_to_drive_id:
+            self.volume_label_edit.setText(self.drive_id_edit.text())
+        else:
+            self.volume_label_edit.setText(self._custom_volume_label)
+        self.volume_label_edit.setEnabled(
+            self.rename_volume_label_check.isEnabled() and not rename_to_drive_id
+        )
 
     def validate_form(self) -> str | None:
         drive_id = self.value()
@@ -1288,7 +1332,7 @@ class VolumeDialog(QDialog):
     def _dialog_section(self, title: str) -> tuple[QGroupBox, QFormLayout]:
         box = QGroupBox(title)
         form = QFormLayout(box)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         return box, form
 
     def browse(self) -> None:
@@ -3961,6 +4005,9 @@ class MainWindow(QMainWindow):
             drive_id = self.choose_new_volume_drive_id(source_path, snapshot)
             if drive_id is None:
                 return
+            refreshed_snapshot = capture_volume_snapshot(source_path) if source_path else None
+            if refreshed_snapshot is not None:
+                snapshot = refreshed_snapshot
             volume_id = self.db.create_volume(
                 "",
                 source_path,
@@ -3992,10 +4039,19 @@ class MainWindow(QMainWindow):
             source_path=source_path,
             volume_label=volume_label,
             existing_volumes=self.db.list_volumes(),
+            allow_volume_label_rename=snapshot is not None and sys.platform == "win32",
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        return dialog.value()
+        drive_id = dialog.value()
+        target_volume_label = (
+            drive_id
+            if dialog.should_rename_volume_label()
+            else dialog.volume_label_value()
+        )
+        if snapshot is not None and target_volume_label != volume_label:
+            rename_volume_label(source_path, target_volume_label)
+        return drive_id
 
     def edit_volume(self) -> None:
         if self.db is None:

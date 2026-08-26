@@ -246,7 +246,7 @@ def test_search_menu_includes_catalogue_location(monkeypatch, tmp_path):
 
     assert [item.text if item is not None else None for item in menu.items] == [
         "Open",
-        "Open Catalogue Location",
+        "View in Catalogue",
         "Open File Location",
         "Copy Path",
         None,

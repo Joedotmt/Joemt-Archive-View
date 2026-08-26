@@ -40,3 +40,24 @@ def test_connected_volume_resolver_matches_identity_not_saved_path(tmp_path):
 
     assert resolver.resolve(old_drive_a) is None
     assert resolver.resolve(current_drive_b) == str(mounted / "Archive")
+
+
+def test_rename_volume_label_uses_the_volume_containing_the_source(monkeypatch):
+    calls = []
+
+    class FakeKernel32:
+        def SetVolumeLabelW(self, mount_root, label):
+            calls.append((mount_root, label))
+            return 1
+
+    monkeypatch.setattr(utils.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(utils, "_windows_volume_path_name", lambda path: "E:\\")
+    monkeypatch.setattr(
+        utils.ctypes,
+        "WinDLL",
+        lambda name, use_last_error: FakeKernel32(),
+    )
+
+    utils.rename_volume_label("E:\\Archive", "AID-042")
+
+    assert calls == [("E:\\", "AID-042")]

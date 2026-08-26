@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
@@ -16,6 +17,7 @@ ADOBE_ACCENT_COLOR = "#5681ff"
 DEFAULT_ACCENT_COLOR = ADOBE_ACCENT_COLOR
 
 THEME_STYLES = frozenset({ADOBE_THEME, FUSION_THEME})
+DROPDOWN_ARROW = (Path(__file__).parent / "assets" / "dropdown-arrow.svg").as_posix()
 
 
 # A compact, neutral dark theme inspired by Blender's workspace chrome and
@@ -190,6 +192,7 @@ QComboBox::drop-down, QDateEdit::drop-down {
     border: 0;
     border-left: 1px solid #151619;
 }
+QComboBox::down-arrow, QDateEdit::down-arrow { image: url("__DROPDOWN_ARROW__"); width: 8px; height: 5px; }
 
 QAbstractItemView {
     color: #d4d6da;
@@ -547,6 +550,7 @@ QComboBox::drop-down, QDateEdit::drop-down {
     border: 0;
     border-left: 1px solid __CONTROL_BORDER__;
 }
+QComboBox::down-arrow, QDateEdit::down-arrow { image: url("__DROPDOWN_ARROW__"); width: 8px; height: 5px; }
 
 QAbstractItemView {
     color: __FOREGROUND__;
@@ -989,6 +993,7 @@ def application_stylesheet(
     accent_color = normalize_accent_color(accent_color)
 
     stylesheet = APP_STYLESHEET.replace("#ffffff", "__ACCENT_TEXT__")
+    stylesheet = stylesheet.replace("__DROPDOWN_ARROW__", DROPDOWN_ARROW)
     stylesheet = stylesheet.replace(
         "__TAB_SELECTED_TEXT__",
         "#181a1f" if color_mode == LIGHT_MODE else "#ffffff",
@@ -1012,6 +1017,7 @@ def preset_stylesheet(
     """Return the Adobe-inspired default stylesheet."""
     tokens = _preset_theme_tokens(theme_style, color_mode, accent_color)
     stylesheet = PRESET_STYLESHEET
+    stylesheet = stylesheet.replace("__DROPDOWN_ARROW__", DROPDOWN_ARROW)
     for name, value in tokens.items():
         stylesheet = stylesheet.replace(f"__{name}__", value)
     return _scale_stylesheet(stylesheet, scale)

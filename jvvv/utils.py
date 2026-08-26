@@ -100,6 +100,32 @@ def capture_volume_snapshot(source_path: str | Path | None) -> VolumeSnapshot | 
     return _capture_local_path_snapshot(path)
 
 
+def rename_volume_label(source_path: str | Path, label: str) -> None:
+    """Rename the Windows volume containing *source_path*."""
+    if platform.system() != "Windows":
+        raise OSError("Renaming volume labels is only supported on Windows.")
+
+    mount_root = _windows_volume_path_name(str(Path(source_path).expanduser()))
+    if mount_root is None:
+        raise OSError(f"Could not identify the volume containing {source_path}.")
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if kernel32.SetVolumeLabelW(mount_root, label):
+        return
+
+    error_code = ctypes.get_last_error()
+    error_message = (
+        ctypes.FormatError(error_code).strip()
+        if error_code
+        else "Unknown Windows error."
+    )
+    raise OSError(
+        error_code,
+        f"Could not rename the volume label to {label}: {error_message}",
+        mount_root,
+    )
+
+
 def list_connected_volume_snapshots() -> list[VolumeSnapshot]:
     if platform.system() == "Windows":
         return _list_windows_volume_snapshots()

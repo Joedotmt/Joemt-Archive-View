@@ -85,13 +85,13 @@ pip install pyinstaller
 Build a one-folder application:
 
 ```bash
-pyinstaller --name JVVV --windowed --collect-all PySide6 jvvv_app.py
+pyinstaller --name JVVV --windowed --collect-all PySide6 --collect-data jvvv jvvv_app.py
 ```
 
 For a single executable:
 
 ```bash
-pyinstaller --name JVVV --onefile --windowed --collect-all PySide6 jvvv_app.py
+pyinstaller --name JVVV --onefile --windowed --collect-all PySide6 --collect-data jvvv jvvv_app.py
 ```
 
 The generated application will be in `dist/`. Catalogue records are saved in
