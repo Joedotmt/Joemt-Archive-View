@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 CATALOGUE_EXTENSION = ".jvvv"
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
@@ -44,6 +44,7 @@ REQUIRED_TABLES = {
     "volume_register",
     "folders",
     "files",
+    "file_media_metadata",
     "files_fts",
     "folders_fts",
     "scan_history",
@@ -90,6 +91,7 @@ REQUIRED_COLUMNS = {
         "evidence_text",
         "strong_volume_ids",
         "possible_volume_ids",
+        "verified_volume_ids",
     },
     "backup_folder_results": {
         "run_id",
@@ -220,6 +222,25 @@ REQUIRED_COLUMNS = {
         "scanned_at",
         "identity_device",
         "identity_inode",
+        "content_hash",
+        "content_hash_algorithm",
+    },
+    "file_media_metadata": {
+        "file_id",
+        "status",
+        "media_kind",
+        "source",
+        "container",
+        "duration_ms",
+        "width",
+        "height",
+        "video_codecs",
+        "audio_codecs",
+        "sample_rate_hz",
+        "channels",
+        "bit_rate",
+        "message",
+        "probed_at",
     },
     "scan_history": {
         "id",
@@ -238,6 +259,11 @@ REQUIRED_COLUMNS = {
         "folders_removed",
         "bytes_before",
         "bytes_after",
+        "files_hashed",
+        "bytes_hashed",
+        "hash_errors",
+        "media_files",
+        "media_metadata_collected",
     },
     "scan_errors": {
         "id",
@@ -563,6 +589,9 @@ class Database:
                 if version < 10:
                     self._apply_migration_10()
                     version = 10
+                if version < 11:
+                    self._apply_migration_11()
+                    version = 11
                 self.connection.execute(f"PRAGMA user_version = {version}")
                 self.connection.commit()
             except sqlite3.Error:
@@ -1007,6 +1036,49 @@ class Database:
             ) VALUES (1, NULL, 0, '', ?)
             """,
             (utc_now(),),
+        )
+
+    def _apply_migration_11(self) -> None:
+        for column, definition in {
+            "content_hash": "BLOB",
+            "content_hash_algorithm": "TEXT",
+        }.items():
+            self._add_column_if_missing("files", column, definition)
+
+        for column, definition in {
+            "files_hashed": "INTEGER NOT NULL DEFAULT 0",
+            "bytes_hashed": "INTEGER NOT NULL DEFAULT 0",
+            "hash_errors": "INTEGER NOT NULL DEFAULT 0",
+            "media_files": "INTEGER NOT NULL DEFAULT 0",
+            "media_metadata_collected": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            self._add_column_if_missing("scan_history", column, definition)
+
+        self._add_column_if_missing(
+            "backup_file_results",
+            "verified_volume_ids",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_media_metadata (
+                file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                media_kind TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                container TEXT,
+                duration_ms INTEGER,
+                width INTEGER,
+                height INTEGER,
+                video_codecs TEXT,
+                audio_codecs TEXT,
+                sample_rate_hz INTEGER,
+                channels INTEGER,
+                bit_rate INTEGER,
+                message TEXT NOT NULL DEFAULT '',
+                probed_at TEXT
+            )
+            """
         )
 
     def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
@@ -1581,6 +1653,12 @@ class Database:
         errors_count: int,
         message: str | None = None,
         changes: dict[str, int] | None = None,
+        *,
+        files_hashed: int = 0,
+        bytes_hashed: int = 0,
+        hash_errors: int = 0,
+        media_files: int = 0,
+        media_metadata_collected: int = 0,
     ) -> None:
         summary = changes or {}
         with self.transaction() as conn:
@@ -1599,7 +1677,12 @@ class Database:
                     folders_added = ?,
                     folders_removed = ?,
                     bytes_before = ?,
-                    bytes_after = ?
+                    bytes_after = ?,
+                    files_hashed = ?,
+                    bytes_hashed = ?,
+                    hash_errors = ?,
+                    media_files = ?,
+                    media_metadata_collected = ?
                 WHERE id = ?
                 """,
                 (
@@ -1616,6 +1699,11 @@ class Database:
                     summary.get("folders_removed"),
                     summary.get("bytes_before"),
                     summary.get("bytes_after"),
+                    int(files_hashed),
+                    int(bytes_hashed),
+                    int(hash_errors),
+                    int(media_files),
+                    int(media_metadata_collected),
                     scan_id,
                 ),
             )
@@ -1701,16 +1789,25 @@ class Database:
         scanned_at: str,
         identity_device: int | None = None,
         identity_inode: int | None = None,
+        content_hash: bytes | None = None,
+        content_hash_algorithm: str | None = None,
     ) -> int:
         identity_device = normalize_identity_integer(identity_device)
         identity_inode = normalize_identity_integer(identity_inode)
+        normalized_hash = bytes(content_hash) if content_hash is not None else None
+        normalized_algorithm = str(content_hash_algorithm or "").strip().casefold() or None
+        if (normalized_hash is None) != (normalized_algorithm is None):
+            raise ValueError("A content hash and its algorithm must be stored together.")
+        if normalized_algorithm == "sha256" and len(normalized_hash or b"") != 32:
+            raise ValueError("A SHA-256 content hash must contain exactly 32 bytes.")
         cur = self.connection.execute(
             """
             INSERT INTO files (
                 volume_id, folder_id, name, relative_path, extension,
-                size_bytes, modified_at, missing, scanned_at, identity_device, identity_inode
+                size_bytes, modified_at, missing, scanned_at, identity_device, identity_inode,
+                content_hash, content_hash_algorithm
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
             ON CONFLICT(volume_id, relative_path) DO UPDATE SET
                 folder_id = excluded.folder_id,
                 name = excluded.name,
@@ -1720,7 +1817,9 @@ class Database:
                 missing = 0,
                 scanned_at = excluded.scanned_at,
                 identity_device = excluded.identity_device,
-                identity_inode = excluded.identity_inode
+                identity_inode = excluded.identity_inode,
+                content_hash = excluded.content_hash,
+                content_hash_algorithm = excluded.content_hash_algorithm
             RETURNING id
             """,
             (
@@ -1734,9 +1833,91 @@ class Database:
                 scanned_at,
                 identity_device,
                 identity_inode,
+                normalized_hash,
+                normalized_algorithm,
             ),
         )
         return int(cur.fetchone()["id"])
+
+    def replace_file_media_metadata(
+        self,
+        file_id: int,
+        metadata: dict[str, Any] | None,
+        *,
+        preserve_existing_on_failure: bool = False,
+    ) -> None:
+        if (
+            metadata is not None
+            and preserve_existing_on_failure
+            and str(metadata.get("status") or "").casefold()
+            in {"unavailable", "failed"}
+        ):
+            existing = self.get_file_media_metadata(file_id)
+            if existing is not None and str(existing["status"] or "").casefold() in {
+                "complete",
+                "partial",
+            }:
+                latest_message = str(metadata.get("message") or "").strip()
+                retained_message = (
+                    "Previously collected details were retained; the latest scan "
+                    "could not refresh them"
+                )
+                if latest_message:
+                    retained_message += f": {latest_message}"
+                metadata = {
+                    "status": "partial",
+                    "media_kind": existing["media_kind"],
+                    "source": existing["source"],
+                    "container": existing["container"],
+                    "duration_ms": existing["duration_ms"],
+                    "width": existing["width"],
+                    "height": existing["height"],
+                    "video_codecs": existing["video_codecs"],
+                    "audio_codecs": existing["audio_codecs"],
+                    "sample_rate_hz": existing["sample_rate_hz"],
+                    "channels": existing["channels"],
+                    "bit_rate": existing["bit_rate"],
+                    "message": retained_message,
+                    "probed_at": existing["probed_at"],
+                }
+        self.connection.execute(
+            "DELETE FROM file_media_metadata WHERE file_id = ?",
+            (int(file_id),),
+        )
+        if metadata is None:
+            return
+        self.connection.execute(
+            """
+            INSERT INTO file_media_metadata (
+                file_id, status, media_kind, source, container, duration_ms,
+                width, height, video_codecs, audio_codecs, sample_rate_hz,
+                channels, bit_rate, message, probed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(file_id),
+                str(metadata.get("status") or "unavailable"),
+                str(metadata.get("media_kind") or ""),
+                str(metadata.get("source") or ""),
+                metadata.get("container") or metadata.get("container_format"),
+                metadata.get("duration_ms"),
+                metadata.get("width"),
+                metadata.get("height"),
+                metadata.get("video_codecs") or metadata.get("video_codec"),
+                metadata.get("audio_codecs") or metadata.get("audio_codec"),
+                metadata.get("sample_rate_hz"),
+                metadata.get("channels"),
+                metadata.get("bit_rate"),
+                str(metadata.get("message") or ""),
+                metadata.get("probed_at") or utc_now(),
+            ),
+        )
+
+    def get_file_media_metadata(self, file_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM file_media_metadata WHERE file_id = ?",
+            (int(file_id),),
+        ).fetchone()
 
     def prepare_scan_comparison(self, volume_id: int) -> None:
         """Take a connection-local snapshot used only while reviewing one scan."""
@@ -1747,14 +1928,20 @@ class Database:
             CREATE TEMP TABLE scan_previous_files (
                 relative_path TEXT PRIMARY KEY,
                 size_bytes INTEGER NOT NULL,
-                modified_at TEXT
+                modified_at TEXT,
+                content_hash BLOB,
+                content_hash_algorithm TEXT
             ) WITHOUT ROWID
             """
         )
         self.connection.execute(
             """
-            INSERT INTO scan_previous_files (relative_path, size_bytes, modified_at)
-            SELECT relative_path, size_bytes, modified_at
+            INSERT INTO scan_previous_files (
+                relative_path, size_bytes, modified_at, content_hash,
+                content_hash_algorithm
+            )
+            SELECT relative_path, size_bytes, modified_at, content_hash,
+                   content_hash_algorithm
             FROM files
             WHERE volume_id = ? AND missing = 0
             """,
@@ -1777,6 +1964,26 @@ class Database:
             (volume_id,),
         )
 
+    def scan_previous_file_hash(
+        self,
+        relative_path: str,
+    ) -> tuple[bytes, str] | None:
+        row = self.connection.execute(
+            """
+            SELECT content_hash, content_hash_algorithm
+            FROM scan_previous_files
+            WHERE relative_path = ?
+            """,
+            (relative_path,),
+        ).fetchone()
+        if (
+            row is None
+            or row["content_hash"] is None
+            or not str(row["content_hash_algorithm"] or "").strip()
+        ):
+            return None
+        return bytes(row["content_hash"]), str(row["content_hash_algorithm"])
+
     def scan_change_summary(self, volume_id: int, scanned_at: str) -> dict[str, int]:
         file_totals = self.connection.execute(
             """
@@ -1797,15 +2004,42 @@ class Database:
                 COALESCE(SUM(CASE WHEN p.relative_path IS NULL THEN f.size_bytes ELSE 0 END), 0) AS bytes_added,
                 COALESCE(SUM(CASE
                     WHEN p.relative_path IS NOT NULL
-                     AND (p.size_bytes != f.size_bytes OR p.modified_at IS NOT f.modified_at)
+                     AND (
+                         p.size_bytes != f.size_bytes
+                         OR CASE
+                             WHEN p.content_hash IS NOT NULL
+                              AND f.content_hash IS NOT NULL
+                              AND p.content_hash_algorithm = f.content_hash_algorithm
+                             THEN p.content_hash != f.content_hash
+                             ELSE p.modified_at IS NOT f.modified_at
+                            END
+                     )
                     THEN 1 ELSE 0 END), 0) AS files_changed,
                 COALESCE(SUM(CASE
                     WHEN p.relative_path IS NOT NULL
-                     AND (p.size_bytes != f.size_bytes OR p.modified_at IS NOT f.modified_at)
+                     AND (
+                         p.size_bytes != f.size_bytes
+                         OR CASE
+                             WHEN p.content_hash IS NOT NULL
+                              AND f.content_hash IS NOT NULL
+                              AND p.content_hash_algorithm = f.content_hash_algorithm
+                             THEN p.content_hash != f.content_hash
+                             ELSE p.modified_at IS NOT f.modified_at
+                            END
+                     )
                     THEN p.size_bytes ELSE 0 END), 0) AS changed_bytes_before,
                 COALESCE(SUM(CASE
                     WHEN p.relative_path IS NOT NULL
-                     AND (p.size_bytes != f.size_bytes OR p.modified_at IS NOT f.modified_at)
+                     AND (
+                         p.size_bytes != f.size_bytes
+                         OR CASE
+                             WHEN p.content_hash IS NOT NULL
+                              AND f.content_hash IS NOT NULL
+                              AND p.content_hash_algorithm = f.content_hash_algorithm
+                             THEN p.content_hash != f.content_hash
+                             ELSE p.modified_at IS NOT f.modified_at
+                            END
+                     )
                     THEN f.size_bytes ELSE 0 END), 0) AS changed_bytes_after
             FROM files f
             LEFT JOIN scan_previous_files p ON p.relative_path = f.relative_path
@@ -2173,6 +2407,22 @@ class Database:
                     f.scanned_at,
                     f.identity_device,
                     f.identity_inode,
+                    f.content_hash,
+                    f.content_hash_algorithm,
+                    media.status AS media_status,
+                    media.media_kind,
+                    media.source AS media_source,
+                    media.container AS media_container,
+                    media.duration_ms AS media_duration_ms,
+                    media.width AS media_width,
+                    media.height AS media_height,
+                    media.video_codecs,
+                    media.audio_codecs,
+                    media.sample_rate_hz AS media_sample_rate_hz,
+                    media.channels AS media_channels,
+                    media.bit_rate AS media_bit_rate,
+                    media.message AS media_message,
+                    media.probed_at AS media_probed_at,
                     v.name AS volume_name,
                     v.source_path,
                     parent.id AS parent_folder_id,
@@ -2186,6 +2436,7 @@ class Database:
                 FROM files f
                 JOIN volumes v ON v.id = f.volume_id
                 LEFT JOIN folders parent ON parent.id = f.folder_id
+                LEFT JOIN file_media_metadata media ON media.file_id = f.id
                 WHERE f.id = ?
                 """,
                 (item_id,),

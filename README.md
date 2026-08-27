@@ -23,10 +23,17 @@ component.
   last scan time, and scan logs.
 - Run scans on a Qt worker thread so the interface remains responsive.
 - Cancel scans and record inaccessible files/folders as scan errors.
-- Analyse saved catalogue metadata for evidence that files and folders also
-  exist on other registered drives, without reconnecting or rescanning those
-  drives.
-- Show explicit **Strong**, **Possible/Partial**, **None found**, and
+- Read every accessible regular file during a scan or rescan and store its full
+  SHA-256 content hash. Hashing is streamed and cancellable; partial scan data
+  is rolled back.
+- Store image dimensions with the built-in Qt reader, WAV duration/audio details
+  with Python's built-in reader, and broader audio/video duration, codec,
+  dimensions, sample-rate, channel, and bit-rate details when `ffprobe` is
+  available.
+- Analyse saved catalogue hashes and metadata for evidence that files and folders
+  also exist on other registered drives, without reconnecting or rescanning them.
+- Show explicit **Hash verified**, **Strong metadata**, **Possible/Partial**,
+  **None found**, and
   **Unknown/Outdated** copy-evidence states with the matching drive IDs and the
   exact metadata used for each conclusion.
 - Report per-volume other-copy coverage, potential whole-drive copies, and the
@@ -70,22 +77,41 @@ is a valid SQLite database and contains the full catalogue.
 5. Use the search bar to search across all indexed volumes.
 6. Use **Scan** again to refresh an existing catalogue.
 
+Scanning now reads the complete contents of every accessible regular file and
+recalculates its SHA-256, even when its size and timestamp appear unchanged.
+This catches same-size changes and makes content identity independent of the
+filename, folder, or date, but it also means scans can take roughly as long as
+reading all data on the drive. The scan bar and Scan Log report hashing progress,
+bytes read, and files whose hash could not be recorded. Cancelling or declining a
+rescan restores the previously applied hashes and catalogue records atomically.
+If a file keeps changing or disappears while it is being hashed, it is skipped
+and reported as an incomplete scan area instead of saving a known-stale snapshot.
+
+Media details are descriptive and are never used as file identity. Image sizes
+and WAV details require no additional software. For broader audio/video details,
+install FFmpeg and make its `ffprobe` executable available on `PATH`; otherwise
+Properties explicitly says that those details were not collected. If a later
+probe fails, earlier details are retained only when SHA-256 proves the content is
+unchanged, and Properties labels them as partial with the latest failure reason.
+
 Use **Catalogue > Backup Evidence** to compare records already stored in the
-catalogue. This analysis reads the `.jvvv` database only: it does not access
-source drives, read file contents, or calculate content checksums. A strong
-match is therefore strong metadata evidence of another copy, not byte-for-byte
-verification. Re-run the analysis when the application marks its results as
-outdated after catalogue contents change.
+catalogue. This analysis reads the `.jvvv` database only: it does not access or
+rescan source drives and does not reread file contents. **Hash verified** means
+the full-file SHA-256 values previously recorded by scans are identical, even if
+the files have different names, paths, or timestamps. Re-run the analysis when
+the application marks its results as outdated after catalogue contents change.
 
 The labels are deliberately conservative and explain their evidence in the
-interface. **Strong** file evidence requires the normalized filename, exact
-byte size, modified time, and parent path to agree on another drive.
-**Possible** means only normalized filename and exact size agree. A folder is
-**Complete** only when a bounded, same-named structure containing at least two
-content files matches on one other drive and both scan denominators are
-trustworthy. Renamed or partial structures remain Possible. Overly common or
-competing metadata is shown as **Too common** rather than being guessed, and
-known operating-system bookkeeping is excluded from coverage.
+interface. When one of the two records has no comparable hash, **Strong
+metadata** requires the normalized filename, exact byte size, modified time,
+and parent path to agree; **Possible** means only normalized filename and exact
+size agree. Two comparable but different hashes are never treated as a metadata
+match. A folder is **Complete** only when a bounded, same-named, hash-aware
+structure containing at least two content files matches on one other drive and
+both scan denominators are trustworthy. Mixed hashed/legacy, renamed, or partial
+structures remain Possible. Overly repetitive hashes or metadata are shown as
+**Too common** rather than being guessed, and known operating-system bookkeeping
+is excluded from coverage.
 
 While a scan is running, use **Cancel Scan** beside the progress bar to cancel
 it. Partial results are discarded, so the existing catalogue remains intact.
@@ -103,8 +129,9 @@ real file or reveal it in the operating system file manager.
 pytest
 ```
 
-The automated tests cover database initialization, volume operations, scanning,
-change review and rollback, and search.
+The automated tests cover database initialization and migration, volume
+operations, streaming hashes, media inspection, scan cancellation/change review
+and rollback, hash-first backup evidence, offline browsing, and search.
 
 ## Packaging With PyInstaller
 

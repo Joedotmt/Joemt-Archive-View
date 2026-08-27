@@ -102,6 +102,7 @@ from .database import (
     parse_db_time,
 )
 from .scanner import VolumeScanner
+from .media_metadata import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from .theme import (
     ADOBE_THEME,
     DARK_MODE,
@@ -369,9 +370,6 @@ class StandardTableModel(QAbstractTableModel):
         return value
 
 
-VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "avi", "wmv", "webm", "m4v"}
-AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "aac", "m4a", "ogg", "wma"}
-IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "tif", "tiff", "gif", "bmp", "webp", "heic"}
 TEXT_EXTENSIONS = {"txt", "md", "markdown", "rst", "log", "csv", "json", "xml", "yaml", "yml"}
 PDF_EXTENSIONS = {"pdf"}
 OFFICE_EXTENSIONS = {
@@ -390,12 +388,13 @@ ARCHIVE_EXTENSIONS = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"}
 EXECUTABLE_EXTENSIONS = {"exe", "msi", "app", "bat", "cmd", "com", "sh", "run", "deb", "rpm", "dmg"}
 
 BACKUP_METADATA_DISCLAIMER = (
-    "Saved catalogue metadata only; drives and file contents were not read, "
-    "and no checksum verification was performed."
+    "This analysis reads the saved catalogue only, not the connected drives. "
+    "Hash-verified means full-file SHA-256 values recorded during scans match; "
+    "metadata-only matches are not byte-for-byte verification."
 )
 BACKUP_COLUMN_HEADER_TOOLTIP = (
     "Evidence that another catalogue volume contains the same item.\n"
-    "Green: strong metadata match. Amber: possible or partial match. "
+    "Green: matching SHA-256 or strong metadata evidence. Amber: possible or partial match. "
     "Red: none found. Grey: not analysed, outdated, or unknown.\n\n"
     f"{BACKUP_METADATA_DISCLAIMER}"
 )
@@ -404,7 +403,7 @@ BACKUP_FILTER_OPTIONS = (
     ("Needs attention", "attention"),
     ("No other copy found", "none"),
     ("Possible or partial", "possible"),
-    ("Strong or complete", "strong"),
+    ("Hash verified, strong, or complete", "strong"),
     ("Unknown / not analysed", "unknown"),
 )
 
@@ -503,8 +502,22 @@ def item_backup_display(
     drive_refs = backup_drive_references(other_ids, references)
     strong_ids = object_value(status, "strong_volume_ids", None)
     possible_ids = object_value(status, "possible_volume_ids", None)
-    has_target_breakdown = strong_ids is not None or possible_ids is not None
-    strong_refs = backup_drive_references(strong_ids or (), references)
+    verified_ids = object_value(status, "verified_volume_ids", None)
+    has_target_breakdown = (
+        strong_ids is not None or possible_ids is not None or verified_ids is not None
+    )
+    verified_id_set = {
+        int(value)
+        for value in (verified_ids or ())
+        if str(value).strip().lstrip("-").isdigit()
+    }
+    verified_refs = backup_drive_references(verified_ids or (), references)
+    metadata_strong_ids = [
+        value
+        for value in (strong_ids or ())
+        if int(value) not in verified_id_set
+    ]
+    strong_refs = backup_drive_references(metadata_strong_ids, references)
     possible_refs = backup_drive_references(possible_ids or (), references)
     evidence = str(object_value(status, "evidence_text", "") or "").strip()
     analysed_at = object_value(status, "analysed_at")
@@ -549,17 +562,21 @@ def item_backup_display(
             if has_target_breakdown
             else other_count
         )
-        text = (
-            f"Complete · {plural_other_drives(complete_count)}"
-            if resolved_type == "folder"
-            else f"Strong · {plural_other_drives(complete_count)}"
-        )
+        if resolved_type == "folder":
+            text = f"Complete · {plural_other_drives(complete_count)}"
+        elif verified_refs:
+            text = f"Hash verified · {plural_other_drives(len(verified_refs))}"
+        else:
+            text = f"Strong metadata · {plural_other_drives(complete_count)}"
         rank = 3
-        lines = [
-            "Complete structural metadata match on another drive."
-            if resolved_type == "folder"
-            else "Strong file metadata match on another drive."
-        ]
+        if resolved_type == "folder":
+            lines = ["Complete structural match on another drive."]
+        elif verified_refs:
+            lines = [
+                "The full-file SHA-256 recorded during scanning matches on another drive."
+            ]
+        else:
+            lines = ["Strong file metadata match on another drive; no comparable hash was available."]
     elif raw_state in {"possible", "partial", "probable", "scattered"}:
         state = "possible"
         files_percent = object_value(status, "best_coverage_files_percent")
@@ -632,9 +649,14 @@ def item_backup_display(
                     f"{summarized_backup_drive_references(possible_refs)}."
                 )
         else:
+            if verified_refs:
+                lines.append(
+                    f"{backup_evidence_label('Hash-verified drives', stale)}: "
+                    f"{summarized_backup_drive_references(verified_refs)}."
+                )
             if strong_refs:
                 lines.append(
-                    f"{backup_evidence_label('Strong match drives', stale)}: "
+                    f"{backup_evidence_label('Strong metadata-only drives', stale)}: "
                     f"{summarized_backup_drive_references(strong_refs)}."
                 )
             if possible_refs:
@@ -739,7 +761,13 @@ def volume_backup_display(
     latest_ignored_errors = int(
         object_value(scan_record, "latest_attempt_ignored_errors", 0) or 0
     )
-    actionable_latest_errors = max(0, latest_errors - latest_ignored_errors)
+    latest_hash_errors = int(
+        object_value(scan_record, "latest_attempt_hash_errors", 0) or 0
+    )
+    actionable_latest_errors = max(
+        0,
+        latest_errors - latest_ignored_errors - latest_hash_errors,
+    )
     if indexed_file_count == 0 and latest_status == "completed" and actionable_latest_errors > 0:
         return BackupDisplay(
             "unknown",
@@ -895,7 +923,7 @@ def volume_backup_display(
         if bytes_value is not None:
             text += f" · {bytes_value:.0f}% data"
     tooltip = (
-        f"Strong metadata matches on another drive: {strong_files:,} of "
+        f"Hash-verified or strong metadata matches on another drive: {strong_files:,} of "
         f"{coverage_files:,} coverage-eligible files"
     )
     if coverage_bytes:
@@ -1321,8 +1349,8 @@ class VolumeTableModel(StandardTableModel):
                     decoration=lambda item: self.backup_icons.icon_for(item.backup),
                     tooltip=lambda item: item.backup.tooltip,
                     header_tooltip=(
-                        "The share of this volume's indexed files and bytes with a strong "
-                        "metadata match on another catalogue drive. Empty volumes are N/A.\n\n"
+                        "The share of this volume's indexed files and bytes with a hash-verified "
+                        "or strong metadata match on another catalogue drive. Empty volumes are N/A.\n\n"
                         f"{BACKUP_METADATA_DISCLAIMER}"
                     ),
                 ),
@@ -1474,6 +1502,18 @@ def display_indexed_size(value: int | None) -> str:
     if value is None:
         return "Unknown"
     return format_size(value)
+
+
+def display_duration_ms(value: int | None) -> str:
+    if value is None:
+        return "Unavailable"
+    milliseconds = max(0, int(value))
+    seconds, millis = divmod(milliseconds, 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+    return f"{minutes:d}:{seconds:02d}.{millis:03d}"
 
 
 def size_sort_key(value: int | None) -> int:
@@ -2211,14 +2251,14 @@ class BackupEvidenceDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Backup Evidence - catalogue metadata")
+        self.setWindowTitle("Backup Evidence - saved catalogue evidence")
         self.resize(980, 680)
         self.setMinimumSize(760, 520)
 
         explanation = QLabel(
             "This compares records already saved in the catalogue. It does not reconnect "
-            "or rescan drives, read file contents, or calculate checksums. A strong match "
-            "is evidence of another copy, not byte-for-byte verification."
+            "or rescan drives or read file contents. Hash-verified means SHA-256 values "
+            "recorded during scans match; other strong matches use metadata only."
         )
         explanation.setObjectName("offlineNotice")
         explanation.setWordWrap(True)
@@ -2236,7 +2276,7 @@ class BackupEvidenceDialog(QDialog):
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         legend = QLabel(
-            "Green — strong file match or complete folder structure on another drive\n"
+            "Green — SHA-256 match, strong metadata match, or complete folder structure\n"
             "Amber — possible file match or partial folder on the best single drive\n"
             "Red — no other catalogue match found\n"
             "Grey — not analysed, outdated, too common, excluded system metadata, "
@@ -2245,20 +2285,24 @@ class BackupEvidenceDialog(QDialog):
         legend.setWordWrap(True)
         rules = QLabel(
             "What the labels mean:\n"
-            "• Strong file: normalized filename, exact byte size, non-empty exact "
-            "modified time, and the same normalized parent path on another drive.\n"
+            "• Hash verified: the full-file SHA-256 values recorded during scans are "
+            "identical. Names, paths, and timestamps may differ.\n"
+            "• Strong metadata: when a comparable hash is unavailable, normalized "
+            "filename, exact byte size, non-empty exact modified time, and the same "
+            "normalized parent path match.\n"
             "• Possible file: normalized filename and exact byte size on another "
             "drive, but path or modified time differs or is unavailable.\n"
-            "• Too common: weak name-and-size evidence is suppressed when it spans "
+            "• Too common: repetitive hashes or weak name-and-size evidence are suppressed "
+            "when they span "
             "more than 8 drives, 64 records, or 256 projected file-to-drive links. "
             "Exact path-and-time subgroups use separate bounded limits (32 drives, "
             "512 records, or 4,096 links), so even strong evidence cannot expand "
             "without limit.\n"
             "• Complete folder: the folder name and a content-bearing subtree with at "
-            "least two files match one other drive by descendant names, exact sizes, and "
-            "layout, and both applied scans have trustworthy denominators. A one-file, "
-            "renamed, overly common, error-bearing, or partial subtree stays amber or "
-            "grey.\n"
+            "least two files match one other drive by descendant names, layout, and "
+            "SHA-256 wherever hashes are present, and both applied scans have trustworthy "
+            "denominators. Mixed hashed/legacy, one-file, renamed, overly common, "
+            "error-bearing, or partial subtrees stay amber or grey.\n"
             "• Known OS bookkeeping such as .DS_Store, Thumbs.db, desktop.ini, "
             "$RECYCLE.BIN, and System Volume Information is shown but excluded from "
             "coverage."
@@ -2284,7 +2328,7 @@ class BackupEvidenceDialog(QDialog):
             [
                 "Drive",
                 "Indexed files",
-                "Strong matches",
+                "Hash verified / strong metadata",
                 "Possible",
                 "Too common",
                 "OS metadata",
@@ -2311,7 +2355,8 @@ class BackupEvidenceDialog(QDialog):
                 "Last applied",
                 "Files",
                 "Folders",
-                "Access errors",
+                "Incomplete / access",
+                "Hash unavailable",
                 "Meaning",
             ]
         )
@@ -2319,7 +2364,7 @@ class BackupEvidenceDialog(QDialog):
         volume_page = QWidget()
         volume_layout = QVBoxLayout(volume_page)
         volume_note = QLabel(
-            "Coverage counts only strong metadata matches on a different drive. "
+            "Coverage counts hash-verified or strong metadata matches on a different drive. "
             "Empty successfully scanned drives are N/A."
         )
         volume_note.setWordWrap(True)
@@ -2329,7 +2374,7 @@ class BackupEvidenceDialog(QDialog):
         mirror_page = QWidget()
         mirror_layout = QVBoxLayout(mirror_page)
         mirror_note = QLabel(
-            "These are metadata-overlap suggestions only. They do not create or change the "
+            "These are saved-evidence overlap suggestions only. They do not create or change the "
             "manual mirror relationship in the volume register."
         )
         mirror_note.setWordWrap(True)
@@ -2341,7 +2386,9 @@ class BackupEvidenceDialog(QDialog):
         scan_note = QLabel(
             "The latest scan attempt is reported separately from the last successfully "
             "applied catalogue data. A failed or cancelled attempt does not invalidate a "
-            "previous successful backup analysis."
+            "previous successful backup analysis. Hash-unavailable files remain indexed "
+            "and use labelled metadata fallback; inaccessible or unstable paths can mean "
+            "catalogue gaps."
         )
         scan_note.setWordWrap(True)
         scan_layout.addWidget(scan_note)
@@ -2360,7 +2407,7 @@ class BackupEvidenceDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         self.analyse_button = buttons.addButton(
-            "Analyse saved metadata",
+            "Analyse saved evidence",
             QDialogButtonBox.ButtonRole.ActionRole,
         )
         self.cancel_button = buttons.addButton(
@@ -2399,7 +2446,7 @@ class BackupEvidenceDialog(QDialog):
                 "Analysis running · the last completed results remain visible"
             )
             self.progress.setRange(0, 0)
-            self.progress.setFormat("Preparing saved catalogue metadata…")
+            self.progress.setFormat("Preparing saved catalogue evidence…")
 
     def set_analysis_progress(self, completed: int, total: int, message: str) -> None:
         if total > 0:
@@ -2468,13 +2515,14 @@ class BackupEvidenceDialog(QDialog):
             )
             drive_word = "drive" if len(scans) == 1 else "drives"
             summary_parts = [
-                "No backup evidence has been analysed yet. Choose Analyse saved metadata "
+                "No backup evidence has been analysed yet. Choose Analyse saved evidence "
                 f"to compare {indexed_records:,} indexed file records across "
                 f"{len(scans):,} catalogue {drive_word}."
             ]
         else:
             summary_parts = [
-                f"The last completed analysis found a strong metadata match on another "
+                f"The last completed analysis found hash-verified or strong metadata "
+                f"evidence on another "
                 f"drive for {strong_files:,} of {total_files:,} indexed file records.",
                 f"Possible: {possible_files:,}. Too common to use: "
                 f"{ambiguous_files:,}. Excluded OS metadata: {excluded_files:,}.",
@@ -2484,7 +2532,7 @@ class BackupEvidenceDialog(QDialog):
         summary_parts.append(BACKUP_METADATA_DISCLAIMER)
         self.analysis_summary_label.setText("\n\n".join(summary_parts))
         self.analyse_button.setText(
-            "Update saved metadata analysis" if analysed_at else "Analyse saved metadata"
+            "Update saved evidence" if analysed_at else "Analyse saved evidence"
         )
 
         self._populate_volumes(summaries, volume_references, stale)
@@ -2696,6 +2744,11 @@ class BackupEvidenceDialog(QDialog):
             ignored_errors = int(
                 object_value(scan, "latest_attempt_ignored_errors", 0) or 0
             )
+            hash_errors = int(
+                object_value(scan, "latest_attempt_hash_errors", 0) or 0
+            )
+            access_errors = max(0, errors - hash_errors)
+            actionable_access_errors = max(0, access_errors - ignored_errors)
             health = enum_value(object_value(scan, "health_status", ""))
             attempted_at = first_object_value(scan, "started_at", "latest_attempt_at", "last_scan_at")
             applied_at = first_object_value(
@@ -2705,8 +2758,14 @@ class BackupEvidenceDialog(QDialog):
                 "catalogue_scan_at",
             )
             applied = bool(first_object_value(scan, "applied", "is_applied", default=status == "completed"))
-            if status == "completed" and errors and ignored_errors >= errors:
-                outcome = "Completed with system warning" + ("s" if errors != 1 else "")
+            if (
+                status == "completed"
+                and access_errors
+                and ignored_errors >= access_errors
+            ):
+                outcome = "Completed with system warning" + (
+                    "s" if access_errors != 1 else ""
+                )
                 if health in {"empty", "healthy_empty", "completed_empty"}:
                     outcome += " · empty"
                     meaning = (
@@ -2717,12 +2776,32 @@ class BackupEvidenceDialog(QDialog):
                     meaning = (
                         "Only protected drive metadata was skipped; copy coverage remains usable"
                     )
+                if hash_errors:
+                    outcome += " · hash gaps"
+                    meaning += (
+                        f"; {hash_errors:,} file"
+                        + ("s" if hash_errors != 1 else "")
+                        + " will use metadata fallback"
+                    )
             elif status == "completed" and health in {"empty", "healthy_empty", "completed_empty"}:
                 outcome = "Completed · empty"
                 meaning = "Healthy empty catalogue; coverage N/A"
-            elif status == "completed" and errors:
-                outcome = "Completed with access errors"
-                meaning = "Check scan; catalogue areas may be incomplete"
+            elif status == "completed" and actionable_access_errors:
+                outcome = "Completed with incomplete areas"
+                meaning = "Check scan; some paths were inaccessible or unstable"
+                if hash_errors:
+                    meaning += (
+                        f"; {hash_errors:,} additional file"
+                        + ("s" if hash_errors != 1 else "")
+                        + " use metadata fallback"
+                    )
+            elif status == "completed" and hash_errors:
+                outcome = "Completed · hash gaps"
+                meaning = (
+                    f"{hash_errors:,} file"
+                    + ("s" if hash_errors != 1 else "")
+                    + " could not be hashed; those files use metadata fallback"
+                )
             elif status == "completed" and files == 0:
                 outcome = "Completed · empty"
                 meaning = "Healthy empty catalogue; coverage N/A"
@@ -2743,7 +2822,8 @@ class BackupEvidenceDialog(QDialog):
                     display_db_time(str(applied_at)) if applied_at else "Never",
                     f"{files:,}",
                     f"{folders:,}",
-                    f"{errors:,}",
+                    f"{access_errors:,}",
+                    f"{hash_errors:,}",
                     meaning,
                 ]
             )
@@ -2949,7 +3029,8 @@ class HelpDialog(QDialog):
              "<code>.jvvv</code> file. It is a portable SQLite catalogue."),
             ("2. Add a volume",
              "Choose <b>New Volume</b>, select a connected drive or folder, "
-             "and it scans automatically. "
+             "and it scans automatically. Scans read every file to record a full "
+             "SHA-256 content hash, so large drives take longer. "
              "Scan it again later to review and apply catalogue changes."),
             ("3. Browse offline",
              "Select a saved volume to explore its folder tree, even when the "
@@ -2958,10 +3039,10 @@ class HelpDialog(QDialog):
              "Find files and folders by name or extension across the stored catalogue. "
              "Path matching can be enabled under <b>Settings &gt; Preferences</b>."),
             ("5. Review copy evidence",
-             "Choose <b>Catalogue &gt; Backup Evidence</b> to compare saved metadata. "
-             "The analysis does not reconnect or rescan drives, read file contents, or "
-             "calculate checksums. Green means a strong metadata match, not byte-for-byte "
-             "verification."),
+             "Choose <b>Catalogue &gt; Backup Evidence</b> to compare saved evidence. "
+             "The analysis does not reconnect, rescan, or reread file contents. It first "
+             "uses SHA-256 values recorded by scans, then clearly labels metadata-only "
+             "fallbacks when a comparable hash is unavailable."),
         ]
         section_html = "".join(
             f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
@@ -2998,11 +3079,48 @@ class ScanWorker(QObject):
         self.cancel_requested = False
         self._review_event = Event()
         self._apply_reviewed_changes = False
+        self._windows_thread_handle: Any | None = None
+
+    def _start_cancellable_io(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenThread.restype = wintypes.HANDLE
+            self._windows_thread_handle = kernel32.OpenThread(
+                0x0001,
+                False,
+                kernel32.GetCurrentThreadId(),
+            )
+        except Exception:
+            self._windows_thread_handle = None
+
+    def _stop_cancellable_io(self) -> None:
+        handle = self._windows_thread_handle
+        self._windows_thread_handle = None
+        if os.name != "nt" or not handle:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
 
     @Slot()
     def run(self) -> None:
         db: Database | None = None
         try:
+            self._start_cancellable_io()
             db = Database(self.db_path)
             scanner = VolumeScanner(
                 db,
@@ -3026,6 +3144,11 @@ class ScanWorker(QObject):
                     "errors_count": result.errors_count,
                     "message": result.message or "",
                     "changes": result.changes.as_dict() if result.changes is not None else {},
+                    "files_hashed": result.files_hashed,
+                    "bytes_hashed": result.bytes_hashed,
+                    "hash_errors": result.hash_errors,
+                    "media_files": result.media_files,
+                    "media_metadata_collected": result.media_metadata_collected,
                 }
             )
         except Exception:
@@ -3033,6 +3156,7 @@ class ScanWorker(QObject):
         finally:
             if db is not None:
                 db.close()
+            self._stop_cancellable_io()
 
     def request_review(self, changes) -> bool:
         self._apply_reviewed_changes = False
@@ -3049,6 +3173,19 @@ class ScanWorker(QObject):
     def cancel(self) -> None:
         self.cancel_requested = True
         self._review_event.set()
+        handle = self._windows_thread_handle
+        if os.name != "nt" or not handle:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+            kernel32.CancelSynchronousIo.restype = wintypes.BOOL
+            kernel32.CancelSynchronousIo(handle)
+        except Exception:
+            pass
 
 
 class DeleteVolumeWorker(QObject):
@@ -3176,7 +3313,7 @@ class BackupAnalysisWorker(QObject):
                     int(object_value(value, "total", 0) or 0),
                     str(
                         object_value(value, "message", "")
-                        or object_value(value, "phase", "Analysing saved metadata")
+                        or object_value(value, "phase", "Analysing saved evidence")
                     ),
                 )
 
@@ -4653,9 +4790,9 @@ class MainWindow(QMainWindow):
         if self.backup_evidence_dialog is not None:
             self.backup_evidence_dialog.set_analysis_running(True)
         self.scan_progress.setRange(0, 0)
-        self.scan_progress.setFormat("Analysing saved catalogue metadata…")
+        self.scan_progress.setFormat("Analysing saved catalogue evidence…")
         self.statusBar().showMessage(
-            "Analysing saved catalogue metadata; no drives are being read…"
+            "Analysing saved catalogue evidence; no drives are being read…"
         )
 
         self.backup_analysis_thread = QThread(self)
@@ -4678,7 +4815,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int, str)
     def on_backup_analysis_progress(self, completed: int, total: int, message: str) -> None:
-        label = message or "Analysing saved catalogue metadata"
+        label = message or "Analysing saved catalogue evidence"
         if total > 0:
             self.scan_progress.setRange(0, total)
             self.scan_progress.setValue(min(max(completed, 0), total))
@@ -4696,7 +4833,7 @@ class MainWindow(QMainWindow):
             return
         worker.cancel()
         self.scan_progress.setRange(0, 0)
-        self.scan_progress.setFormat("Cancelling saved-metadata analysis…")
+        self.scan_progress.setFormat("Cancelling saved-evidence analysis…")
         if self.backup_evidence_dialog is not None:
             self.backup_evidence_dialog.cancel_button.setEnabled(False)
             self.backup_evidence_dialog.progress.setRange(0, 0)
@@ -4722,7 +4859,7 @@ class MainWindow(QMainWindow):
         self.scan_progress.setValue(1)
         self.scan_progress.setFormat("Backup evidence updated")
         self.statusBar().showMessage(
-            "Backup evidence updated from saved catalogue metadata.",
+            "Backup evidence updated from saved catalogue hashes and metadata.",
             6000,
         )
         self.refresh_backup_evidence_views()
@@ -4747,7 +4884,7 @@ class MainWindow(QMainWindow):
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Critical)
         dialog.setWindowTitle("Backup Analysis Failed")
-        dialog.setText("Saved catalogue metadata could not be analysed.")
+        dialog.setText("Saved catalogue evidence could not be analysed.")
         dialog.setInformativeText(
             "No source drive was scanned, and incomplete analysis results were not applied."
         )
@@ -5391,7 +5528,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Backup Analysis Running",
-            "Saved catalogue metadata is still being analysed. Cancel it before closing?",
+            "Saved catalogue evidence is still being analysed. Cancel it before closing?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -5428,7 +5565,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Backup Analysis Running",
-                "Wait for the saved-metadata analysis to finish or cancel it in Backup Evidence.",
+                "Wait for the saved-evidence analysis to finish or cancel it in Backup Evidence.",
             )
         else:
             QMessageBox.information(
@@ -5901,8 +6038,12 @@ class MainWindow(QMainWindow):
             return
 
         self.scan_progress.setRange(0, 0)
-        self.scan_progress.setFormat("Starting scan...")
-        self.statusBar().showMessage("Scanning...")
+        self.scan_progress.setFormat("Starting scan · SHA-256 hashing enabled...")
+        self.scan_progress.setToolTip(
+            "Scans read every regular file to record a full SHA-256 content hash. "
+            "Media details are collected when supported."
+        )
+        self.statusBar().showMessage("Scanning and hashing file contents...")
         self.scan_cancel_requested = False
         self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
         self._set_scan_running_ui(True)
@@ -5945,9 +6086,14 @@ class MainWindow(QMainWindow):
             return
         if self.scan_progress.maximum() != 0:
             self.scan_progress.setRange(0, 0)
-        self.scan_progress.setFormat(
-            f"Scanning... {files_seen:,} files, {folders_seen:,} folders - {current_path}"
-        )
+        if current_path.startswith(("Hashing SHA-256", "Reading media details")):
+            self.scan_progress.setFormat(
+                f"{current_path} · {files_seen:,} files catalogued"
+            )
+        else:
+            self.scan_progress.setFormat(
+                f"Scanning... {files_seen:,} files, {folders_seen:,} folders - {current_path}"
+            )
 
     @Slot(dict)
     def on_scan_review_requested(self, changes: dict) -> None:
@@ -5985,25 +6131,41 @@ class MainWindow(QMainWindow):
             f"({delta_text})",
         ]
         errors_count = int(changes.get("errors_count", 0))
-        if errors_count:
+        hash_errors = int(changes.get("hash_errors", 0))
+        access_errors = max(0, errors_count - hash_errors)
+        if access_errors:
             details.extend(
                 [
                     "",
-                    f"Warning: the scan reported {errors_count:,} errors. Some items listed as "
-                    "no longer present may only have been inaccessible.",
+                    f"Warning: the scan reported {access_errors:,} access or file-stability "
+                    "issues. Some items listed as no longer present may have been "
+                    "inaccessible or changing during the scan.",
+                ]
+            )
+        if hash_errors:
+            details.extend(
+                [
+                    "",
+                    f"SHA-256 unavailable for {hash_errors:,} files. Applying this update "
+                    "will clear any older hash for those records; they will use clearly "
+                    "labelled metadata-only evidence until a later successful rescan.",
                 ]
             )
 
         box = QMessageBox(self)
         box.setWindowTitle("Review Scan Changes")
         box.setIcon(
-            QMessageBox.Icon.Warning if errors_count else QMessageBox.Icon.Question
+            QMessageBox.Icon.Warning
+            if access_errors or hash_errors
+            else QMessageBox.Icon.Question
         )
         box.setText("Apply these changes to the catalogue?")
         box.setInformativeText("\n".join(details))
         apply_button = box.addButton("Apply Update", QMessageBox.ButtonRole.AcceptRole)
         cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(cancel_button if errors_count else apply_button)
+        box.setDefaultButton(
+            cancel_button if access_errors or hash_errors else apply_button
+        )
         box.setEscapeButton(cancel_button)
 
         apply_changes = False
@@ -6055,9 +6217,15 @@ class MainWindow(QMainWindow):
         if status != "completed":
             self.post_scan_edit_volume_id = None
         self.scan_progress.setFormat(status.title())
+        hash_errors = int(result.get("hash_errors", 0))
+        access_errors = max(0, int(result.get("errors_count", 0)) - hash_errors)
         self.statusBar().showMessage(
             f"Scan {status}: {result.get('files_seen', 0)} files, "
-            f"{result.get('folders_seen', 0)} folders, {result.get('errors_count', 0)} errors.",
+            f"{result.get('files_hashed', 0)} SHA-256 hashes "
+            f"({format_size(int(result.get('bytes_hashed', 0)))} read), "
+            f"{result.get('media_metadata_collected', 0)}/"
+            f"{result.get('media_files', 0)} media probes succeeded, "
+            f"{access_errors} incomplete/access issues, {hash_errors} hash unavailable.",
             8000,
         )
         self.refresh_after_catalogue_write()
@@ -6586,6 +6754,7 @@ class MainWindow(QMainWindow):
 
     def catalogue_item_property_rows(self, record) -> list[tuple[str, str]]:
         item_type = record["item_type"]
+        record_field = lambda name, default=None: object_value(record, name, default)
         relative_path = record["relative_path"] or ""
         volume = self.db.get_volume(record["volume_id"]) if self.db is not None else None
         source_path = self.current_source_path_for_volume(volume)
@@ -6605,12 +6774,81 @@ class MainWindow(QMainWindow):
 
         if item_type == "file":
             extension = (record["extension"] or "").lstrip(".")
+            raw_hash = record_field("content_hash")
+            stored_hash_algorithm = str(
+                record_field("content_hash_algorithm") or ""
+            ).casefold()
+            hash_algorithm = {
+                "sha256": "SHA-256",
+            }.get(stored_hash_algorithm, stored_hash_algorithm.upper())
+            if raw_hash is not None and hash_algorithm:
+                hash_text = f"{hash_algorithm} · {bytes(raw_hash).hex()}"
+            else:
+                hash_text = "Unavailable — rescan this volume to record current file content"
             properties.extend(
                 [
                     ("Extension", f".{extension}" if extension else "Unavailable"),
                     ("Size", display_indexed_size(record["size_bytes"])),
+                    ("Content hash", hash_text),
                 ]
             )
+            if extension.casefold() in (IMAGE_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS):
+                media_status = str(record_field("media_status") or "").casefold()
+                media_source = str(record_field("media_source") or "")
+                source_label = {
+                    "ffprobe": "ffprobe",
+                    "qt-image": "Qt image header reader",
+                    "python-wave": "built-in WAV reader",
+                    "ffprobe + python-wave": "ffprobe and built-in WAV reader",
+                }.get(media_source, media_source or "no compatible reader")
+                media_message = str(record_field("media_message") or "").strip()
+                if media_status == "complete":
+                    media_summary = f"Collected · {source_label}"
+                elif media_status == "partial":
+                    media_summary = f"Partially collected · {source_label}"
+                    if media_message:
+                        media_summary += f" · {media_message}"
+                elif media_status in {"unavailable", "failed"}:
+                    media_summary = "Not collected"
+                    if media_message:
+                        media_summary += f" — {media_message}"
+                else:
+                    media_summary = (
+                        "Not collected — this catalogue record predates media inspection; "
+                        "rescan the volume"
+                    )
+                properties.append(("Media details", media_summary))
+                if record_field("media_duration_ms") is not None:
+                    properties.append(
+                        ("Duration", display_duration_ms(record_field("media_duration_ms")))
+                    )
+                if record_field("media_width") is not None and record_field("media_height") is not None:
+                    properties.append(
+                        (
+                            "Dimensions",
+                            f"{int(record_field('media_width')):,} × {int(record_field('media_height')):,}",
+                        )
+                    )
+                if record_field("media_container"):
+                    properties.append(("Media container", str(record_field("media_container"))))
+                if record_field("video_codecs"):
+                    properties.append(("Video codec", str(record_field("video_codecs"))))
+                if record_field("audio_codecs"):
+                    properties.append(("Audio codec", str(record_field("audio_codecs"))))
+                if record_field("media_sample_rate_hz") is not None:
+                    properties.append(
+                        ("Sample rate", f"{int(record_field('media_sample_rate_hz')):,} Hz")
+                    )
+                if record_field("media_channels") is not None:
+                    properties.append(("Audio channels", str(int(record_field("media_channels")))))
+                if record_field("media_bit_rate") is not None:
+                    properties.append(
+                        ("Bit rate", f"{int(record_field('media_bit_rate')):,} bit/s")
+                    )
+                if record_field("media_probed_at"):
+                    properties.append(
+                        ("Media details recorded", self._display_time(record_field("media_probed_at")))
+                    )
         else:
             properties.extend(
                 [
@@ -6662,24 +6900,42 @@ class MainWindow(QMainWindow):
                     ", ".join(other_refs) if other_refs else "None listed",
                 ),
                 (
-                    backup_evidence_label("Metadata evidence", stale_status),
+                    backup_evidence_label("Match evidence", stale_status),
                     str(object_value(status, "evidence_text", "") or "Unavailable"),
                 ),
             ]
         )
         if item_type == "file" and status is not None:
+            verified_ids = tuple(object_value(status, "verified_volume_ids", ()) or ())
+            verified_id_set = {int(value) for value in verified_ids}
+            verified_refs = backup_drive_references(
+                verified_ids,
+                getattr(self, "backup_volume_references", {}),
+            )
+            metadata_strong_ids = [
+                value
+                for value in (object_value(status, "strong_volume_ids", ()) or ())
+                if int(value) not in verified_id_set
+            ]
             strong_refs = backup_drive_references(
-                object_value(status, "strong_volume_ids", ()) or (),
+                metadata_strong_ids,
                 getattr(self, "backup_volume_references", {}),
             )
             possible_refs = backup_drive_references(
                 object_value(status, "possible_volume_ids", ()) or (),
                 getattr(self, "backup_volume_references", {}),
             )
+            if verified_refs:
+                properties.append(
+                    (
+                        backup_evidence_label("Hash-verified drives", stale_status),
+                        ", ".join(verified_refs),
+                    )
+                )
             if strong_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Strong match drives", stale_status),
+                        backup_evidence_label("Strong metadata-only drives", stale_status),
                         ", ".join(strong_refs),
                     )
                 )
@@ -7043,11 +7299,26 @@ class MainWindow(QMainWindow):
         errors = self.db.list_scan_errors(volume_id)
         lines: list[str] = []
         for row in history:
+            hash_errors = int(row["hash_errors"] or 0)
+            access_errors = max(0, int(row["errors_count"] or 0) - hash_errors)
             lines.append(
                 f"{self._display_time(row['started_at'])} - {row['status']} - "
                 f"{row['files_seen']} files, {row['folders_seen']} folders, "
-                f"{row['errors_count']} errors"
+                f"{access_errors} incomplete/access issues"
             )
+            lines.append(
+                f"  SHA-256: {int(row['files_hashed'] or 0):,} files, "
+                f"{format_size(int(row['bytes_hashed'] or 0))} read, "
+                f"{hash_errors:,} unavailable"
+            )
+            if int(row["media_files"] or 0):
+                media_files = int(row["media_files"] or 0)
+                media_collected = int(row["media_metadata_collected"] or 0)
+                lines.append(
+                    f"  Media inspection: {media_collected:,} of {media_files:,} recognized "
+                    f"media files returned complete or partial details this scan; "
+                    f"{max(0, media_files - media_collected):,} unavailable"
+                )
             if row["files_added"] is not None:
                 lines.append(
                     f"  Changes: +{row['files_added']} files, "

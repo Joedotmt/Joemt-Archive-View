@@ -15,6 +15,8 @@ from jvvv.database import Database
 SCANNED_AT = "2026-08-20T10:00:00.000000+0000"
 LATER_SCAN = "2026-08-21T10:00:00.000000+0000"
 MODIFIED_AT = "2026-08-19T09:00:00.000000+0000"
+HASH_A = b"a" * 32
+HASH_B = b"b" * 32
 
 
 def add_catalogued_volume(
@@ -26,7 +28,9 @@ def add_catalogued_volume(
     files: dict[str, tuple[int, str | None]],
     scanned_at: str = SCANNED_AT,
     scan_errors: int = 0,
+    hash_errors: int = 0,
     scan_status: str | None = "completed",
+    content_hashes: dict[str, bytes | tuple[str, bytes]] | None = None,
 ) -> tuple[int, dict[str, int], dict[str, int]]:
     """Build saved catalogue records without requiring a connected source drive."""
     volume_id = db.create_volume(
@@ -67,6 +71,12 @@ def add_catalogued_volume(
                 parent_path = child_path
                 parent_id = child_id
 
+            saved_hash = (content_hashes or {}).get(relative_path)
+            if isinstance(saved_hash, tuple):
+                hash_algorithm, content_hash = saved_hash
+            else:
+                hash_algorithm = "sha256" if saved_hash is not None else None
+                content_hash = saved_hash
             file_ids[relative_path] = db.upsert_file(
                 volume_id=volume_id,
                 folder_id=parent_id,
@@ -76,6 +86,8 @@ def add_catalogued_volume(
                 size_bytes=size_bytes,
                 modified_at=modified_at,
                 scanned_at=scanned_at,
+                content_hash=content_hash,
+                content_hash_algorithm=hash_algorithm,
             )
 
         db.rebuild_folder_statistics(volume_id, scanned_at)
@@ -92,6 +104,7 @@ def add_catalogued_volume(
             len(files),
             len(folder_ids),
             scan_errors,
+            hash_errors=hash_errors,
         )
     return volume_id, file_ids, folder_ids
 
@@ -169,6 +182,348 @@ def test_analysis_distinguishes_strong_possible_and_same_drive_only_matches(tmp_
         } == {second_volume_id}
         assert first_volume_id != second_volume_id
         assert second_files["Project/report.psd"] > 0
+    finally:
+        db.close()
+
+
+def test_exact_hash_verifies_renamed_and_relocated_file(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"Original/report.psd": (100, MODIFIED_AT)},
+            content_hashes={"Original/report.psd": HASH_A},
+        )
+        target_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Backup",
+            drive_id="AID-002",
+            files={"Elsewhere/renamed-copy.bin": (100, LATER_SCAN)},
+            content_hashes={"Elsewhere/renamed-copy.bin": HASH_A},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(source_files["Original/report.psd"])
+
+        assert status.status == "likely"
+        assert status.verified_volume_ids == (target_id,)
+        assert status.strong_volume_ids == (target_id,)
+        assert status.possible_volume_ids == ()
+        assert "exact sha-256 content hash" in status.evidence_text.casefold()
+        matches = engine.file_matches(source_files["Original/report.psd"])
+        assert len(matches) == 1
+        assert "exact sha-256" in matches[0].evidence_text.casefold()
+    finally:
+        db.close()
+
+
+def test_exact_hash_remains_authoritative_when_saved_size_metadata_disagrees(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"Original.bin": (100, MODIFIED_AT)},
+            content_hashes={"Original.bin": HASH_A},
+        )
+        target_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Backup",
+            drive_id="AID-002",
+            files={"Renamed.bin": (101, LATER_SCAN)},
+            content_hashes={"Renamed.bin": HASH_A},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(source_files["Original.bin"])
+
+        assert status.status == "likely"
+        assert status.verified_volume_ids == (target_id,)
+    finally:
+        db.close()
+
+
+def test_comparable_hash_conflict_vetoes_identical_metadata(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+            content_hashes={"Project/report.psd": HASH_A},
+        )
+        _, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Other",
+            drive_id="AID-002",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+            content_hashes={"Project/report.psd": HASH_B},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(source_files["Project/report.psd"])
+
+        assert status.status == "ambiguous"
+        assert status.other_volume_ids == ()
+        assert status.verified_volume_ids == ()
+        assert engine.file_matches(source_files["Project/report.psd"]) == []
+        assert "hashes differ" in status.evidence_text.casefold()
+    finally:
+        db.close()
+
+
+def test_metadata_fallback_remains_explicit_when_one_hash_is_missing(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+            content_hashes={"Project/report.psd": HASH_A},
+        )
+        target_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Legacy backup",
+            drive_id="AID-002",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(source_files["Project/report.psd"])
+
+        assert status.status == "likely"
+        assert status.strong_volume_ids == (target_id,)
+        assert status.verified_volume_ids == ()
+        assert "hash was unavailable" in status.evidence_text.casefold()
+    finally:
+        db.close()
+
+
+def test_hash_match_is_not_downgraded_by_common_metadata_guard(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"Project/common.bin": (100, MODIFIED_AT)},
+            content_hashes={"Project/common.bin": HASH_A},
+        )
+        verified_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Verified",
+            drive_id="AID-002",
+            files={"Project/common.bin": (100, MODIFIED_AT)},
+            content_hashes={"Project/common.bin": HASH_A},
+        )
+        metadata_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Legacy",
+            drive_id="AID-003",
+            files={"Project/common.bin": (100, MODIFIED_AT)},
+        )
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_candidate_records_per_key=1),
+        )
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(source_files["Project/common.bin"])
+
+        assert status.status == "likely"
+        assert status.verified_volume_ids == (verified_id,)
+        assert set(status.strong_volume_ids) == {verified_id, metadata_id}
+    finally:
+        db.close()
+
+
+def test_hash_aware_folder_structure_blocks_conflicts_and_mixed_hash_completion(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={
+                "Project/one.bin": (100, MODIFIED_AT),
+                "Project/two.bin": (200, MODIFIED_AT),
+            },
+            content_hashes={
+                "Project/one.bin": HASH_A,
+                "Project/two.bin": HASH_B,
+            },
+        )
+        legacy_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Legacy",
+            drive_id="AID-002",
+            files={
+                "Project/one.bin": (100, MODIFIED_AT),
+                "Project/two.bin": (200, MODIFIED_AT),
+            },
+        )
+        conflicting_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Conflicting",
+            drive_id="AID-003",
+            files={
+                "Project/one.bin": (100, MODIFIED_AT),
+                "Project/two.bin": (200, MODIFIED_AT),
+            },
+            content_hashes={
+                "Project/one.bin": HASH_B,
+                "Project/two.bin": HASH_A,
+            },
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        folder = engine.folder_status(source_folders["Project"])
+
+        assert folder.status == "possible"
+        assert folder.best_target_volume_id == legacy_id
+        assert folder.best_coverage_files_percent == 100.0
+        assert folder.strong_volume_ids == ()
+        assert all(
+            engine.file_status(file_id).verified_volume_ids == (conflicting_id,)
+            for file_id in source_files.values()
+        )
+        assert "hash-aware" in folder.evidence_text.casefold()
+    finally:
+        db.close()
+
+
+def test_fully_hashed_matching_folder_can_be_complete(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, _, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={
+                "Project/one.bin": (100, MODIFIED_AT),
+                "Project/two.bin": (200, MODIFIED_AT),
+            },
+            content_hashes={
+                "Project/one.bin": HASH_A,
+                "Project/two.bin": HASH_B,
+            },
+        )
+        target_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Backup",
+            drive_id="AID-002",
+            files={
+                "Project/one.bin": (100, LATER_SCAN),
+                "Project/two.bin": (200, LATER_SCAN),
+            },
+            content_hashes={
+                "Project/one.bin": HASH_A,
+                "Project/two.bin": HASH_B,
+            },
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        folder = engine.folder_status(source_folders["Project"])
+
+        assert folder.status == "likely"
+        assert folder.strong_volume_ids == (target_id,)
+        assert "hash-aware structure" in folder.evidence_text.casefold()
+        assert "exact sha-256" in folder.evidence_text.casefold()
+    finally:
+        db.close()
+
+
+def test_partially_hashed_matching_structure_remains_possible(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        files = {
+            "Project/one.bin": (100, MODIFIED_AT),
+            "Project/two.bin": (200, MODIFIED_AT),
+        }
+        _, _, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files=files,
+            content_hashes={"Project/one.bin": HASH_A},
+        )
+        target_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Backup",
+            drive_id="AID-002",
+            files=files,
+            content_hashes={"Project/one.bin": HASH_A},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        folder = engine.folder_status(source_folders["Project"])
+
+        assert folder.status == "possible"
+        assert folder.possible_volume_ids == (target_id,)
+        assert folder.strong_volume_ids == ()
+        assert folder.best_coverage_files_percent == 100.0
+        assert "mixed hash and legacy" in folder.evidence_text.casefold()
+    finally:
+        db.close()
+
+
+def test_overly_common_exact_hash_is_bounded_and_ambiguous(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        file_ids = []
+        for index in range(3):
+            _, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={f"Different-{index}/copy-{index}.bin": (100, MODIFIED_AT)},
+                content_hashes={f"Different-{index}/copy-{index}.bin": HASH_A},
+            )
+            file_ids.extend(files.values())
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_hash_volumes_per_signature=2),
+        )
+        assert engine.analyse().status == "completed"
+
+        for file_id in file_ids:
+            status = engine.file_status(file_id)
+            assert status.status == "ambiguous"
+            assert status.verified_volume_ids == ()
+            assert engine.file_matches(file_id) == []
+            assert "too repetitive" in status.evidence_text.casefold()
     finally:
         db.close()
 
@@ -673,6 +1028,44 @@ def test_populated_volume_with_applied_scan_errors_has_unknown_coverage(tmp_path
         )
         assert bool(object_field(summary, "coverage_eligible")) is False
         assert status_text(object_field(summary, "status")) == "unknown"
+    finally:
+        db.close()
+
+
+def test_hash_only_scan_error_keeps_applied_metadata_coverage_eligible(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        volume_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Hash Gap",
+            drive_id="AID-001",
+            files={"Known/report.psd": (100, MODIFIED_AT)},
+            scan_errors=1,
+            hash_errors=1,
+        )
+        add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Other Copy",
+            drive_id="AID-002",
+            files={"Known/report.psd": (100, MODIFIED_AT)},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        summary = next(
+            row for row in engine.volume_summaries() if row.volume_id == volume_id
+        )
+        scan = next(row for row in engine.scan_records() if row.volume_id == volume_id)
+
+        assert scan.health_status == "completed"
+        assert scan.latest_attempt_errors == 1
+        assert scan.latest_attempt_hash_errors == 1
+        assert scan.last_applied_hash_errors == 1
+        assert summary.health_status == "completed"
+        assert summary.coverage_eligible is True
+        assert summary.status == "likely"
     finally:
         db.close()
 

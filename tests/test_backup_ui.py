@@ -31,7 +31,7 @@ def test_item_copy_evidence_uses_words_and_explains_metadata_limit():
     display = item_backup_display(status, {2: "AID-002 - Offsite"})
 
     assert display.state == "strong"
-    assert display.text == "Strong · 1 other drive"
+    assert display.text == "Strong metadata · 1 other drive"
     assert "AID-002 - Offsite" in display.tooltip
     assert "same relative path" in display.tooltip
     assert BACKUP_METADATA_DISCLAIMER in display.tooltip
@@ -120,8 +120,8 @@ def test_strong_file_distinguishes_strong_and_possible_only_drives():
         {2: "AID-002", 3: "AID-003"},
     )
 
-    assert display.text == "Strong · 1 other drive"
-    assert "Strong match drives: AID-002" in display.tooltip
+    assert display.text == "Strong metadata · 1 other drive"
+    assert "Strong metadata-only drives: AID-002" in display.tooltip
     assert "Possible-only drives: AID-003" in display.tooltip
 
 
@@ -157,7 +157,7 @@ def test_stale_tooltip_qualifies_old_targets_and_reports_omitted_drives():
     )
 
     assert display.text == "Outdated"
-    assert "Last-analysed strong match drives:" in display.tooltip
+    assert "Last-analysed strong metadata-only drives:" in display.tooltip
     assert "Last-analysed possible-only drives:" in display.tooltip
     assert display.tooltip.count("(+1 more)") == 2
     assert "Last-analysed evidence:" in display.tooltip
@@ -177,7 +177,7 @@ def test_browser_other_copy_column_has_header_and_row_explanations():
     model.set_items([item])
 
     assert model.headerData(1, Qt.Orientation.Horizontal) == "Other copies"
-    assert "no checksum" in model.headerData(
+    assert "SHA-256" in model.headerData(
         1,
         Qt.Orientation.Horizontal,
         Qt.ItemDataRole.ToolTipRole,
@@ -187,6 +187,28 @@ def test_browser_other_copy_column_has_header_and_row_explanations():
         model.index(0, 1),
         Qt.ItemDataRole.ToolTipRole,
     )
+
+
+def test_hash_verified_file_is_distinct_from_metadata_only_targets():
+    display = item_backup_display(
+        SimpleNamespace(
+            status="likely",
+            item_type="file",
+            is_stale=False,
+            other_drive_count=3,
+            other_volume_ids=(2, 3, 4),
+            strong_volume_ids=(2, 3),
+            verified_volume_ids=(2,),
+            possible_volume_ids=(4,),
+            evidence_text="SHA-256 on one drive; metadata fallbacks on two drives.",
+        ),
+        {2: "HASH", 3: "META", 4: "POSSIBLE"},
+    )
+
+    assert display.text == "Hash verified · 1 other drive"
+    assert "Hash-verified drives: HASH" in display.tooltip
+    assert "Strong metadata-only drives: META" in display.tooltip
+    assert "Possible-only drives: POSSIBLE" in display.tooltip
 
 
 def test_browser_attention_filter_keeps_parent_navigation_entry():
@@ -259,6 +281,15 @@ def test_empty_volume_ui_uses_applied_scan_health_not_latest_failed_attempt():
             latest_attempt_ignored_errors=1,
         ),
     )
+    before_analysis_with_hash_gap = volume_backup_display(
+        None,
+        0,
+        SimpleNamespace(
+            latest_attempt_status="completed",
+            latest_attempt_errors=1,
+            latest_attempt_hash_errors=1,
+        ),
+    )
     newly_errored = volume_backup_display(
         SimpleNamespace(health_status="empty"),
         0,
@@ -282,6 +313,7 @@ def test_empty_volume_ui_uses_applied_scan_health_not_latest_failed_attempt():
     assert errored.text == "Check scan"
     assert never.text == "Not scanned"
     assert before_analysis_with_system_warning.text == "N/A · empty"
+    assert before_analysis_with_hash_gap.text == "N/A · empty"
     assert newly_errored.text == "Check scan"
     assert newly_clean.text == "N/A · empty"
 
@@ -336,6 +368,37 @@ def test_backup_report_before_first_analysis_explains_what_will_be_compared(
     assert "1 catalogue drive." in dialog.analysis_summary_label.text()
     assert dialog.volume_table.columnCount() == 9
     assert dialog.mirror_table.columnCount() == 6
+    assert app is not None
+
+
+def test_backup_report_separates_hash_gaps_from_access_errors(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    dialog = BackupEvidenceDialog()
+    dialog.set_records(
+        SimpleNamespace(status="not_analyzed", analysed_at=None, is_stale=False),
+        [],
+        [],
+        [
+            SimpleNamespace(
+                volume_id=1,
+                latest_attempt_status="completed",
+                latest_attempt_files=2,
+                latest_attempt_folders=1,
+                latest_attempt_errors=1,
+                latest_attempt_hash_errors=1,
+                latest_attempt_ignored_errors=0,
+                health_status="healthy",
+                applied=True,
+            )
+        ],
+        {1: "AID-001"},
+    )
+
+    assert dialog.scan_table.item(0, 2).text() == "Completed · hash gaps"
+    assert dialog.scan_table.item(0, 6).text() == "0"
+    assert dialog.scan_table.item(0, 7).text() == "1"
+    assert "metadata fallback" in dialog.scan_table.item(0, 8).text()
     assert app is not None
 
 

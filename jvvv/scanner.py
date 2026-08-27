@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import stat
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .database import Database, format_timestamp, utc_now
+from .media_metadata import (
+    MediaInspectionCancelled,
+    MediaMetadataExtractor,
+    media_kind_for_extension,
+)
 from .utils import capture_volume_snapshot, resolve_volume_source_path, volume_identity_known
 
 
 ProgressCallback = Callable[[int, int, str], None]
 StatsProgressCallback = Callable[[int, int, str, int, int], None]
 CancelCallback = Callable[[], bool]
+HASH_ALGORITHM = "sha256"
+HASH_READ_SIZE = 4 * 1024 * 1024
+HASH_PROGRESS_BYTES = 64 * 1024 * 1024
+HASH_PROGRESS_SECONDS = 0.5
+HASH_STABILITY_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -34,16 +46,23 @@ class ScanChanges:
     changed_bytes_before: int
     changed_bytes_after: int
     errors_count: int = 0
+    hash_errors: int = 0
 
     @classmethod
-    def from_dict(cls, values: dict[str, int], errors_count: int = 0) -> ScanChanges:
+    def from_dict(
+        cls,
+        values: dict[str, int],
+        errors_count: int = 0,
+        hash_errors: int = 0,
+    ) -> ScanChanges:
         return cls(
             **{
                 field: int(values.get(field, 0))
                 for field in cls.__dataclass_fields__
-                if field != "errors_count"
+                if field not in {"errors_count", "hash_errors"}
             },
             errors_count=errors_count,
+            hash_errors=hash_errors,
         )
 
     @property
@@ -59,6 +78,7 @@ class ScanChanges:
                 self.files_changed,
                 self.folders_added,
                 self.folders_removed,
+                self.hash_errors,
             )
         )
 
@@ -80,6 +100,11 @@ class ScanResult:
     errors_count: int
     message: str | None = None
     changes: ScanChanges | None = None
+    files_hashed: int = 0
+    bytes_hashed: int = 0
+    hash_errors: int = 0
+    media_files: int = 0
+    media_metadata_collected: int = 0
 
 
 class ScanCancelled(Exception):
@@ -87,6 +112,10 @@ class ScanCancelled(Exception):
 
 
 class ScanDiscarded(Exception):
+    pass
+
+
+class FileChangedDuringHashError(OSError):
     pass
 
 
@@ -109,6 +138,7 @@ class VolumeScanner:
         stats_progress_callback: StatsProgressCallback | None = None,
         cancel_callback: CancelCallback | None = None,
         preview_callback: PreviewCallback | None = None,
+        media_extractor: MediaMetadataExtractor | None = None,
         batch_size: int = 500,
     ) -> None:
         self.db = db
@@ -116,9 +146,29 @@ class VolumeScanner:
         self.stats_progress_callback = stats_progress_callback
         self.cancel_callback = cancel_callback
         self.preview_callback = preview_callback
+        self.media_extractor = media_extractor or MediaMetadataExtractor()
         self.batch_size = batch_size
+        self.files_hashed = 0
+        self.bytes_hashed = 0
+        self.hash_errors = 0
+        self.media_files = 0
+        self.media_metadata_collected = 0
+        self._last_hash_progress_bytes = 0
+        self._last_hash_progress_time = 0.0
+        catalogue_path = os.path.normcase(os.path.abspath(str(self.db.path)))
+        self._catalogue_storage_paths = {
+            catalogue_path,
+            *(f"{catalogue_path}{suffix}" for suffix in ("-wal", "-shm", "-journal")),
+        }
 
     def scan(self, volume_id: int) -> ScanResult:
+        self.files_hashed = 0
+        self.bytes_hashed = 0
+        self.hash_errors = 0
+        self.media_files = 0
+        self.media_metadata_collected = 0
+        self._last_hash_progress_bytes = 0
+        self._last_hash_progress_time = time.monotonic()
         volume = self.db.get_volume(volume_id)
         if volume is None:
             raise ValueError(f"Volume does not exist: {volume_id}")
@@ -246,6 +296,8 @@ class VolumeScanner:
                             break
                         full_path = current_path / file_name
                         rel_path = normalize_relative_path(full_path.relative_to(root))
+                        if self._is_catalogue_storage_path(full_path):
+                            continue
                         try:
                             stat_result = full_path.lstat()
                         except OSError as exc:
@@ -256,7 +308,39 @@ class VolumeScanner:
                             continue
 
                         extension = full_path.suffix[1:].lower() if full_path.suffix else ""
-                        self.db.upsert_file(
+                        content_hash: bytes | None = None
+                        try:
+                            content_hash, stat_result = self._hash_stable_file(
+                                full_path,
+                                stat_result,
+                                rel_path,
+                                files_seen,
+                                folders_seen,
+                            )
+                            self.files_hashed += 1
+                        except ScanCancelled:
+                            raise
+                        except FileChangedDuringHashError as exc:
+                            errors_count += 1
+                            self.db.add_scan_error(
+                                scan_id,
+                                volume_id,
+                                rel_path,
+                                "File skipped because it changed or disappeared while "
+                                f"being scanned: {exc}",
+                            )
+                            continue
+                        except OSError as exc:
+                            errors_count += 1
+                            self.hash_errors += 1
+                            self.db.add_scan_error(
+                                scan_id,
+                                volume_id,
+                                rel_path,
+                                f"SHA-256 hash unavailable: {exc}",
+                            )
+
+                        file_id = self.db.upsert_file(
                             volume_id=volume_id,
                             folder_id=parent_folder_id,
                             name=file_name,
@@ -267,7 +351,45 @@ class VolumeScanner:
                             scanned_at=scanned_at,
                             identity_device=self._stat_identity_value(stat_result, "st_dev"),
                             identity_inode=self._stat_identity_value(stat_result, "st_ino"),
+                            content_hash=content_hash,
+                            content_hash_algorithm=(
+                                HASH_ALGORITHM if content_hash is not None else None
+                            ),
                         )
+                        media_kind = media_kind_for_extension(extension)
+                        preserve_previous_media = False
+                        if media_kind is not None and content_hash is not None:
+                            previous_hash = self.db.scan_previous_file_hash(rel_path)
+                            preserve_previous_media = bool(
+                                previous_hash is not None
+                                and previous_hash[0] == content_hash
+                                and previous_hash[1].casefold() == HASH_ALGORITHM
+                            )
+                        try:
+                            if media_kind is not None:
+                                self._emit_progress(
+                                    files_seen,
+                                    folders_seen,
+                                    f"Reading media details · {rel_path}",
+                                )
+                                media_metadata = self.media_extractor.inspect(
+                                    full_path,
+                                    extension=extension,
+                                    cancel_callback=self._cancelled,
+                                )
+                            else:
+                                media_metadata = None
+                        except MediaInspectionCancelled as exc:
+                            raise ScanCancelled(str(exc)) from exc
+                        if media_metadata is not None:
+                            self.db.replace_file_media_metadata(
+                                file_id,
+                                media_metadata.as_db_values(),
+                                preserve_existing_on_failure=preserve_previous_media,
+                            )
+                            self.media_files += 1
+                            if media_metadata.status in {"complete", "partial"}:
+                                self.media_metadata_collected += 1
                         files_seen += 1
                         if files_seen % self.batch_size == 0:
                             self._emit_progress(files_seen, folders_seen, rel_path)
@@ -281,6 +403,7 @@ class VolumeScanner:
                     changes = ScanChanges.from_dict(
                         self.db.scan_change_summary(volume_id, scanned_at),
                         errors_count=errors_count,
+                        hash_errors=self.hash_errors,
                     )
                     had_previous_scan = bool(volume["last_scan_at"]) or changes.has_previous_catalogue
                     if (
@@ -325,8 +448,13 @@ class VolumeScanner:
                 errors_count,
                 message,
                 summary,
+                files_hashed=self.files_hashed,
+                bytes_hashed=self.bytes_hashed,
+                hash_errors=self.hash_errors,
+                media_files=self.media_files,
+                media_metadata_collected=self.media_metadata_collected,
             )
-            return ScanResult(status, files_seen, folders_seen, errors_count, message, changes)
+            return self._result(status, files_seen, folders_seen, errors_count, message, changes)
         except ScanDiscarded as exc:
             summary = changes.as_dict() if changes is not None else None
             self.db.finish_scan(
@@ -337,15 +465,13 @@ class VolumeScanner:
                 errors_count,
                 str(exc),
                 summary,
+                files_hashed=self.files_hashed,
+                bytes_hashed=self.bytes_hashed,
+                hash_errors=self.hash_errors,
+                media_files=self.media_files,
+                media_metadata_collected=self.media_metadata_collected,
             )
-            return ScanResult(
-                "discarded",
-                files_seen,
-                folders_seen,
-                errors_count,
-                str(exc),
-                changes,
-            )
+            return self._result("discarded", files_seen, folders_seen, errors_count, str(exc), changes)
         except ScanCancelled as exc:
             summary = changes.as_dict() if changes is not None else None
             self.db.finish_scan(
@@ -356,15 +482,13 @@ class VolumeScanner:
                 errors_count,
                 str(exc),
                 summary,
+                files_hashed=self.files_hashed,
+                bytes_hashed=self.bytes_hashed,
+                hash_errors=self.hash_errors,
+                media_files=self.media_files,
+                media_metadata_collected=self.media_metadata_collected,
             )
-            return ScanResult(
-                "cancelled",
-                files_seen,
-                folders_seen,
-                errors_count,
-                str(exc),
-                changes,
-            )
+            return self._result("cancelled", files_seen, folders_seen, errors_count, str(exc), changes)
         except Exception as exc:
             summary = changes.as_dict() if changes is not None else None
             self.db.finish_scan(
@@ -375,8 +499,156 @@ class VolumeScanner:
                 errors_count,
                 str(exc),
                 summary,
+                files_hashed=self.files_hashed,
+                bytes_hashed=self.bytes_hashed,
+                hash_errors=self.hash_errors,
+                media_files=self.media_files,
+                media_metadata_collected=self.media_metadata_collected,
             )
             raise
+
+    def _result(
+        self,
+        status: str,
+        files_seen: int,
+        folders_seen: int,
+        errors_count: int,
+        message: str | None,
+        changes: ScanChanges | None,
+    ) -> ScanResult:
+        return ScanResult(
+            status=status,
+            files_seen=files_seen,
+            folders_seen=folders_seen,
+            errors_count=errors_count,
+            message=message,
+            changes=changes,
+            files_hashed=self.files_hashed,
+            bytes_hashed=self.bytes_hashed,
+            hash_errors=self.hash_errors,
+            media_files=self.media_files,
+            media_metadata_collected=self.media_metadata_collected,
+        )
+
+    def _hash_stable_file(
+        self,
+        path: Path,
+        initial_stat: os.stat_result,
+        relative_path: str,
+        files_seen: int,
+        folders_seen: int,
+    ) -> tuple[bytes, os.stat_result]:
+        """Hash a stable snapshot, retrying once after a concurrent change."""
+        current_stat = initial_stat
+        last_error: OSError | None = None
+        for attempt in range(HASH_STABILITY_ATTEMPTS):
+            try:
+                return (
+                    self._hash_file(
+                        path,
+                        current_stat,
+                        relative_path,
+                        files_seen,
+                        folders_seen,
+                    ),
+                    current_stat,
+                )
+            except ScanCancelled:
+                raise
+            except (FileChangedDuringHashError, FileNotFoundError) as exc:
+                last_error = exc
+                if attempt + 1 >= HASH_STABILITY_ATTEMPTS:
+                    break
+                if self._cancelled():
+                    raise ScanCancelled("Scan cancelled.")
+                try:
+                    refreshed_stat = path.lstat()
+                except OSError as refresh_error:
+                    raise FileChangedDuringHashError(
+                        f"the file could not be restated after a change: {refresh_error}"
+                    ) from refresh_error
+                if self._is_link_or_reparse_point(refreshed_stat) or not stat.S_ISREG(
+                    refreshed_stat.st_mode
+                ):
+                    raise FileChangedDuringHashError(
+                        "the path stopped being a regular file"
+                    )
+                current_stat = refreshed_stat
+        raise FileChangedDuringHashError(
+            str(last_error or "the file did not remain stable long enough to hash")
+        ) from last_error
+
+    def _hash_file(
+        self,
+        path: Path,
+        initial_stat: os.stat_result,
+        relative_path: str,
+        files_seen: int,
+        folders_seen: int,
+    ) -> bytes:
+        if self._cancelled():
+            raise ScanCancelled("Scan cancelled.")
+        hasher = hashlib.sha256()
+        with path.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            if not self._same_file_snapshot(initial_stat, opened_stat):
+                raise FileChangedDuringHashError("file changed before its content was read")
+            while True:
+                if self._cancelled():
+                    raise ScanCancelled("Scan cancelled.")
+                chunk = stream.read(HASH_READ_SIZE)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                self.bytes_hashed += len(chunk)
+                self._emit_hash_progress(files_seen, folders_seen, relative_path)
+            finished_stat = os.fstat(stream.fileno())
+        final_stat = path.lstat()
+        if (
+            not self._same_file_snapshot(opened_stat, finished_stat)
+            or not self._same_file_snapshot(finished_stat, final_stat)
+        ):
+            raise FileChangedDuringHashError("file changed while its content was read")
+        if self._cancelled():
+            raise ScanCancelled("Scan cancelled.")
+        return hasher.digest()
+
+    def _emit_hash_progress(
+        self,
+        files_seen: int,
+        folders_seen: int,
+        relative_path: str,
+    ) -> None:
+        now = time.monotonic()
+        if (
+            self.bytes_hashed - self._last_hash_progress_bytes < HASH_PROGRESS_BYTES
+            and now - self._last_hash_progress_time < HASH_PROGRESS_SECONDS
+        ):
+            return
+        self._last_hash_progress_bytes = self.bytes_hashed
+        self._last_hash_progress_time = now
+        self._emit_progress(
+            files_seen,
+            folders_seen,
+            f"Hashing SHA-256 · {self.bytes_hashed:,} bytes read · {relative_path}",
+        )
+
+    @staticmethod
+    def _same_file_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
+        first_mtime_ns = getattr(first, "st_mtime_ns", int(first.st_mtime * 1_000_000_000))
+        second_mtime_ns = getattr(second, "st_mtime_ns", int(second.st_mtime * 1_000_000_000))
+        if int(first.st_size) != int(second.st_size) or int(first_mtime_ns) != int(second_mtime_ns):
+            return False
+        for identity_name in ("st_dev", "st_ino"):
+            first_identity = int(getattr(first, identity_name, 0) or 0)
+            second_identity = int(getattr(second, identity_name, 0) or 0)
+            if first_identity and second_identity and first_identity != second_identity:
+                return False
+        return stat.S_ISREG(second.st_mode)
+
+    def _is_catalogue_storage_path(self, path: Path) -> bool:
+        normalized = os.path.normcase(os.path.abspath(str(path)))
+        return normalized in self._catalogue_storage_paths
 
     def _modified_at(self, path: Path) -> str | None:
         try:

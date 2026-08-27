@@ -35,7 +35,14 @@ def test_database_initializes_schema(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert {"volumes", "folders", "files", "scan_history", "scan_errors"} <= tables
+        assert {
+            "volumes",
+            "folders",
+            "files",
+            "file_media_metadata",
+            "scan_history",
+            "scan_errors",
+        } <= tables
         assert "volume_register" in tables
         assert {
             "backup_analysis_runs",
@@ -45,7 +52,7 @@ def test_database_initializes_schema(tmp_path):
             "backup_volume_results",
             "backup_mirror_candidates",
         } <= tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 11
         assert {"files_fts", "folders_fts"} <= tables
         folder_indexes = {
             row["name"]
@@ -79,7 +86,38 @@ def test_database_initializes_schema(tmp_path):
             "folders_removed",
             "bytes_before",
             "bytes_after",
+            "files_hashed",
+            "bytes_hashed",
+            "hash_errors",
+            "media_files",
+            "media_metadata_collected",
         } <= scan_history_columns
+        file_columns = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA table_info(files)")
+        }
+        assert {"content_hash", "content_hash_algorithm"} <= file_columns
+        media_columns = {
+            row["name"]
+            for row in db.connection.execute("PRAGMA table_info(file_media_metadata)")
+        }
+        assert {
+            "file_id",
+            "status",
+            "media_kind",
+            "source",
+            "container",
+            "duration_ms",
+            "width",
+            "height",
+            "video_codecs",
+            "audio_codecs",
+            "sample_rate_hz",
+            "channels",
+            "bit_rate",
+            "message",
+            "probed_at",
+        } <= media_columns
         volume_columns = {
             row["name"]: row
             for row in db.connection.execute("PRAGMA table_info(volumes)")
@@ -756,7 +794,7 @@ def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 11
         root = migrated.get_root_folder(volume_id)
         assert root is not None
         assert root["recursive_size_bytes"] is None
@@ -834,7 +872,7 @@ def test_version_7_search_index_migrates_to_column_detail(tmp_path):
 
     migrated = open_catalogue(path)
     try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 11
         definitions = {
             row["name"]: row["sql"]
             for row in migrated.connection.execute(
@@ -902,3 +940,228 @@ def test_upsert_file_accepts_unsigned_64_bit_identity_values(tmp_path):
         assert root["direct_file_count"] == 2
     finally:
         db.close()
+
+
+def test_upsert_file_validates_and_replaces_content_hash_fields(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        scanned_at = "2026-08-27T12:00:00.000000+0000"
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        with db.transaction():
+            folder_id = db.ensure_folder(
+                volume_id=volume_id,
+                parent_id=None,
+                name="Archive",
+                relative_path="",
+                scanned_at=scanned_at,
+            )
+            file_id = db.upsert_file(
+                volume_id=volume_id,
+                folder_id=folder_id,
+                name="hashed.bin",
+                relative_path="hashed.bin",
+                extension="bin",
+                size_bytes=32,
+                modified_at=None,
+                scanned_at=scanned_at,
+                content_hash=bytes(range(32)),
+                content_hash_algorithm=" SHA256 ",
+            )
+
+        row = db.get_file(file_id)
+        assert row["content_hash"] == bytes(range(32))
+        assert row["content_hash_algorithm"] == "sha256"
+
+        with pytest.raises(ValueError, match="stored together"):
+            db.upsert_file(
+                volume_id=volume_id,
+                folder_id=folder_id,
+                name="missing-algorithm.bin",
+                relative_path="missing-algorithm.bin",
+                extension="bin",
+                size_bytes=1,
+                modified_at=None,
+                scanned_at=scanned_at,
+                content_hash=bytes(range(32)),
+            )
+        with pytest.raises(ValueError, match="exactly 32 bytes"):
+            db.upsert_file(
+                volume_id=volume_id,
+                folder_id=folder_id,
+                name="short.bin",
+                relative_path="short.bin",
+                extension="bin",
+                size_bytes=1,
+                modified_at=None,
+                scanned_at=scanned_at,
+                content_hash=b"short",
+                content_hash_algorithm="sha256",
+            )
+
+        with db.transaction():
+            same_file_id = db.upsert_file(
+                volume_id=volume_id,
+                folder_id=folder_id,
+                name="hashed.bin",
+                relative_path="hashed.bin",
+                extension="bin",
+                size_bytes=32,
+                modified_at=None,
+                scanned_at=scanned_at,
+            )
+        row = db.get_file(same_file_id)
+        assert same_file_id == file_id
+        assert row["content_hash"] is None
+        assert row["content_hash_algorithm"] is None
+    finally:
+        db.close()
+
+
+def test_finish_scan_stores_hash_and_media_statistics(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        scan_id = db.start_scan(volume_id)
+        db.finish_scan(
+            scan_id,
+            "completed",
+            4,
+            2,
+            1,
+            files_hashed=3,
+            bytes_hashed=4096,
+            hash_errors=1,
+            media_files=2,
+            media_metadata_collected=1,
+        )
+
+        row = db.list_scan_history(volume_id)[0]
+        assert row["files_hashed"] == 3
+        assert row["bytes_hashed"] == 4096
+        assert row["hash_errors"] == 1
+        assert row["media_files"] == 2
+        assert row["media_metadata_collected"] == 1
+    finally:
+        db.close()
+
+
+def test_file_media_metadata_api_replaces_and_clears_one_to_one_record(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        scanned_at = "2026-08-27T12:00:00.000000+0000"
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        with db.transaction():
+            folder_id = db.ensure_folder(
+                volume_id=volume_id,
+                parent_id=None,
+                name="Archive",
+                relative_path="",
+                scanned_at=scanned_at,
+            )
+            file_id = db.upsert_file(
+                volume_id=volume_id,
+                folder_id=folder_id,
+                name="clip.mp4",
+                relative_path="clip.mp4",
+                extension="mp4",
+                size_bytes=100,
+                modified_at=None,
+                scanned_at=scanned_at,
+            )
+            db.replace_file_media_metadata(
+                file_id,
+                {
+                    "status": "available",
+                    "media_kind": "video",
+                    "source": "ffprobe",
+                    "container": "mov,mp4",
+                    "duration_ms": 12_345,
+                    "width": 1920,
+                    "height": 1080,
+                    "video_codecs": "h264",
+                    "audio_codecs": "aac",
+                    "sample_rate_hz": 48_000,
+                    "channels": 2,
+                    "bit_rate": 8_000_000,
+                    "message": "",
+                    "probed_at": scanned_at,
+                },
+            )
+
+        row = db.get_file_media_metadata(file_id)
+        assert row["status"] == "available"
+        assert row["media_kind"] == "video"
+        assert row["duration_ms"] == 12_345
+        assert (row["width"], row["height"]) == (1920, 1080)
+        assert row["video_codecs"] == "h264"
+        assert row["audio_codecs"] == "aac"
+
+        with db.transaction():
+            db.replace_file_media_metadata(file_id, None)
+        assert db.get_file_media_metadata(file_id) is None
+    finally:
+        db.close()
+
+
+def test_version_10_catalogue_migrates_hash_and_media_fields_as_unknown(tmp_path):
+    path = tmp_path / "catalogue.jvvv"
+    legacy = Database(path, initialize=False)
+    try:
+        legacy.connection.execute("PRAGMA foreign_keys = OFF")
+        with legacy.transaction() as conn:
+            for version in range(1, 11):
+                getattr(legacy, f"_apply_migration_{version}")()
+            conn.execute("PRAGMA user_version = 10")
+        legacy.connection.execute("PRAGMA foreign_keys = ON")
+
+        now = "2026-08-27T12:00:00.000000+0000"
+        volume_id = legacy.create_volume("Legacy", str(tmp_path))
+        with legacy.transaction() as conn:
+            folder_id = legacy.ensure_folder(
+                volume_id=volume_id,
+                parent_id=None,
+                name="Legacy",
+                relative_path="",
+                scanned_at=now,
+            )
+            file_id = conn.execute(
+                """
+                INSERT INTO files (
+                    volume_id, folder_id, name, relative_path, extension,
+                    size_bytes, modified_at, missing, scanned_at,
+                    identity_device, identity_inode
+                ) VALUES (?, ?, 'legacy.bin', 'legacy.bin', 'bin', 7, NULL, 0, ?, NULL, NULL)
+                """,
+                (volume_id, folder_id, now),
+            ).lastrowid
+            scan_id = conn.execute(
+                """
+                INSERT INTO scan_history (
+                    volume_id, started_at, finished_at, status,
+                    files_seen, folders_seen, errors_count
+                ) VALUES (?, ?, ?, 'completed', 1, 1, 0)
+                """,
+                (volume_id, now, now),
+            ).lastrowid
+    finally:
+        legacy.close()
+
+    migrated = open_catalogue(path)
+    try:
+        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        file_row = migrated.get_file(file_id)
+        assert file_row["content_hash"] is None
+        assert file_row["content_hash_algorithm"] is None
+
+        history = migrated.connection.execute(
+            "SELECT * FROM scan_history WHERE id = ?",
+            (scan_id,),
+        ).fetchone()
+        assert history["files_hashed"] == 0
+        assert history["bytes_hashed"] == 0
+        assert history["hash_errors"] == 0
+        assert history["media_files"] == 0
+        assert history["media_metadata_collected"] == 0
+        assert migrated.get_file_media_metadata(file_id) is None
+    finally:
+        migrated.close()

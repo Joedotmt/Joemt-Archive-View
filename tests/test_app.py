@@ -638,6 +638,82 @@ def test_open_catalogue_location_reveals_catalogue_file(monkeypatch):
     assert opened == [(Path("archive.jvvv"), True)]
 
 
+def test_file_properties_explain_hash_and_persisted_media_details():
+    digest = bytes.fromhex("ab" * 32)
+    record = {
+        "item_type": "file",
+        "item_id": 7,
+        "volume_id": 3,
+        "name": "clip.mp4",
+        "relative_path": "Videos/clip.mp4",
+        "extension": "mp4",
+        "size_bytes": 1234,
+        "modified_at": None,
+        "missing": 0,
+        "scanned_at": "2026-08-27T10:00:00.000000+0000",
+        "volume_name": "Archive",
+        "parent_id": 4,
+        "parent_relative_path": "Videos",
+        "content_hash": digest,
+        "content_hash_algorithm": "sha256",
+        "media_status": "complete",
+        "media_source": "ffprobe",
+        "media_container": "mov,mp4",
+        "media_duration_ms": 2500,
+        "media_width": 1920,
+        "media_height": 1080,
+        "video_codecs": "h264",
+        "audio_codecs": "aac",
+        "media_sample_rate_hz": 48000,
+        "media_channels": 2,
+        "media_bit_rate": 7500000,
+        "media_message": "",
+        "media_probed_at": "2026-08-27T10:00:00.000000+0000",
+    }
+    window = SimpleNamespace(
+        db=SimpleNamespace(get_volume=lambda _volume_id: {"name": "Archive"}),
+        current_source_path_for_volume=lambda _volume: None,
+        physical_path_for_source=lambda _source, _relative: None,
+        current_item_exists_text=lambda _path, _connected: "Unavailable",
+        catalogue_item_display_name=lambda value: value["name"],
+        catalogue_item_type_label=lambda _value: "MP4 video",
+        parent_folder_display=lambda _value: "Videos",
+        backup_engine=None,
+        backup_volume_references={},
+        _display_time=lambda value: value or "-",
+        _display_optional_count=lambda value: str(value),
+        _display_unknown_time=lambda value: value or "Unknown",
+    )
+
+    rows = dict(MainWindow.catalogue_item_property_rows(window, record))
+
+    assert rows["Content hash"] == f"SHA-256 · {digest.hex()}"
+    assert rows["Media details"] == "Collected · ffprobe"
+    assert rows["Duration"] == "0:02.500"
+    assert rows["Dimensions"] == "1,920 × 1,080"
+    assert rows["Video codec"] == "h264"
+    assert rows["Audio codec"] == "aac"
+    assert rows["Sample rate"] == "48,000 Hz"
+    assert rows["Bit rate"] == "7,500,000 bit/s"
+
+    record["media_status"] = "partial"
+    record["media_message"] = "Only the video stream could be read."
+    partial_rows = dict(MainWindow.catalogue_item_property_rows(window, record))
+    assert partial_rows["Media details"] == (
+        "Partially collected · ffprobe · Only the video stream could be read."
+    )
+
+    record["content_hash"] = None
+    record["content_hash_algorithm"] = None
+    record["media_status"] = "unavailable"
+    record["media_message"] = "ffprobe was not available during this scan."
+    unavailable_rows = dict(MainWindow.catalogue_item_property_rows(window, record))
+    assert unavailable_rows["Content hash"].startswith("Unavailable — rescan")
+    assert unavailable_rows["Media details"] == (
+        "Not collected — ffprobe was not available during this scan."
+    )
+
+
 def test_search_worker_reuses_connected_state_for_results_on_same_volume(monkeypatch):
     events = []
 
