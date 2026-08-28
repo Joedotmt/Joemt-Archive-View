@@ -913,6 +913,169 @@ def test_volume_health_distinguishes_clean_empty_error_empty_and_not_scanned(tmp
         db.close()
 
 
+def test_volume_results_group_rows_once_and_preserve_all_aggregate_values(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        first_id, first_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="First",
+            drive_id="AID-001",
+            files={
+                "likely.bin": (100, MODIFIED_AT),
+                "possible.bin": (50, MODIFIED_AT),
+                "ambiguous.bin": (25, MODIFIED_AT),
+                "excluded.bin": (10, MODIFIED_AT),
+                "single.bin": (5, MODIFIED_AT),
+            },
+        )
+        second_id, second_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Second",
+            drive_id="AID-002",
+            files={"unknown.bin": (7, MODIFIED_AT)},
+            scan_status=None,
+        )
+        empty_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Empty",
+            drive_id="AID-003",
+            files={},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        engine._create_work_tables()
+        db.connection.executemany(
+            "INSERT INTO backup_work_files VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, '')",
+            [
+                (first_files["likely.bin"], first_id, b"l", b"l", b"", MODIFIED_AT, 100, 1),
+                (first_files["possible.bin"], first_id, b"p", b"p", b"", MODIFIED_AT, 50, 1),
+                (first_files["ambiguous.bin"], first_id, b"a", b"a", b"", MODIFIED_AT, 25, 1),
+                (first_files["excluded.bin"], first_id, b"e", b"e", b"", MODIFIED_AT, 10, 0),
+                (first_files["single.bin"], first_id, b"s", b"s", b"", MODIFIED_AT, 5, 1),
+                (second_files["unknown.bin"], second_id, b"u", b"u", b"", MODIFIED_AT, 7, 1),
+            ],
+        )
+        db.connection.executemany(
+            "INSERT INTO backup_stage_file_results VALUES (?, ?, ?, '[]', '', '[]', '[]', '[]')",
+            [
+                (first_files["likely.bin"], first_id, "likely"),
+                (first_files["possible.bin"], first_id, "possible"),
+                (first_files["ambiguous.bin"], first_id, "ambiguous"),
+            ],
+        )
+
+        traced_sql: list[str] = []
+        progress = []
+        db.connection.set_trace_callback(traced_sql.append)
+        try:
+            engine._build_volume_results(progress.append, None)
+        finally:
+            db.connection.set_trace_callback(None)
+
+        rows = {
+            int(row["volume_id"]): dict(row)
+            for row in db.connection.execute(
+                "SELECT * FROM backup_stage_volume_results ORDER BY volume_id"
+            )
+        }
+        assert rows[first_id] == {
+            "volume_id": first_id,
+            "status": "possible",
+            "health_status": "completed",
+            "coverage_eligible": 1,
+            "total_files": 5,
+            "total_bytes": 190,
+            "coverage_files": 4,
+            "coverage_bytes": 180,
+            "likely_files": 1,
+            "likely_bytes": 100,
+            "possible_files": 1,
+            "possible_bytes": 50,
+            "ambiguous_files": 1,
+            "ambiguous_bytes": 25,
+            "excluded_files": 1,
+            "excluded_bytes": 10,
+            "single_files": 1,
+            "single_bytes": 5,
+            "likely_files_percent": 25.0,
+            "likely_bytes_percent": pytest.approx(55.55555555555556),
+            "latest_scan_status": "completed",
+            "latest_scan_errors": 0,
+        }
+        assert rows[second_id]["status"] == "unknown"
+        assert rows[second_id]["health_status"] == "not_scanned"
+        assert rows[second_id]["coverage_eligible"] == 0
+        assert rows[second_id]["total_files"] == 1
+        assert rows[second_id]["total_bytes"] == 7
+        assert rows[second_id]["single_files"] == 1
+        assert rows[second_id]["single_bytes"] == 7
+        assert rows[empty_id]["status"] == "empty"
+        assert rows[empty_id]["health_status"] == "empty"
+        assert rows[empty_id]["total_files"] == 0
+        assert rows[empty_id]["total_bytes"] == 0
+        assert [event.completed for event in progress] == [0, 1, 2, 3]
+        assert all(event.phase == "volume_coverage" for event in progress)
+        assert all(event.total == 3 for event in progress)
+
+        normalized_sql = [" ".join(statement.casefold().split()) for statement in traced_sql]
+        total_queries = [
+            statement
+            for statement in normalized_sql
+            if "from backup_work_files" in statement
+            and "as coverage_files" in statement
+        ]
+        matched_queries = [
+            statement
+            for statement in normalized_sql
+            if "from backup_stage_file_results r" in statement
+            and "as likely_files" in statement
+        ]
+        assert len(total_queries) == 1
+        assert "group by volume_id" in total_queries[0]
+        assert len(matched_queries) == 1
+        assert "group by r.volume_id" in matched_queries[0]
+    finally:
+        db.close()
+
+
+def test_analysis_can_defer_persistent_indexes_without_changing_the_default(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    analysis_indexes = {
+        "idx_backup_file_results_item",
+        "idx_backup_folder_results_item",
+        "idx_backup_volume_results_volume",
+        "idx_backup_folder_matches_item",
+    }
+    try:
+        with db.transaction():
+            for index_name in analysis_indexes:
+                db.connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse(defer_persistent_indexes=True).status == "completed"
+        existing = {
+            str(row["name"])
+            for row in db.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert analysis_indexes.isdisjoint(existing)
+
+        engine.ensure_schema()
+        existing = {
+            str(row["name"])
+            for row in db.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert analysis_indexes <= existing
+    finally:
+        db.close()
+
+
 def test_scan_report_keeps_latest_attempt_separate_from_last_applied_data(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:

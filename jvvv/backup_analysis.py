@@ -532,9 +532,15 @@ class BackupAnalysisEngine:
         self.connection = db.connection
         self.options = options or AnalysisOptions()
 
-    def ensure_schema(self) -> None:
+    def ensure_schema(self, *, defer_persistent_indexes: bool = False) -> None:
         with self.db.transaction():
             for statement in ANALYSIS_SCHEMA_SQL:
+                normalized = statement.lstrip().casefold()
+                if defer_persistent_indexes and (
+                    normalized.startswith("create index")
+                    or normalized.startswith("create unique index")
+                ):
+                    continue
                 self.connection.execute(statement)
             self.connection.execute(
                 """
@@ -790,6 +796,8 @@ class BackupAnalysisEngine:
         self,
         progress_callback: ProgressCallback | None = None,
         cancel_callback: CancelCallback | None = None,
+        *,
+        defer_persistent_indexes: bool = False,
     ) -> AnalysisSummary:
         started_at = _utc_now()
         if self.connection.in_transaction:
@@ -812,7 +820,7 @@ class BackupAnalysisEngine:
             self.connection.set_progress_handler(interrupt_long_sql, 10_000)
         try:
             self._check_cancel(cancel_callback)
-            self.ensure_schema()
+            self.ensure_schema(defer_persistent_indexes=defer_persistent_indexes)
             invalidation_watermark = int(
                 self.connection.execute(
                     "SELECT COALESCE(MAX(id), 0) FROM backup_analysis_invalidations"
@@ -2308,44 +2316,83 @@ class BackupAnalysisEngine:
         volumes = list(self.connection.execute("SELECT id FROM volumes ORDER BY id"))
         self._emit(progress_callback, "volume_coverage", 0, len(volumes), "Calculating volume coverage…")
         scan_by_volume = {record.volume_id: record for record in self.scan_records()}
+        self._check_cancel(cancel_callback)
+        totals_by_volume = {
+            int(row["volume_id"]): row
+            for row in self.connection.execute(
+                """
+                SELECT volume_id,
+                       COUNT(*) AS files,
+                       COALESCE(SUM(size_bytes), 0) AS bytes,
+                       COALESCE(SUM(evidence_eligible), 0) AS coverage_files,
+                       COALESCE(
+                           SUM(CASE WHEN evidence_eligible = 1 THEN size_bytes ELSE 0 END),
+                           0
+                       ) AS coverage_bytes
+                FROM backup_work_files
+                GROUP BY volume_id
+                """
+            )
+        }
+        self._check_cancel(cancel_callback)
+        matched_by_volume = {
+            int(row["volume_id"]): row
+            for row in self.connection.execute(
+                """
+                SELECT
+                    r.volume_id,
+                    COALESCE(SUM(r.status='likely'), 0) AS likely_files,
+                    COALESCE(
+                        SUM(CASE WHEN r.status='likely' THEN wf.size_bytes ELSE 0 END),
+                        0
+                    ) AS likely_bytes,
+                    COALESCE(SUM(r.status='possible'), 0) AS possible_files,
+                    COALESCE(
+                        SUM(CASE WHEN r.status='possible' THEN wf.size_bytes ELSE 0 END),
+                        0
+                    ) AS possible_bytes,
+                    COALESCE(SUM(r.status='ambiguous'), 0) AS ambiguous_files,
+                    COALESCE(
+                        SUM(CASE WHEN r.status='ambiguous' THEN wf.size_bytes ELSE 0 END),
+                        0
+                    ) AS ambiguous_bytes
+                FROM backup_stage_file_results r
+                JOIN backup_work_files wf ON wf.file_id = r.file_id
+                GROUP BY r.volume_id
+                """
+            )
+        }
         for index, volume_row in enumerate(volumes, start=1):
             self._check_cancel(cancel_callback)
             volume_id = int(volume_row["id"])
-            totals = self.connection.execute(
-                """
-                SELECT COUNT(*) AS files, COALESCE(SUM(size_bytes), 0) AS bytes
-                     , COALESCE(SUM(evidence_eligible), 0) AS coverage_files
-                     , COALESCE(SUM(CASE WHEN evidence_eligible = 1 THEN size_bytes ELSE 0 END), 0)
-                       AS coverage_bytes
-                FROM backup_work_files WHERE volume_id = ?
-                """,
-                (volume_id,),
-            ).fetchone()
-            matched = self.connection.execute(
-                """
-                SELECT
-                    COALESCE(SUM(r.status='likely'), 0) AS likely_files,
-                    COALESCE(SUM(CASE WHEN r.status='likely' THEN wf.size_bytes ELSE 0 END), 0) AS likely_bytes,
-                    COALESCE(SUM(r.status='possible'), 0) AS possible_files,
-                    COALESCE(SUM(CASE WHEN r.status='possible' THEN wf.size_bytes ELSE 0 END), 0) AS possible_bytes,
-                    COALESCE(SUM(r.status='ambiguous'), 0) AS ambiguous_files,
-                    COALESCE(SUM(CASE WHEN r.status='ambiguous' THEN wf.size_bytes ELSE 0 END), 0) AS ambiguous_bytes
-                FROM backup_stage_file_results r
-                JOIN backup_work_files wf ON wf.file_id = r.file_id
-                WHERE r.volume_id = ?
-                """,
-                (volume_id,),
-            ).fetchone()
-            total_files = int(totals["files"] or 0)
-            total_bytes = int(totals["bytes"] or 0)
-            coverage_files = int(totals["coverage_files"] or 0)
-            coverage_bytes = int(totals["coverage_bytes"] or 0)
-            likely_files = int(matched["likely_files"] or 0)
-            likely_bytes = int(matched["likely_bytes"] or 0)
-            possible_files = int(matched["possible_files"] or 0)
-            possible_bytes = int(matched["possible_bytes"] or 0)
-            ambiguous_files = int(matched["ambiguous_files"] or 0)
-            ambiguous_bytes = int(matched["ambiguous_bytes"] or 0)
+            totals = totals_by_volume.get(volume_id)
+            matched = matched_by_volume.get(volume_id)
+            total_files = int(totals["files"] or 0) if totals is not None else 0
+            total_bytes = int(totals["bytes"] or 0) if totals is not None else 0
+            coverage_files = (
+                int(totals["coverage_files"] or 0) if totals is not None else 0
+            )
+            coverage_bytes = (
+                int(totals["coverage_bytes"] or 0) if totals is not None else 0
+            )
+            likely_files = (
+                int(matched["likely_files"] or 0) if matched is not None else 0
+            )
+            likely_bytes = (
+                int(matched["likely_bytes"] or 0) if matched is not None else 0
+            )
+            possible_files = (
+                int(matched["possible_files"] or 0) if matched is not None else 0
+            )
+            possible_bytes = (
+                int(matched["possible_bytes"] or 0) if matched is not None else 0
+            )
+            ambiguous_files = (
+                int(matched["ambiguous_files"] or 0) if matched is not None else 0
+            )
+            ambiguous_bytes = (
+                int(matched["ambiguous_bytes"] or 0) if matched is not None else 0
+            )
             excluded_files = max(0, total_files - coverage_files)
             excluded_bytes = max(0, total_bytes - coverage_bytes)
             single_files = max(

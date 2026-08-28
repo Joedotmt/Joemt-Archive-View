@@ -5,10 +5,11 @@ import json
 import sqlite3
 import warnings
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZipFile
 
 import pytest
 
+import jvvv.catalogue_backup as catalogue_backup
 from jvvv.backup_analysis import BackupAnalysisEngine
 from jvvv.catalogue_backup import (
     BackupInspection,
@@ -25,6 +26,7 @@ from jvvv.database import Database, SCHEMA_VERSION
 
 
 ARCHIVE_MEMBERS = {"manifest.json", "source.sqlite"}
+V2_ARCHIVE_MEMBERS = ARCHIVE_MEMBERS | {"analysis.sqlite"}
 SHARED_HASH = bytes(range(32))
 UNIQUE_HASH = bytes(reversed(range(32)))
 SOURCE_TABLES = {
@@ -489,6 +491,28 @@ def _write_archive(path: Path, members: list[tuple[str, bytes]]) -> None:
                 archive.writestr(name, data)
 
 
+def _write_mixed_archive(
+    path: Path,
+    members: list[tuple[str, bytes, int]],
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with ZipFile(path, "w", allowZip64=True) as archive:
+            for name, data, compression in members:
+                archive.writestr(name, data, compress_type=compression)
+
+
+def _component(manifest: dict[str, object], path: str) -> dict[str, object]:
+    components = manifest["components"]
+    assert isinstance(components, list)
+    component = next(
+        item
+        for item in components
+        if isinstance(item, dict) and item.get("path") == path
+    )
+    return component
+
+
 def _manifest_with_payload_integrity(
     manifest: dict[str, object], payload: bytes
 ) -> dict[str, object]:
@@ -560,6 +584,11 @@ def test_backup_roundtrip_is_semantically_lossless_and_regenerates_derived_data(
         (backup.savings_bytes * 100.0) / backup.original_size
     )
     assert EXPECTED_ROW_COUNTS.items() <= backup.table_rows.items()
+    with ZipFile(backup_path) as archive:
+        stale_manifest = json.loads(archive.read("manifest.json"))
+        assert set(archive.namelist()) == ARCHIVE_MEMBERS
+    assert stale_manifest["format_version"] == 1
+    assert stale_manifest["reconstruction"]["backup_analysis"]["storage"] == "stored"
 
     restored = restore_catalogue_backup(backup_path, restored_path)
 
@@ -626,19 +655,23 @@ def test_archive_manifest_payload_and_hash_deduplication_are_compact(
 ):
     backup_path = tmp_path / "catalogue.zip"
     _clear_backup_analysis(representative_catalogue)
-    create_catalogue_backup(representative_catalogue, backup_path)
+    result = create_catalogue_backup(representative_catalogue, backup_path)
 
     with ZipFile(backup_path) as archive:
         infos = archive.infolist()
         assert {info.filename for info in infos} == ARCHIVE_MEMBERS
         assert len(infos) == 2
         assert all(info.compress_type == ZIP_DEFLATED for info in infos)
-        assert archive.getinfo("source.sqlite").extract_version >= 45
+        payload_info = archive.getinfo("source.sqlite")
+        assert payload_info.extract_version >= 45
+        assert payload_info.file_size == result.payload_size
+        assert payload_info.compress_size < payload_info.file_size
         manifest = json.loads(archive.read("manifest.json"))
         payload = archive.read("source.sqlite")
 
     assert manifest["format"] == "jvvv-semantic-backup"
     assert manifest["format_version"] == 1
+    assert manifest["reconstruction"]["backup_analysis"]["storage"] == "none"
     assert manifest["catalogue_schema_version"] == SCHEMA_VERSION
     components = manifest["components"]
     assert isinstance(components, list) and len(components) == 1
@@ -671,6 +704,17 @@ def test_archive_manifest_payload_and_hash_deduplication_are_compact(
         assert not any(name.startswith(("files_fts", "folders_fts")) for name in tables)
         assert not any(name.startswith("backup_") for name in tables)
         assert connection.execute("SELECT COUNT(*) FROM content_blobs").fetchone()[0] == 2
+        assert connection.execute("PRAGMA freelist_count").fetchone()[0] == 0
+        persistent_indexes = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'
+                """
+            )
+        }
+        assert "content_blobs_digest_copy_index" not in persistent_indexes
 
         folder_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(folders)")
@@ -693,9 +737,10 @@ def test_archive_manifest_payload_and_hash_deduplication_are_compact(
         connection.close()
 
 
-def test_current_backup_evidence_is_regenerated_with_exact_saved_identity(
+def test_current_backup_evidence_uses_exact_lzma_accelerator_and_restores(
     representative_catalogue: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     _clear_backup_analysis(representative_catalogue)
     db = Database(representative_catalogue, create=False)
@@ -705,12 +750,49 @@ def test_current_backup_evidence_is_regenerated_with_exact_saved_identity(
         db.close()
     expected_analysis = _analysis_snapshot(representative_catalogue)
     expected_sequences = _sequences(representative_catalogue)
+    expected_analysis_sequences = {
+        name: sequence
+        for name, sequence in expected_sequences.items()
+        if name in {"backup_analysis_runs", "backup_analysis_invalidations"}
+    }
     backup_path = tmp_path / "current-analysis.zip"
     restored_path = tmp_path / "current-analysis.jvvv"
 
-    create_catalogue_backup(representative_catalogue, backup_path)
-    manifest, payload = _read_archive(backup_path)
-    assert manifest["reconstruction"]["backup_analysis"]["storage"] == "regenerate"
+    result = create_catalogue_backup(representative_catalogue, backup_path)
+    with ZipFile(backup_path) as archive:
+        assert set(archive.namelist()) == V2_ARCHIVE_MEMBERS
+        assert archive.getinfo("source.sqlite").compress_type == ZIP_DEFLATED
+        analysis_info = archive.getinfo("analysis.sqlite")
+        assert analysis_info.compress_type == ZIP_LZMA
+        assert analysis_info.compress_size < analysis_info.file_size
+        manifest = json.loads(archive.read("manifest.json"))
+        payload = archive.read("source.sqlite")
+        analysis_payload = archive.read("analysis.sqlite")
+
+    assert result.backup_size < result.original_size
+    assert manifest["format_version"] == 2
+    analysis_reconstruction = manifest["reconstruction"]["backup_analysis"]
+    assert analysis_reconstruction["storage"] == "accelerator"
+    assert analysis_reconstruction["component"] == "analysis.sqlite"
+    assert analysis_reconstruction["requested"] is True
+    assert analysis_reconstruction["source_was_stale"] is False
+    assert {item["path"] for item in manifest["components"]} == {
+        "source.sqlite",
+        "analysis.sqlite",
+    }
+    analysis_component = _component(manifest, "analysis.sqlite")
+    assert analysis_component["size"] == len(analysis_payload)
+    assert analysis_component["sha256"] == hashlib.sha256(analysis_payload).hexdigest()
+    expected_counts = {
+        table: len(rows)
+        for table, rows in expected_analysis.items()
+    }
+    expected_counts["analysis_sequences"] = len(expected_analysis_sequences)
+    assert analysis_component["tables"] == expected_counts
+    assert set(analysis_component["schema"]) == set(expected_analysis) | {
+        "analysis_sequences"
+    }
+
     payload_path = tmp_path / "current-source.sqlite"
     payload_path.write_bytes(payload)
     connection = sqlite3.connect(payload_path)
@@ -725,11 +807,196 @@ def test_current_backup_evidence_is_regenerated_with_exact_saved_identity(
     finally:
         connection.close()
 
-    result = restore_catalogue_backup(backup_path, restored_path)
+    analysis_path = tmp_path / "current-analysis.sqlite"
+    analysis_path.write_bytes(analysis_payload)
+    connection = sqlite3.connect(analysis_path)
+    try:
+        analysis_tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        assert analysis_tables == set(expected_analysis) | {"analysis_sequences"}
+        for table, columns in catalogue_backup.ANALYSIS_TABLE_COLUMNS.items():
+            actual_columns = tuple(
+                row[1]
+                for row in connection.execute(f'PRAGMA table_info("{table}")')
+            )
+            assert actual_columns == columns
+            assert analysis_component["schema"][table] == list(columns)
+            assert connection.execute(
+                f'SELECT COUNT(*) FROM "{table}"'
+            ).fetchone()[0] == expected_counts[table]
+        assert analysis_component["schema"]["analysis_sequences"] == ["name", "seq"]
+        assert dict(
+            connection.execute(
+                "SELECT name, seq FROM analysis_sequences ORDER BY name"
+            )
+        ) == expected_analysis_sequences
+        assert list(
+            connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'
+                """
+            )
+        ) == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert list(connection.execute("PRAGMA foreign_key_check")) == []
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    finally:
+        connection.close()
 
-    assert "backup evidence" in result.regenerated_components
+    inspection = validate_catalogue_backup(backup_path)
+    assert inspection.manifest["format_version"] == 2
+    assert inspection.analysis_payload_size == len(analysis_payload)
+
+    def unexpected_reanalysis(*_args, **_kwargs):
+        raise AssertionError("accelerated restore recomputed backup evidence")
+
+    monkeypatch.setattr(BackupAnalysisEngine, "analyse", unexpected_reanalysis)
+    restore_catalogue_backup(backup_path, restored_path)
+
     assert _analysis_snapshot(restored_path) == expected_analysis
     assert _sequences(restored_path) == expected_sequences
+
+
+def _create_current_analysis_backup(source: Path, backup: Path) -> None:
+    _clear_backup_analysis(source)
+    db = Database(source, create=False)
+    try:
+        assert BackupAnalysisEngine(db).analyse().status == "completed"
+    finally:
+        db.close()
+    create_catalogue_backup(source, backup)
+
+
+def test_v1_no_analysis_archive_remains_validate_and_restore_compatible(
+    representative_catalogue: Path,
+    tmp_path: Path,
+):
+    _clear_backup_analysis(representative_catalogue)
+    expected = _semantic_snapshot(representative_catalogue)
+    backup_path = tmp_path / "legacy-v1.zip"
+    restored_path = tmp_path / "legacy-v1.jvvv"
+
+    create_catalogue_backup(representative_catalogue, backup_path)
+
+    with ZipFile(backup_path) as archive:
+        assert set(archive.namelist()) == ARCHIVE_MEMBERS
+        manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["format_version"] == 1
+    assert manifest["reconstruction"]["backup_analysis"]["storage"] == "none"
+    assert validate_catalogue_backup(backup_path).manifest["format_version"] == 1
+    restore_catalogue_backup(backup_path, restored_path)
+    assert _semantic_snapshot(restored_path) == expected
+
+
+def test_tampered_v2_analysis_accelerator_is_rejected_atomically(
+    representative_catalogue: Path,
+    tmp_path: Path,
+):
+    valid_path = tmp_path / "accelerated-valid.zip"
+    tampered_path = tmp_path / "accelerated-tampered.zip"
+    target = tmp_path / "existing.jvvv"
+    _create_current_analysis_backup(representative_catalogue, valid_path)
+    with ZipFile(valid_path) as archive:
+        manifest = archive.read("manifest.json")
+        source_payload = archive.read("source.sqlite")
+        analysis_payload = bytearray(archive.read("analysis.sqlite"))
+    analysis_payload[len(analysis_payload) // 2] ^= 0xFF
+    _write_mixed_archive(
+        tampered_path,
+        [
+            ("source.sqlite", source_payload, ZIP_DEFLATED),
+            ("analysis.sqlite", bytes(analysis_payload), ZIP_LZMA),
+            ("manifest.json", manifest, ZIP_DEFLATED),
+        ],
+    )
+    target.write_bytes(b"existing catalogue bytes")
+    names_before = {item.name for item in tmp_path.iterdir()}
+
+    with pytest.raises(InvalidBackupError, match="(?i)(checksum|integrity|hash)"):
+        validate_catalogue_backup(tampered_path)
+    with pytest.raises(InvalidBackupError):
+        restore_catalogue_backup(tampered_path, target, overwrite=True)
+
+    assert target.read_bytes() == b"existing catalogue bytes"
+    assert {item.name for item in tmp_path.iterdir()} == names_before
+
+
+def test_restore_uses_captured_backup_size_after_validated_archive_is_removed(
+    representative_catalogue: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backup_path = tmp_path / "remove-after-validation.zip"
+    restored_path = tmp_path / "remove-after-validation.jvvv"
+    _create_current_analysis_backup(representative_catalogue, backup_path)
+    expected_backup_size = backup_path.stat().st_size
+    validate_to_payload = catalogue_backup._validate_archive_to_payload
+
+    def validate_then_remove(*args, **kwargs):
+        inspection = validate_to_payload(*args, **kwargs)
+        backup_path.unlink()
+        return inspection
+
+    monkeypatch.setattr(
+        catalogue_backup,
+        "_validate_archive_to_payload",
+        validate_then_remove,
+    )
+
+    result = restore_catalogue_backup(backup_path, restored_path)
+
+    assert not backup_path.exists()
+    assert result.backup_size == expected_backup_size
+    assert restored_path.is_file()
+
+
+@pytest.mark.parametrize(
+    "archive_shape",
+    ["missing", "extra", "duplicate", "unsafe", "wrong-compression"],
+)
+def test_v2_analysis_member_shape_and_compression_are_strictly_validated(
+    archive_shape: str,
+    representative_catalogue: Path,
+    tmp_path: Path,
+):
+    valid_path = tmp_path / "accelerated-valid.zip"
+    malformed_path = tmp_path / f"accelerated-{archive_shape}.zip"
+    _create_current_analysis_backup(representative_catalogue, valid_path)
+    with ZipFile(valid_path) as archive:
+        manifest = archive.read("manifest.json")
+        source_payload = archive.read("source.sqlite")
+        analysis_payload = archive.read("analysis.sqlite")
+
+    members = [
+        ("source.sqlite", source_payload, ZIP_DEFLATED),
+        ("analysis.sqlite", analysis_payload, ZIP_LZMA),
+        ("manifest.json", manifest, ZIP_DEFLATED),
+    ]
+    if archive_shape == "missing":
+        members = [member for member in members if member[0] != "analysis.sqlite"]
+    elif archive_shape == "extra":
+        members.append(("unexpected.bin", b"unexpected", ZIP_DEFLATED))
+    elif archive_shape == "duplicate":
+        members.append(("analysis.sqlite", analysis_payload, ZIP_LZMA))
+    elif archive_shape == "unsafe":
+        members.append(("../analysis.sqlite", analysis_payload, ZIP_LZMA))
+    else:
+        members[1] = ("analysis.sqlite", analysis_payload, ZIP_DEFLATED)
+    _write_mixed_archive(malformed_path, members)
+
+    with pytest.raises(
+        InvalidBackupError,
+        match="(?i)(member|component|compression|duplicate|missing|unexpected|unsafe)",
+    ):
+        validate_catalogue_backup(malformed_path)
 
 
 def test_canonical_aggregates_are_omitted_and_rebuilt_exactly(
@@ -793,6 +1060,85 @@ def test_validate_returns_checked_manifest_and_sizes(
     assert inspection.archive_size == backup_path.stat().st_size
     assert inspection.payload_size == result.payload_size
     assert EXPECTED_ROW_COUNTS.items() <= inspection.table_rows.items()
+
+
+def test_create_stream_verifies_without_extracting_and_revalidating_its_archive(
+    representative_catalogue: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Creation must not repeat the full public validation/restore read path."""
+    backup_path = tmp_path / "stream-verified.zip"
+    full_validator = catalogue_backup._validate_archive_to_payload
+
+    def unexpected_full_validation(*_args, **_kwargs):
+        raise AssertionError(
+            "create_catalogue_backup extracted and fully revalidated its own archive"
+        )
+
+    monkeypatch.setattr(
+        catalogue_backup,
+        "_validate_archive_to_payload",
+        unexpected_full_validation,
+    )
+    create_catalogue_backup(representative_catalogue, backup_path)
+
+    # The separately invoked public validator must retain the complete path.
+    monkeypatch.setattr(
+        catalogue_backup,
+        "_validate_archive_to_payload",
+        full_validator,
+    )
+    inspection = validate_catalogue_backup(backup_path)
+    assert inspection.backup_path == backup_path
+    assert inspection.payload_size > 0
+
+
+def test_create_validates_final_payload_without_scanning_omitted_source_indexes(
+    representative_catalogue: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Derived-index state must not force a full scan of the source database."""
+    source = Database(representative_catalogue, create=False)
+    try:
+        source.connection.execute("INSERT INTO files_fts(files_fts) VALUES('delete-all')")
+        source.connection.execute("INSERT INTO folders_fts(folders_fts) VALUES('delete-all')")
+        source.connection.commit()
+        assert source.search("shared") == []
+    finally:
+        source.close()
+
+    integrity_check = catalogue_backup._check_sqlite_integrity
+    checked_databases: list[str] = []
+
+    def record_payload_checks(connection, database, error_type):
+        if database == "original":
+            raise AssertionError("creation performed a full source integrity scan")
+        checked_databases.append(database)
+        return integrity_check(connection, database, error_type)
+
+    monkeypatch.setattr(
+        catalogue_backup,
+        "_check_sqlite_integrity",
+        record_payload_checks,
+    )
+    backup_path = tmp_path / "derived-index.zip"
+    restored_path = tmp_path / "derived-index.jvvv"
+
+    create_catalogue_backup(representative_catalogue, backup_path)
+
+    assert "main" in checked_databases
+    restore_catalogue_backup(backup_path, restored_path)
+    restored = Database(restored_path, create=False)
+    try:
+        search_ids = {
+            (row["item_type"], row["item_id"])
+            for row in restored.search("shared")
+        }
+        assert {("file", 1001), ("file", 2001)} <= search_ids
+    finally:
+        restored.close()
 
 
 def test_payload_tampering_is_rejected_and_failed_restore_leaves_target_untouched(
@@ -866,6 +1212,45 @@ def test_checksum_valid_but_unrestorable_payload_is_atomic(
 
     assert target.read_bytes() == b"original target"
     assert {item.name for item in tmp_path.iterdir()} == names_before
+
+
+@pytest.mark.parametrize(
+    ("mutation", "component"),
+    [
+        ("UPDATE files SET modified_at = '' WHERE id = 1002", "file"),
+        ("UPDATE scan_errors SET id = 410 WHERE id = 409", "scan_errors"),
+    ],
+)
+def test_restore_validation_compares_nulls_and_source_ids_exactly(
+    mutation: str,
+    component: str,
+    representative_catalogue: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_backup_analysis(representative_catalogue)
+    backup_path = tmp_path / f"exact-{component}.zip"
+    target = tmp_path / f"exact-{component}.jvvv"
+    create_catalogue_backup(representative_catalogue, backup_path)
+    copy_source = catalogue_backup._copy_payload_to_catalogue
+
+    def copy_then_mutate(db, *args, **kwargs):
+        result = copy_source(db, *args, **kwargs)
+        db.connection.execute(mutation)
+        db.connection.commit()
+        return result
+
+    monkeypatch.setattr(
+        catalogue_backup,
+        "_copy_payload_to_catalogue",
+        copy_then_mutate,
+    )
+
+    with pytest.raises(CatalogueBackupError, match=component):
+        restore_catalogue_backup(backup_path, target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob("*.restoring"))
 
 
 def test_unsupported_backup_version_is_distinct_from_invalid_backup(
@@ -980,12 +1365,13 @@ def test_live_wal_backup_uses_one_committed_sqlite_snapshot(tmp_path: Path):
                     str(tmp_path / "late"),
                 )
 
-        create_catalogue_backup(
+        result = create_catalogue_backup(
             source,
             backup,
             progress_callback=mutate_after_snapshot,
         )
         assert late_id is not None
+        assert result.table_rows["volumes"] == 1
         assert {row["id"] for row in writer.list_volumes()} == {first_id, late_id}
     finally:
         writer.close()

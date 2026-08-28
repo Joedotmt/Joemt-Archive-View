@@ -24,16 +24,21 @@ from .database import (
 
 
 BACKUP_FORMAT = "jvvv-semantic-backup"
-BACKUP_FORMAT_VERSION = 1
+BACKUP_FORMAT_VERSION = 2
+LEGACY_BACKUP_FORMAT_VERSION = 1
 PAYLOAD_FORMAT_VERSION = 1
+ANALYSIS_PAYLOAD_FORMAT_VERSION = 1
 FOLDER_AGGREGATE_ALGORITHM_VERSION = 1
 VOLUME_COUNT_ALGORITHM_VERSION = 1
 PAYLOAD_APPLICATION_ID = 0x4A565642  # "JVVB"
+ANALYSIS_PAYLOAD_APPLICATION_ID = 0x4A565641  # "JVVA"
 MANIFEST_PATH = "manifest.json"
 PAYLOAD_PATH = "source.sqlite"
+ANALYSIS_PAYLOAD_PATH = "analysis.sqlite"
 BACKUP_FILE_FILTER = "JVVV Catalogue Backups (*.zip)"
 MAX_MANIFEST_BYTES = 1024 * 1024
 COPY_CHUNK_BYTES = 1024 * 1024
+ZIP_COMPRESSION_LEVEL = 6
 
 
 class CatalogueBackupError(Exception):
@@ -88,6 +93,7 @@ class BackupInspection:
     archive_size: int
     payload_size: int
     table_rows: dict[str, int]
+    analysis_payload_size: int = 0
 
 
 ProgressCallback = Callable[[BackupProgress], None]
@@ -358,6 +364,12 @@ ANALYSIS_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+ANALYSIS_SEQUENCE_TABLE = "analysis_sequences"
+ANALYSIS_ACCELERATOR_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    **ANALYSIS_TABLE_COLUMNS,
+    ANALYSIS_SEQUENCE_TABLE: ("name", "seq"),
+}
+
 FTS_TRIGGERS = (
     "files_fts_insert",
     "files_fts_delete",
@@ -366,6 +378,45 @@ FTS_TRIGGERS = (
     "folders_fts_delete",
     "folders_fts_update",
 )
+
+# A restore is built in an unpublished temporary database.  Only these indexes
+# materially help reconstruction; every other named index is cheaper to build
+# once after the multi-million-row bulk load has finished.
+RESTORE_WORK_INDEXES = frozenset(
+    {
+        "idx_files_identity",
+        "idx_files_volume_folder",
+        "idx_folders_volume_parent",
+        "idx_scan_errors_volume",
+        "idx_scan_history_volume",
+    }
+)
+
+TABLE_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "volumes": ("id",),
+    "volume_register": ("volume_id",),
+    "folders": ("id",),
+    "file_media_metadata": ("file_id",),
+    "scan_history": ("id",),
+    "scan_errors": ("id",),
+    "backup_analysis_runs": ("id",),
+    "backup_analysis_state": ("id",),
+    "backup_analysis_volume_snapshots": ("run_id", "volume_id"),
+    "backup_file_results": ("run_id", "file_id"),
+    "backup_folder_results": ("run_id", "folder_id"),
+    "backup_folder_drive_matches": (
+        "run_id",
+        "folder_id",
+        "target_volume_id",
+    ),
+    "backup_volume_results": ("run_id", "volume_id"),
+    "backup_mirror_candidates": (
+        "run_id",
+        "source_volume_id",
+        "target_volume_id",
+    ),
+    "backup_analysis_invalidations": ("id",),
+}
 
 FTS_SHADOW_TABLES = {
     f"{prefix}_{suffix}"
@@ -726,8 +777,8 @@ def _check_sqlite_integrity(
 def _canonical_folder_statistics(
     connection: sqlite3.Connection,
     volume_id: int,
-) -> dict[int, tuple[int, int, int, int, int]]:
-    """Calculate the same folder aggregates as Database.rebuild_folder_statistics."""
+) -> tuple[dict[int, tuple[int, int, int, int, int]], int, int]:
+    """Return canonical folder aggregates and non-missing volume row counts."""
     folder_rows = list(
         connection.execute(
             """
@@ -763,20 +814,25 @@ def _canonical_folder_statistics(
         if folder_id in stats:
             stats[folder_id]["direct_subfolder_count"] = len(children)
 
+    indexed_file_count = 0
     for row in connection.execute(
         """
         SELECT folder_id, COUNT(*) AS direct_file_count,
                COALESCE(SUM(size_bytes), 0) AS direct_size
         FROM original.files
-        WHERE volume_id = ? AND missing = 0 AND folder_id IS NOT NULL
+        WHERE volume_id = ? AND missing = 0
         GROUP BY folder_id
         """,
         (volume_id,),
     ):
+        direct_file_count = int(row["direct_file_count"] or 0)
+        indexed_file_count += direct_file_count
+        if row["folder_id"] is None:
+            continue
         folder_id = int(row["folder_id"])
         if folder_id in stats:
             stats[folder_id]["direct_size"] = int(row["direct_size"] or 0)
-            stats[folder_id]["direct_file_count"] = int(row["direct_file_count"] or 0)
+            stats[folder_id]["direct_file_count"] = direct_file_count
 
     for folder_id in sorted(depth_by_id, key=depth_by_id.get, reverse=True):
         folder_stats = stats[folder_id]
@@ -843,7 +899,7 @@ def _canonical_folder_statistics(
             current = parent
     apply_identity_group()
 
-    return {
+    canonical = {
         folder_id: (
             values["recursive_size"],
             values["recursive_file_count"],
@@ -853,40 +909,41 @@ def _canonical_folder_statistics(
         )
         for folder_id, values in stats.items()
     }
+    return canonical, indexed_file_count, len(folder_rows)
 
 
 def _store_derived_exceptions(
     connection: sqlite3.Connection,
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
-) -> None:
-    connection.execute(
-        """
-        INSERT INTO volume_count_exceptions (
-            volume_id, indexed_file_count, indexed_folder_count
-        )
-        SELECT v.id, v.indexed_file_count, v.indexed_folder_count
-        FROM original.volumes v
-        WHERE v.indexed_file_count != (
-                SELECT COUNT(*) FROM original.files f
-                WHERE f.volume_id = v.id AND f.missing = 0
-              )
-           OR v.indexed_folder_count != (
-                SELECT COUNT(*) FROM original.folders fo
-                WHERE fo.volume_id = v.id AND fo.missing = 0
-              )
-        ORDER BY v.id
-        """
-    )
+) -> tuple[int, int]:
     volumes = list(
         connection.execute(
-            "SELECT id, last_scan_at FROM original.volumes ORDER BY id"
+            """
+            SELECT id, last_scan_at, indexed_file_count, indexed_folder_count
+            FROM original.volumes ORDER BY id
+            """
         )
     )
+    folder_exception_count = 0
+    volume_exceptions: list[tuple[int, int, int]] = []
     for index, volume in enumerate(volumes, start=1):
         _check_cancel(cancel_callback)
         volume_id = int(volume["id"])
-        canonical = _canonical_folder_statistics(connection, volume_id)
+        canonical, indexed_file_count, indexed_folder_count = (
+            _canonical_folder_statistics(connection, volume_id)
+        )
+        if (
+            int(volume["indexed_file_count"]) != indexed_file_count
+            or int(volume["indexed_folder_count"]) != indexed_folder_count
+        ):
+            volume_exceptions.append(
+                (
+                    volume_id,
+                    int(volume["indexed_file_count"]),
+                    int(volume["indexed_folder_count"]),
+                )
+            )
         expected_time = volume["last_scan_at"]
         exceptions: list[tuple[Any, ...]] = []
         for row in connection.execute(
@@ -928,6 +985,7 @@ def _store_derived_exceptions(
                 """,
                 exceptions,
             )
+            folder_exception_count += len(exceptions)
         _emit(
             progress_callback,
             "classify_derived",
@@ -935,6 +993,16 @@ def _store_derived_exceptions(
             len(volumes),
             "Verifying regenerable folder statistics…",
         )
+    if volume_exceptions:
+        connection.executemany(
+            """
+            INSERT INTO volume_count_exceptions (
+                volume_id, indexed_file_count, indexed_folder_count
+            ) VALUES (?, ?, ?)
+            """,
+            volume_exceptions,
+        )
+    return folder_exception_count, len(volume_exceptions)
 
 
 def _analysis_reconstruction_metadata(
@@ -988,32 +1056,14 @@ def _analysis_reconstruction_metadata(
         and str(run_row["status"] or "") == "completed"
     )
     metadata: dict[str, Any] = {
-        "storage": "regenerate" if current else "stored",
+        "storage": "accelerator" if current else "stored",
         "requested": True,
         "source_was_stale": not current,
         "source_rules_version": int(run_row["rules_version"] or 0),
         "source_status": str(run_row["status"] or ""),
     }
     if current:
-        metadata["source_run"] = {
-            column: run_row[column]
-            for column in ANALYSIS_TABLE_COLUMNS["backup_analysis_runs"]
-        }
-        metadata["source_state"] = {
-            column: state_row[column]
-            for column in ANALYSIS_TABLE_COLUMNS["backup_analysis_state"]
-        }
-        sequence_rows = connection.execute(
-            """
-            SELECT name, seq FROM original.sqlite_sequence
-            WHERE name IN ('backup_analysis_runs', 'backup_analysis_invalidations')
-            ORDER BY name
-            """
-        )
-        metadata["source_sequences"] = {
-            str(row["name"]): int(row["seq"])
-            for row in sequence_rows
-        }
+        metadata["component"] = ANALYSIS_PAYLOAD_PATH
     return metadata
 
 
@@ -1026,21 +1076,103 @@ def _create_and_copy_stored_analysis(
             connection.execute(statement)
     for table, columns in ANALYSIS_TABLE_COLUMNS.items():
         column_sql = _quoted_columns(columns)
+        changes_before = connection.total_changes
         connection.execute(
             f'INSERT INTO "{table}" ({column_sql}) '
             f'SELECT {column_sql} FROM original."{table}"'
         )
-        table_rows[table] = int(
-            connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        table_rows[table] = connection.total_changes - changes_before
+
+
+def _qualified_analysis_table_statement(statement: str, database: str) -> str:
+    marker = "CREATE TABLE IF NOT EXISTS "
+    if marker not in statement:
+        raise CatalogueBackupError("The backup-analysis table schema is invalid.")
+    return statement.replace(marker, f'{marker}"{database}".', 1)
+
+
+def _create_and_copy_analysis_accelerator(
+    connection: sqlite3.Connection,
+    database: str,
+) -> dict[str, int]:
+    """Copy current analysis tables into a compact attached SQLite payload."""
+    for statement in ANALYSIS_SCHEMA_SQL:
+        if statement.lstrip().casefold().startswith("create table"):
+            connection.execute(
+                _qualified_analysis_table_statement(statement, database)
+            )
+    connection.execute(
+        f"""
+        CREATE TABLE "{database}"."{ANALYSIS_SEQUENCE_TABLE}" (
+            name TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    connection.execute(
+        f"PRAGMA {database}.application_id = {ANALYSIS_PAYLOAD_APPLICATION_ID}"
+    )
+    connection.execute(
+        f"PRAGMA {database}.user_version = {ANALYSIS_PAYLOAD_FORMAT_VERSION}"
+    )
+
+    table_rows: dict[str, int] = {}
+    for table, columns in ANALYSIS_TABLE_COLUMNS.items():
+        column_sql = _quoted_columns(columns)
+        order_sql = _quoted_columns(TABLE_PRIMARY_KEYS[table])
+        changes_before = connection.total_changes
+        connection.execute(
+            f'INSERT INTO "{database}"."{table}" ({column_sql}) '
+            f'SELECT {column_sql} FROM original."{table}" ORDER BY {order_sql}'
         )
+        table_rows[table] = connection.total_changes - changes_before
+
+    placeholders = ",".join("?" for _ in ANALYSIS_AUTOINCREMENT_TABLES)
+    changes_before = connection.total_changes
+    connection.execute(
+        f"""
+        INSERT INTO "{database}"."{ANALYSIS_SEQUENCE_TABLE}" (name, seq)
+        SELECT name, seq FROM original.sqlite_sequence
+        WHERE name IN ({placeholders})
+        ORDER BY name
+        """,
+        ANALYSIS_AUTOINCREMENT_TABLES,
+    )
+    table_rows[ANALYSIS_SEQUENCE_TABLE] = (
+        connection.total_changes - changes_before
+    )
+    return table_rows
+
+
+def _compact_payload(
+    payload_path: Path,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+    message: str,
+) -> None:
+    _check_cancel(cancel_callback)
+    _emit(progress_callback, "compact", 0, 0, message)
+    compact = sqlite3.connect(payload_path)
+    compact.set_progress_handler(_sqlite_cancel_handler(cancel_callback), 10_000)
+    try:
+        if int(compact.execute("PRAGMA freelist_count").fetchone()[0]) > 0:
+            compact.execute("VACUUM")
+    except sqlite3.DatabaseError as exc:
+        if cancel_callback is not None and cancel_callback():
+            raise BackupCancelled("The catalogue backup operation was cancelled.") from exc
+        raise CatalogueBackupError(f"The backup source could not be compacted: {exc}") from exc
+    finally:
+        compact.set_progress_handler(None, 0)
+        compact.close()
 
 
 def _create_payload(
     source_path: Path,
     payload_path: Path,
+    analysis_payload_path: Path,
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
-) -> tuple[dict[str, int], dict[str, Any]]:
+) -> tuple[dict[str, int], dict[str, Any], dict[str, int] | None]:
     # uri=True also enables URI filenames for ATTACH, allowing the source to
     # be opened explicitly read-only while this main payload remains writable.
     connection = sqlite3.connect(payload_path, uri=True)
@@ -1052,10 +1184,15 @@ def _create_payload(
     connection.set_progress_handler(_sqlite_cancel_handler(cancel_callback), 10_000)
     try:
         _attach_catalogue_read_only(connection, source_path)
+        connection.execute(
+            "ATTACH DATABASE ? AS analysis_payload",
+            (str(analysis_payload_path.resolve()),),
+        )
+        connection.execute("PRAGMA analysis_payload.journal_mode = OFF")
+        connection.execute("PRAGMA analysis_payload.synchronous = OFF")
         connection.execute("BEGIN")
-        _emit(progress_callback, "validate_source", 0, 0, "Checking catalogue integrity…")
+        _emit(progress_callback, "validate_source", 0, 0, "Checking catalogue format…")
         _validate_catalogue_schema(connection)
-        _check_sqlite_integrity(connection, "original", CatalogueBackupError)
         _check_cancel(cancel_callback)
 
         for statement in PAYLOAD_SCHEMA_SQL:
@@ -1063,13 +1200,9 @@ def _create_payload(
         connection.execute(f"PRAGMA application_id = {PAYLOAD_APPLICATION_ID}")
         connection.execute(f"PRAGMA user_version = {PAYLOAD_FORMAT_VERSION}")
 
-        table_rows = {
-            table: int(
-                connection.execute(f'SELECT COUNT(*) FROM original."{table}"').fetchone()[0]
-            )
-            for table in SOURCE_TABLES
-        }
+        table_rows: dict[str, int] = {}
         analysis_reconstruction = _analysis_reconstruction_metadata(connection)
+        analysis_table_rows: dict[str, int] | None = None
 
         copy_steps = len(SOURCE_TABLES) + 1
         completed = 0
@@ -1077,10 +1210,12 @@ def _create_payload(
         for table in ("volumes", "folders"):
             columns = AUTHORITATIVE_TABLE_COLUMNS[table]
             column_sql = _quoted_columns(columns)
+            changes_before = connection.total_changes
             connection.execute(
                 f'INSERT INTO "{table}" ({column_sql}) '
                 f'SELECT {column_sql} FROM original."{table}" ORDER BY id'
             )
+            table_rows[table] = connection.total_changes - changes_before
             completed += 1
             _emit(
                 progress_callback,
@@ -1100,7 +1235,15 @@ def _create_payload(
         )
         connection.execute(
             """
-            INSERT INTO content_blobs (digest)
+            CREATE TEMP TABLE content_blob_lookup (
+                id INTEGER PRIMARY KEY,
+                digest BLOB NOT NULL UNIQUE
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO temp.content_blob_lookup (digest)
             SELECT content_hash
             FROM original.files
             WHERE content_hash IS NOT NULL
@@ -1108,12 +1251,14 @@ def _create_payload(
             ORDER BY content_hash
             """
         )
+        changes_before = connection.total_changes
         connection.execute(
-            "CREATE UNIQUE INDEX content_blobs_digest_copy_index ON content_blobs(digest)"
+            """
+            INSERT INTO content_blobs (id, digest)
+            SELECT id, digest FROM temp.content_blob_lookup ORDER BY id
+            """
         )
-        table_rows["content_blobs"] = int(
-            connection.execute("SELECT COUNT(*) FROM content_blobs").fetchone()[0]
-        )
+        table_rows["content_blobs"] = connection.total_changes - changes_before
         completed += 1
         _emit(
             progress_callback,
@@ -1131,6 +1276,7 @@ def _create_payload(
             copy_steps,
             "Saving file records…",
         )
+        changes_before = connection.total_changes
         connection.execute(
             f"""
             INSERT INTO files ({_quoted_columns(file_columns)})
@@ -1139,11 +1285,12 @@ def _create_payload(
                    f.scanned_at, f.identity_device, f.identity_inode,
                    b.id, f.content_hash_algorithm
             FROM original.files f
-            LEFT JOIN content_blobs b ON b.digest = f.content_hash
+            LEFT JOIN temp.content_blob_lookup b ON b.digest = f.content_hash
             ORDER BY f.id
             """
         )
-        connection.execute("DROP INDEX content_blobs_digest_copy_index")
+        table_rows["files"] = connection.total_changes - changes_before
+        connection.execute("DROP TABLE temp.content_blob_lookup")
         completed += 1
         _emit(
             progress_callback,
@@ -1162,10 +1309,12 @@ def _create_payload(
             columns = AUTHORITATIVE_TABLE_COLUMNS[table]
             column_sql = _quoted_columns(columns)
             order_column = columns[0]
+            changes_before = connection.total_changes
             connection.execute(
                 f'INSERT INTO "{table}" ({column_sql}) '
                 f'SELECT {column_sql} FROM original."{table}" ORDER BY "{order_column}"'
             )
+            table_rows[table] = connection.total_changes - changes_before
             completed += 1
             _emit(
                 progress_callback,
@@ -1187,6 +1336,7 @@ def _create_payload(
             if analysis_reconstruction["storage"] == "stored":
                 sequence_names.extend(ANALYSIS_AUTOINCREMENT_TABLES)
             placeholders = ",".join("?" for _ in sequence_names)
+            changes_before = connection.total_changes
             connection.execute(
                 f"""
                 INSERT INTO catalogue_sequences (name, seq)
@@ -1196,20 +1346,18 @@ def _create_payload(
                 """,
                 sequence_names,
             )
-        table_rows["catalogue_sequences"] = int(
-            connection.execute("SELECT COUNT(*) FROM catalogue_sequences").fetchone()[0]
-        )
-        _store_derived_exceptions(
+            table_rows["catalogue_sequences"] = (
+                connection.total_changes - changes_before
+            )
+        else:
+            table_rows["catalogue_sequences"] = 0
+        folder_exception_count, volume_exception_count = _store_derived_exceptions(
             connection,
             progress_callback,
             cancel_callback,
         )
-        table_rows["folder_state_exceptions"] = int(
-            connection.execute("SELECT COUNT(*) FROM folder_state_exceptions").fetchone()[0]
-        )
-        table_rows["volume_count_exceptions"] = int(
-            connection.execute("SELECT COUNT(*) FROM volume_count_exceptions").fetchone()[0]
-        )
+        table_rows["folder_state_exceptions"] = folder_exception_count
+        table_rows["volume_count_exceptions"] = volume_exception_count
         if analysis_reconstruction["storage"] == "stored":
             _emit(
                 progress_callback,
@@ -1219,11 +1367,22 @@ def _create_payload(
                 "Preserving non-regenerable stale backup evidence…",
             )
             _create_and_copy_stored_analysis(connection, table_rows)
+        elif analysis_reconstruction["storage"] == "accelerator":
+            _emit(
+                progress_callback,
+                "preserve_analysis",
+                0,
+                0,
+                "Saving current backup evidence accelerator…",
+            )
+            analysis_table_rows = _create_and_copy_analysis_accelerator(
+                connection,
+                "analysis_payload",
+            )
         connection.commit()
+        connection.execute("DETACH DATABASE analysis_payload")
         connection.execute("DETACH DATABASE original")
-        connection.execute("PRAGMA foreign_keys = ON")
-        _check_sqlite_integrity(connection, "main", CatalogueBackupError)
-    except sqlite3.OperationalError as exc:
+    except sqlite3.DatabaseError as exc:
         connection.rollback()
         if cancel_callback is not None and cancel_callback():
             raise BackupCancelled("The catalogue backup operation was cancelled.") from exc
@@ -1235,35 +1394,20 @@ def _create_payload(
         connection.set_progress_handler(None, 0)
         connection.close()
 
-    _check_cancel(cancel_callback)
-    _emit(progress_callback, "compact", 0, 0, "Compacting source data…")
-    compact = sqlite3.connect(payload_path)
-    compact.set_progress_handler(_sqlite_cancel_handler(cancel_callback), 10_000)
-    try:
-        compact.execute("VACUUM")
-    except sqlite3.OperationalError as exc:
-        if cancel_callback is not None and cancel_callback():
-            raise BackupCancelled("The catalogue backup operation was cancelled.") from exc
-        raise CatalogueBackupError(f"The backup source could not be compacted: {exc}") from exc
-    finally:
-        compact.set_progress_handler(None, 0)
-        compact.close()
-    return table_rows, analysis_reconstruction
-
-
-def _sha256_file(
-    path: Path,
-    cancel_callback: CancelCallback | None = None,
-) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while True:
-            _check_cancel(cancel_callback)
-            chunk = source.read(COPY_CHUNK_BYTES)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    _compact_payload(
+        payload_path,
+        progress_callback,
+        cancel_callback,
+        "Compacting source data…",
+    )
+    if analysis_table_rows is not None:
+        _compact_payload(
+            analysis_payload_path,
+            progress_callback,
+            cancel_callback,
+            "Compacting backup-evidence accelerator…",
+        )
+    return table_rows, analysis_reconstruction, analysis_table_rows
 
 
 def _manifest_for_payload(
@@ -1272,32 +1416,84 @@ def _manifest_for_payload(
     payload_sha256: str,
     table_rows: Mapping[str, int],
     analysis_reconstruction: Mapping[str, Any],
+    *,
+    analysis_payload_path: Path | None = None,
+    analysis_payload_sha256: str | None = None,
+    analysis_table_rows: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     all_schemas = {**AUTHORITATIVE_TABLE_COLUMNS, **ANALYSIS_TABLE_COLUMNS}
     schemas = {
         table: list(all_schemas[table])
         for table in table_rows
     }
+    has_accelerator = analysis_table_rows is not None
+    if has_accelerator != (
+        analysis_payload_path is not None and analysis_payload_sha256 is not None
+    ):
+        raise CatalogueBackupError(
+            "The backup-analysis accelerator metadata is incomplete."
+        )
+    components: list[dict[str, Any]] = [
+        {
+            "path": PAYLOAD_PATH,
+            "media_type": "application/vnd.sqlite3",
+            "payload_format_version": PAYLOAD_FORMAT_VERSION,
+            "size": payload_path.stat().st_size,
+            "sha256": payload_sha256,
+            "tables": {name: int(count) for name, count in table_rows.items()},
+            "schema": schemas,
+        }
+    ]
+    if has_accelerator:
+        assert analysis_payload_path is not None
+        assert analysis_payload_sha256 is not None
+        assert analysis_table_rows is not None
+        components.append(
+            {
+                "path": ANALYSIS_PAYLOAD_PATH,
+                "media_type": "application/vnd.sqlite3",
+                "payload_format_version": ANALYSIS_PAYLOAD_FORMAT_VERSION,
+                "size": analysis_payload_path.stat().st_size,
+                "sha256": analysis_payload_sha256,
+                "tables": {
+                    name: int(count)
+                    for name, count in analysis_table_rows.items()
+                },
+                "schema": {
+                    table: list(ANALYSIS_ACCELERATOR_TABLE_COLUMNS[table])
+                    for table in analysis_table_rows
+                },
+            }
+        )
+
+    omitted_derived = [
+        "SQLite free pages and journals",
+        "ordinary SQL indexes and triggers",
+        "files_fts and folders_fts search indexes",
+        "folder aggregate statistics",
+        "volume indexed row counts",
+    ]
+    if has_accelerator or analysis_reconstruction.get("storage") == "stored":
+        omitted_derived.append("backup-analysis indexes")
+    else:
+        omitted_derived.append(
+            "current backup-analysis result tables (stale generations are retained)"
+        )
+
     return {
         "format": BACKUP_FORMAT,
-        "format_version": BACKUP_FORMAT_VERSION,
+        "format_version": (
+            BACKUP_FORMAT_VERSION
+            if has_accelerator
+            else LEGACY_BACKUP_FORMAT_VERSION
+        ),
         "created_at": _utc_now(),
         "application_version": APPLICATION_VERSION,
         "minimum_application_version": APPLICATION_VERSION,
         "catalogue_schema_version": SCHEMA_VERSION,
         "source_catalogue_name": source_path.name,
         "source_catalogue_size": source_path.stat().st_size,
-        "components": [
-            {
-                "path": PAYLOAD_PATH,
-                "media_type": "application/vnd.sqlite3",
-                "payload_format_version": PAYLOAD_FORMAT_VERSION,
-                "size": payload_path.stat().st_size,
-                "sha256": payload_sha256,
-                "tables": {name: int(count) for name, count in table_rows.items()},
-                "schema": schemas,
-            }
-        ],
+        "components": components,
         "reconstruction": {
             "search_indexes": "rebuild_from_files_and_folders",
             "folder_aggregates": "rebuild_from_hierarchy_and_files",
@@ -1308,49 +1504,41 @@ def _manifest_for_payload(
             "backup_analysis": dict(analysis_reconstruction),
             "backup_analysis_rules_version": RULES_VERSION,
         },
-        "omitted_derived": [
-            "SQLite free pages and journals",
-            "ordinary SQL indexes and triggers",
-            "files_fts and folders_fts search indexes",
-            "folder aggregate statistics",
-            "volume indexed row counts",
-            "current backup-analysis result tables (stale generations are retained)",
-        ],
+        "omitted_derived": omitted_derived,
     }
 
 
 def _write_archive(
     archive_path: Path,
+    source_path: Path,
     payload_path: Path,
-    manifest: Mapping[str, Any],
+    table_rows: Mapping[str, int],
+    analysis_reconstruction: Mapping[str, Any],
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
-) -> None:
-    manifest_bytes = json.dumps(
-        manifest,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    *,
+    analysis_payload_path: Path | None = None,
+    analysis_table_rows: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
     payload_size = payload_path.stat().st_size
+    analysis_payload_size = (
+        analysis_payload_path.stat().st_size
+        if analysis_payload_path is not None
+        else 0
+    )
+    total_size = payload_size + analysis_payload_size
+    digest = hashlib.sha256()
+    analysis_digest: Any | None = None
     written = 0
     with zipfile.ZipFile(
         archive_path,
         "w",
         compression=zipfile.ZIP_DEFLATED,
-        compresslevel=9,
+        compresslevel=ZIP_COMPRESSION_LEVEL,
         allowZip64=True,
     ) as archive:
-        manifest_info = zipfile.ZipInfo(MANIFEST_PATH)
-        manifest_info.compress_type = zipfile.ZIP_DEFLATED
-        manifest_info.external_attr = 0o600 << 16
-        archive.writestr(manifest_info, manifest_bytes, compresslevel=9)
-
-        payload_info = zipfile.ZipInfo(PAYLOAD_PATH)
-        payload_info.compress_type = zipfile.ZIP_DEFLATED
-        payload_info.external_attr = 0o600 << 16
         with payload_path.open("rb") as source, archive.open(
-            payload_info,
+            PAYLOAD_PATH,
             "w",
             force_zip64=True,
         ) as destination:
@@ -1360,14 +1548,176 @@ def _write_archive(
                 if not chunk:
                     break
                 destination.write(chunk)
+                digest.update(chunk)
                 written += len(chunk)
                 _emit(
                     progress_callback,
                     "compress",
                     written,
-                    payload_size,
+                    total_size,
                     "Compressing semantic backup…",
                 )
+        # Passing the member name above makes ZipFile apply its explicit
+        # compression level on every supported Python version.  Permissions
+        # are central-directory metadata and can be set after streaming.
+        archive.getinfo(PAYLOAD_PATH).external_attr = 0o600 << 16
+
+        if analysis_payload_path is not None:
+            analysis_digest = hashlib.sha256()
+            analysis_info = zipfile.ZipInfo(ANALYSIS_PAYLOAD_PATH)
+            analysis_info.compress_type = zipfile.ZIP_LZMA
+            analysis_info.external_attr = 0o600 << 16
+            with analysis_payload_path.open("rb") as source, archive.open(
+                analysis_info,
+                "w",
+                force_zip64=True,
+            ) as destination:
+                while True:
+                    _check_cancel(cancel_callback)
+                    chunk = source.read(COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    destination.write(chunk)
+                    analysis_digest.update(chunk)
+                    written += len(chunk)
+                    _emit(
+                        progress_callback,
+                        "compress",
+                        written,
+                        total_size,
+                        "Compressing backup-evidence accelerator…",
+                    )
+
+        manifest = _manifest_for_payload(
+            source_path,
+            payload_path,
+            digest.hexdigest(),
+            table_rows,
+            analysis_reconstruction,
+            analysis_payload_path=analysis_payload_path,
+            analysis_payload_sha256=(
+                analysis_digest.hexdigest()
+                if analysis_digest is not None
+                else None
+            ),
+            analysis_table_rows=analysis_table_rows,
+        )
+        manifest_bytes = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        manifest_info = zipfile.ZipInfo(MANIFEST_PATH)
+        manifest_info.compress_type = zipfile.ZIP_DEFLATED
+        manifest_info.external_attr = 0o600 << 16
+        archive.writestr(
+            manifest_info,
+            manifest_bytes,
+            compresslevel=ZIP_COMPRESSION_LEVEL,
+        )
+    return manifest
+
+
+def _manifest_components_by_path(
+    manifest: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    return {
+        str(component["path"]): component
+        for component in manifest["components"]
+    }
+
+
+def _validate_archive_member_set(
+    infos: Mapping[str, zipfile.ZipInfo],
+    manifest: Mapping[str, Any],
+) -> None:
+    expected = {MANIFEST_PATH, *_manifest_components_by_path(manifest)}
+    actual = set(infos)
+    if actual == expected:
+        return
+    missing = expected - actual
+    extra = actual - expected
+    details: list[str] = []
+    if missing:
+        details.append("missing " + ", ".join(sorted(missing)))
+    if extra:
+        details.append("unexpected " + ", ".join(sorted(extra)))
+    raise InvalidBackupError(
+        "The backup component list is invalid"
+        + (f" ({'; '.join(details)})" if details else "")
+        + "."
+    )
+
+
+def _validate_archive_compression(
+    infos: Mapping[str, zipfile.ZipInfo],
+    manifest: Mapping[str, Any],
+) -> None:
+    if int(manifest["format_version"]) != BACKUP_FORMAT_VERSION:
+        return
+    if infos[PAYLOAD_PATH].compress_type != zipfile.ZIP_DEFLATED:
+        raise InvalidBackupError(
+            "The v2 catalogue source must use DEFLATE compression."
+        )
+    if infos[ANALYSIS_PAYLOAD_PATH].compress_type != zipfile.ZIP_LZMA:
+        raise InvalidBackupError(
+            "The backup-analysis accelerator must use LZMA compression."
+        )
+
+
+def _verify_created_archive(
+    archive_path: Path,
+    expected_manifest: Mapping[str, Any],
+    cancel_callback: CancelCallback | None,
+) -> None:
+    """Stream-check a newly written ZIP without revalidating SQLite twice."""
+    try:
+        with zipfile.ZipFile(archive_path, "r", allowZip64=True) as archive:
+            infos = _safe_member_names(archive)
+            manifest_info = infos.get(MANIFEST_PATH)
+            if manifest_info is None:
+                raise InvalidBackupError("The backup manifest is missing.")
+            manifest = _read_manifest(archive, manifest_info)
+            _validate_archive_member_set(infos, manifest)
+            _validate_archive_compression(infos, manifest)
+            if manifest != expected_manifest:
+                raise CatalogueBackupError(
+                    "The newly created backup manifest could not be verified."
+                )
+            for path, component in _manifest_components_by_path(manifest).items():
+                payload_info = infos[path]
+                expected_size = int(component["size"])
+                if payload_info.file_size != expected_size:
+                    raise CatalogueBackupError(
+                        f"The newly created backup component '{path}' size could not be verified."
+                    )
+                digest = hashlib.sha256()
+                checked = 0
+                with archive.open(payload_info, "r") as source:
+                    while True:
+                        _check_cancel(cancel_callback)
+                        chunk = source.read(COPY_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        checked += len(chunk)
+                        if checked > expected_size:
+                            raise CatalogueBackupError(
+                                f"The newly created backup component '{path}' exceeds its declared size."
+                            )
+                        digest.update(chunk)
+                if checked != expected_size:
+                    raise CatalogueBackupError(
+                        f"The newly created backup component '{path}' is truncated."
+                    )
+                if digest.hexdigest() != str(component["sha256"]).casefold():
+                    raise CatalogueBackupError(
+                        f"The newly created backup component '{path}' checksum could not be verified."
+                    )
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError) as exc:
+        raise CatalogueBackupError(
+            "The newly created catalogue backup ZIP could not be verified."
+        ) from exc
 
 
 def create_catalogue_backup(
@@ -1394,6 +1744,12 @@ def create_catalogue_backup(
     payload_fd, payload_name = tempfile.mkstemp(suffix=".sqlite", prefix="jvvv-backup-")
     os.close(payload_fd)
     payload = Path(payload_name)
+    analysis_fd, analysis_name = tempfile.mkstemp(
+        suffix=".sqlite",
+        prefix="jvvv-analysis-backup-",
+    )
+    os.close(analysis_fd)
+    analysis_payload = Path(analysis_name)
     archive_fd, archive_name = tempfile.mkstemp(
         suffix=".creating",
         prefix=f"{target.name}.",
@@ -1402,42 +1758,71 @@ def create_catalogue_backup(
     os.close(archive_fd)
     archive_temp = Path(archive_name)
     try:
-        table_rows, analysis = _create_payload(
+        table_rows, analysis, analysis_table_rows = _create_payload(
             source,
             payload,
+            analysis_payload,
             progress_callback,
             cancel_callback,
         )
-        _emit(progress_callback, "checksum", 0, 0, "Calculating integrity checksum…")
-        payload_sha256 = _sha256_file(payload, cancel_callback)
-        manifest = _manifest_for_payload(
+        _emit(
+            progress_callback,
+            "validate_payload",
+            0,
+            0,
+            "Validating compact backup source…",
+        )
+        validation_manifest = _manifest_for_payload(
             source,
             payload,
-            payload_sha256,
+            "0" * 64,
             table_rows,
             analysis,
+            analysis_payload_path=(
+                analysis_payload if analysis_table_rows is not None else None
+            ),
+            analysis_payload_sha256=(
+                "0" * 64 if analysis_table_rows is not None else None
+            ),
+            analysis_table_rows=analysis_table_rows,
         )
-        _write_archive(
+        try:
+            _validate_payload(payload, validation_manifest, cancel_callback)
+            if analysis_table_rows is not None:
+                _validate_analysis_payload(
+                    analysis_payload,
+                    validation_manifest,
+                    cancel_callback,
+                    payload,
+                )
+        except InvalidBackupError as exc:
+            raise CatalogueBackupError(
+                f"The generated backup source failed validation: {exc}"
+            ) from exc
+
+        manifest = _write_archive(
             archive_temp,
+            source,
             payload,
-            manifest,
+            table_rows,
+            analysis,
             progress_callback,
             cancel_callback,
+            analysis_payload_path=(
+                analysis_payload if analysis_table_rows is not None else None
+            ),
+            analysis_table_rows=analysis_table_rows,
         )
         _check_cancel(cancel_callback)
-        _validate_archive_to_payload(
-            archive_temp,
-            payload.with_suffix(".validated.sqlite"),
-            cancel_callback=cancel_callback,
-        )
-        payload.with_suffix(".validated.sqlite").unlink(missing_ok=True)
+        _emit(progress_callback, "verify_archive", 0, 0, "Verifying backup archive…")
+        _verify_created_archive(archive_temp, manifest, cancel_callback)
         os.replace(archive_temp, target)
     except Exception:
         archive_temp.unlink(missing_ok=True)
-        payload.with_suffix(".validated.sqlite").unlink(missing_ok=True)
         raise
     finally:
         payload.unlink(missing_ok=True)
+        analysis_payload.unlink(missing_ok=True)
 
     original_size = source.stat().st_size
     backup_size = target.stat().st_size
@@ -1461,18 +1846,6 @@ def _safe_member_names(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
     names = [info.filename for info in infos]
     if len(names) != len(set(names)):
         raise InvalidBackupError("The backup contains duplicate archive members.")
-    expected = {MANIFEST_PATH, PAYLOAD_PATH}
-    if set(names) != expected:
-        missing = expected - set(names)
-        extra = set(names) - expected
-        details: list[str] = []
-        if missing:
-            details.append("missing " + ", ".join(sorted(missing)))
-        if extra:
-            details.append("unexpected " + ", ".join(sorted(extra)))
-        raise InvalidBackupError(
-            "The backup component list is invalid" + (f" ({'; '.join(details)})" if details else "") + "."
-        )
     for info in infos:
         path = PurePosixPath(info.filename)
         if info.is_dir() or path.is_absolute() or ".." in path.parts or len(path.parts) != 1:
@@ -1480,6 +1853,48 @@ def _safe_member_names(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
         if info.flag_bits & 0x1:
             raise InvalidBackupError("Encrypted catalogue backups are not supported.")
     return {info.filename: info for info in infos}
+
+
+def _validate_component_declaration(
+    component: Any,
+    path: str,
+    payload_version: int,
+) -> Mapping[str, Any]:
+    if (
+        not isinstance(component, dict)
+        or component.get("path") != path
+        or component.get("media_type") != "application/vnd.sqlite3"
+    ):
+        raise InvalidBackupError(
+            f"The backup component '{path}' is not declared correctly."
+        )
+    if component.get("payload_format_version") != payload_version:
+        raise UnsupportedBackupError(
+            f"The backup component '{path}' payload version is not supported."
+        )
+    size = component.get("size")
+    checksum = component.get("sha256")
+    tables = component.get("tables")
+    schema = component.get("schema")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(checksum, str)
+        or len(checksum) != 64
+        or not isinstance(tables, dict)
+        or not isinstance(schema, dict)
+    ):
+        raise InvalidBackupError(
+            f"The backup component '{path}' metadata is invalid."
+        )
+    try:
+        bytes.fromhex(checksum)
+    except ValueError as exc:
+        raise InvalidBackupError(
+            f"The backup component '{path}' checksum is invalid."
+        ) from exc
+    return component
 
 
 def _read_manifest(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> dict[str, Any]:
@@ -1500,7 +1915,7 @@ def _read_manifest(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> dict[str,
             f"This backup uses format version {version}; this JVVV version supports "
             f"up to version {BACKUP_FORMAT_VERSION}."
         )
-    if version != BACKUP_FORMAT_VERSION:
+    if version not in {LEGACY_BACKUP_FORMAT_VERSION, BACKUP_FORMAT_VERSION}:
         raise UnsupportedBackupError(f"Backup format version {version} is not supported.")
     catalogue_version = manifest.get("catalogue_schema_version")
     if not isinstance(catalogue_version, int) or isinstance(catalogue_version, bool):
@@ -1511,29 +1926,27 @@ def _read_manifest(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> dict[str,
             f"JVVV version supports up to version {SCHEMA_VERSION}."
         )
     components = manifest.get("components")
-    if not isinstance(components, list) or len(components) != 1:
-        raise InvalidBackupError("The backup manifest has an invalid component list.")
-    component = components[0]
-    if not isinstance(component, dict) or component.get("path") != PAYLOAD_PATH:
-        raise InvalidBackupError("The backup source component is not declared correctly.")
-    if component.get("payload_format_version") != PAYLOAD_FORMAT_VERSION:
-        raise UnsupportedBackupError("The backup source payload version is not supported.")
-    size = component.get("size")
-    checksum = component.get("sha256")
-    tables = component.get("tables")
+    expected_component_count = (
+        2 if version == BACKUP_FORMAT_VERSION else 1
+    )
     if (
-        not isinstance(size, int)
-        or isinstance(size, bool)
-        or size < 0
-        or not isinstance(checksum, str)
-        or len(checksum) != 64
-        or not isinstance(tables, dict)
+        not isinstance(components, list)
+        or len(components) != expected_component_count
     ):
-        raise InvalidBackupError("The backup source component metadata is invalid.")
-    try:
-        bytes.fromhex(checksum)
-    except ValueError as exc:
-        raise InvalidBackupError("The backup source checksum is invalid.") from exc
+        raise InvalidBackupError("The backup manifest has an invalid component list.")
+    component = _validate_component_declaration(
+        components[0],
+        PAYLOAD_PATH,
+        PAYLOAD_FORMAT_VERSION,
+    )
+    accelerator_component: Mapping[str, Any] | None = None
+    if version == BACKUP_FORMAT_VERSION:
+        accelerator_component = _validate_component_declaration(
+            components[1],
+            ANALYSIS_PAYLOAD_PATH,
+            ANALYSIS_PAYLOAD_FORMAT_VERSION,
+        )
+    tables = component["tables"]
     reconstruction = manifest.get("reconstruction")
     analysis = reconstruction.get("backup_analysis") if isinstance(reconstruction, dict) else None
     if not isinstance(reconstruction, dict) or (
@@ -1550,8 +1963,21 @@ def _read_manifest(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> dict[str,
         "none",
         "regenerate",
         "stored",
+        "accelerator",
     }:
         raise InvalidBackupError("The backup reconstruction instructions are invalid.")
+    if version == BACKUP_FORMAT_VERSION:
+        if (
+            analysis.get("storage") != "accelerator"
+            or analysis.get("component") != ANALYSIS_PAYLOAD_PATH
+        ):
+            raise InvalidBackupError(
+                "The v2 backup-analysis accelerator instructions are invalid."
+            )
+    elif analysis.get("storage") == "accelerator":
+        raise InvalidBackupError(
+            "A v1 backup cannot declare a backup-analysis accelerator."
+        )
     if analysis["storage"] == "regenerate":
         source_run = analysis.get("source_run")
         source_state = analysis.get("source_state")
@@ -1579,6 +2005,15 @@ def _read_manifest(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> dict[str,
         for value in tables.values()
     ):
         raise InvalidBackupError("The backup table inventory is invalid.")
+    if accelerator_component is not None:
+        accelerator_tables = accelerator_component["tables"]
+        if set(accelerator_tables) != set(ANALYSIS_ACCELERATOR_TABLE_COLUMNS) or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in accelerator_tables.values()
+        ):
+            raise InvalidBackupError(
+                "The backup-analysis accelerator table inventory is invalid."
+            )
     return manifest
 
 
@@ -1642,10 +2077,206 @@ def _validate_payload(
         connection.close()
 
 
+def _source_signature_from_payload(
+    payload_path: Path,
+    cancel_callback: CancelCallback | None,
+) -> str:
+    connection = sqlite3.connect(
+        f"{payload_path.resolve().as_uri()}?mode=ro",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.set_progress_handler(_sqlite_cancel_handler(cancel_callback), 10_000)
+    try:
+        rows = connection.execute(
+            """
+            WITH file_counts AS (
+                SELECT volume_id, COUNT(*) AS item_count
+                FROM files WHERE missing = 0 GROUP BY volume_id
+            ),
+            folder_counts AS (
+                SELECT volume_id, COUNT(*) AS item_count
+                FROM folders WHERE missing = 0 GROUP BY volume_id
+            )
+            SELECT v.id, v.last_scan_at,
+                   COALESCE(e.indexed_file_count, f.item_count, 0)
+                       AS indexed_file_count,
+                   COALESCE(e.indexed_folder_count, d.item_count, 0)
+                       AS indexed_folder_count
+            FROM volumes v
+            LEFT JOIN file_counts f ON f.volume_id = v.id
+            LEFT JOIN folder_counts d ON d.volume_id = v.id
+            LEFT JOIN volume_count_exceptions e ON e.volume_id = v.id
+            ORDER BY v.id
+            """
+        )
+        snapshot = [
+            [
+                int(row["id"]),
+                row["last_scan_at"],
+                int(row["indexed_file_count"] or 0),
+                int(row["indexed_folder_count"] or 0),
+            ]
+            for row in rows
+        ]
+        return hashlib.sha256(
+            json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    except sqlite3.DatabaseError as exc:
+        if cancel_callback is not None and cancel_callback():
+            raise BackupCancelled(
+                "The catalogue restore operation was cancelled."
+            ) from exc
+        raise InvalidBackupError(
+            f"The compact catalogue source cannot be matched to its accelerator: {exc}"
+        ) from exc
+    finally:
+        connection.set_progress_handler(None, 0)
+        connection.close()
+
+
+def _validate_analysis_payload(
+    payload_path: Path,
+    manifest: Mapping[str, Any],
+    cancel_callback: CancelCallback | None,
+    source_payload_path: Path | None = None,
+) -> None:
+    component = _manifest_components_by_path(manifest)[ANALYSIS_PAYLOAD_PATH]
+    connection = sqlite3.connect(f"{payload_path.resolve().as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.set_progress_handler(_sqlite_cancel_handler(cancel_callback), 10_000)
+    try:
+        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        payload_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if application_id != ANALYSIS_PAYLOAD_APPLICATION_ID:
+            raise InvalidBackupError(
+                "The backup-analysis accelerator has an invalid application ID."
+            )
+        if payload_version > ANALYSIS_PAYLOAD_FORMAT_VERSION:
+            raise UnsupportedBackupError(
+                "The backup-analysis accelerator is newer than this JVVV version."
+            )
+        if payload_version != ANALYSIS_PAYLOAD_FORMAT_VERSION:
+            raise UnsupportedBackupError(
+                "The backup-analysis accelerator version is not supported."
+            )
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        if tables != set(ANALYSIS_ACCELERATOR_TABLE_COLUMNS):
+            raise InvalidBackupError(
+                "The backup-analysis accelerator has an unexpected table schema."
+            )
+        named_index = connection.execute(
+            """
+            SELECT name FROM sqlite_schema
+            WHERE type = 'index' AND sql IS NOT NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if named_index is not None:
+            raise InvalidBackupError(
+                "The backup-analysis accelerator contains an unexpected index."
+            )
+        manifest_schema = component["schema"]
+        for table, expected_columns in ANALYSIS_ACCELERATOR_TABLE_COLUMNS.items():
+            actual = tuple(
+                str(row[1])
+                for row in connection.execute(f'PRAGMA table_info("{table}")')
+            )
+            if actual != expected_columns or manifest_schema.get(table) != list(
+                expected_columns
+            ):
+                raise InvalidBackupError(
+                    f"The backup-analysis accelerator table '{table}' does not match its declared schema."
+                )
+            actual_count = int(
+                connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            )
+            if actual_count != int(component["tables"][table]):
+                raise InvalidBackupError(
+                    f"The backup-analysis accelerator table '{table}' has an invalid row count."
+                )
+        _check_sqlite_integrity(connection, "main", InvalidBackupError)
+
+        sequence_rows = list(
+            connection.execute(
+                f'SELECT name, seq FROM "{ANALYSIS_SEQUENCE_TABLE}" ORDER BY name'
+            )
+        )
+        if any(
+            str(row[0]) not in ANALYSIS_AUTOINCREMENT_TABLES
+            or not isinstance(row[1], int)
+            or int(row[1]) < 0
+            for row in sequence_rows
+        ):
+            raise InvalidBackupError(
+                "The backup-analysis accelerator has an invalid ID sequence."
+            )
+
+        active = connection.execute(
+            """
+            SELECT s.active_run_id, s.forced_stale, r.status,
+                   r.rules_version, r.source_signature
+            FROM backup_analysis_state s
+            LEFT JOIN backup_analysis_runs r ON r.id = s.active_run_id
+            WHERE s.id = 1
+            """
+        ).fetchone()
+        analysis = manifest["reconstruction"]["backup_analysis"]
+        if (
+            int(component["tables"]["backup_analysis_state"]) != 1
+            or active is None
+            or active["active_run_id"] is None
+            or bool(active["forced_stale"])
+            or str(active["status"] or "") != "completed"
+            or int(active["rules_version"] or 0) != RULES_VERSION
+            or analysis.get("requested") is not True
+            or analysis.get("source_was_stale") is not False
+            or analysis.get("source_status") != "completed"
+            or analysis.get("source_rules_version") != RULES_VERSION
+        ):
+            raise InvalidBackupError(
+                "The backup-analysis accelerator does not describe current backup evidence."
+            )
+        if source_payload_path is None:
+            raise InvalidBackupError(
+                "The backup-analysis accelerator cannot be matched to its catalogue source."
+            )
+        expected_signature = _source_signature_from_payload(
+            source_payload_path,
+            cancel_callback,
+        )
+        if str(active["source_signature"] or "") != expected_signature:
+            raise InvalidBackupError(
+                "The backup-analysis accelerator does not match its catalogue source."
+            )
+    except sqlite3.DatabaseError as exc:
+        if cancel_callback is not None and cancel_callback():
+            raise BackupCancelled("The catalogue restore operation was cancelled.") from exc
+        raise InvalidBackupError(
+            f"The backup-analysis accelerator cannot be read: {exc}"
+        ) from exc
+    finally:
+        connection.set_progress_handler(None, 0)
+        connection.close()
+
+
 def _validate_archive_to_payload(
     backup_path: Path,
     payload_path: Path,
     *,
+    analysis_payload_path: Path | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
 ) -> BackupInspection:
@@ -1654,47 +2285,93 @@ def _validate_archive_to_payload(
     try:
         with zipfile.ZipFile(backup_path, "r", allowZip64=True) as archive:
             infos = _safe_member_names(archive)
-            manifest = _read_manifest(archive, infos[MANIFEST_PATH])
-            component = manifest["components"][0]
-            payload_info = infos[PAYLOAD_PATH]
-            if payload_info.file_size != int(component["size"]):
-                raise InvalidBackupError("The backup source size does not match its manifest.")
-            digest = hashlib.sha256()
-            copied = 0
-            with archive.open(payload_info, "r") as source, payload_path.open("wb") as destination:
-                while True:
-                    _check_cancel(cancel_callback)
-                    chunk = source.read(COPY_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    destination.write(chunk)
-                    digest.update(chunk)
-                    copied += len(chunk)
-                    if copied > int(component["size"]):
-                        raise InvalidBackupError("The backup source exceeds its declared size.")
-                    _emit(
-                        progress_callback,
-                        "validate",
-                        copied,
-                        int(component["size"]),
-                        "Checking backup integrity…",
+            manifest_info = infos.get(MANIFEST_PATH)
+            if manifest_info is None:
+                raise InvalidBackupError("The backup manifest is missing.")
+            manifest = _read_manifest(archive, manifest_info)
+            _validate_archive_member_set(infos, manifest)
+            _validate_archive_compression(infos, manifest)
+            components = _manifest_components_by_path(manifest)
+            destinations = {PAYLOAD_PATH: payload_path}
+            if ANALYSIS_PAYLOAD_PATH in components:
+                accelerator_path = analysis_payload_path or payload_path.with_name(
+                    ANALYSIS_PAYLOAD_PATH
+                )
+                if accelerator_path.resolve() == payload_path.resolve():
+                    raise InvalidBackupError(
+                        "The backup extraction paths for source and analysis must differ."
                     )
-            if copied != int(component["size"]):
-                raise InvalidBackupError("The backup source is truncated.")
-            if digest.hexdigest() != str(component["sha256"]).casefold():
-                raise InvalidBackupError("The backup source checksum does not match its manifest.")
+                destinations[ANALYSIS_PAYLOAD_PATH] = accelerator_path
+
+            total_size = sum(int(component["size"]) for component in components.values())
+            total_copied = 0
+            for path, component in components.items():
+                payload_info = infos[path]
+                expected_size = int(component["size"])
+                if payload_info.file_size != expected_size:
+                    raise InvalidBackupError(
+                        f"The backup component '{path}' size does not match its manifest."
+                    )
+                digest = hashlib.sha256()
+                copied = 0
+                with archive.open(payload_info, "r") as source, destinations[path].open(
+                    "wb"
+                ) as destination:
+                    while True:
+                        _check_cancel(cancel_callback)
+                        chunk = source.read(COPY_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+                        digest.update(chunk)
+                        copied += len(chunk)
+                        total_copied += len(chunk)
+                        if copied > expected_size:
+                            raise InvalidBackupError(
+                                f"The backup component '{path}' exceeds its declared size."
+                            )
+                        _emit(
+                            progress_callback,
+                            "validate",
+                            total_copied,
+                            total_size,
+                            "Checking backup integrity…",
+                        )
+                if copied != expected_size:
+                    raise InvalidBackupError(
+                        f"The backup component '{path}' is truncated."
+                    )
+                if digest.hexdigest() != str(component["sha256"]).casefold():
+                    raise InvalidBackupError(
+                        f"The backup component '{path}' checksum does not match its manifest."
+                    )
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError) as exc:
         if isinstance(exc, CatalogueBackupError):
             raise
         raise InvalidBackupError("The selected file is not a readable JVVV backup ZIP.") from exc
 
     _validate_payload(payload_path, manifest, cancel_callback)
+    analysis_size = 0
+    if int(manifest["format_version"]) == BACKUP_FORMAT_VERSION:
+        accelerator_path = analysis_payload_path or payload_path.with_name(
+            ANALYSIS_PAYLOAD_PATH
+        )
+        _validate_analysis_payload(
+            accelerator_path,
+            manifest,
+            cancel_callback,
+            payload_path,
+        )
+        analysis_size = int(
+            _manifest_components_by_path(manifest)[ANALYSIS_PAYLOAD_PATH]["size"]
+        )
     return BackupInspection(
         backup_path,
         manifest,
         backup_path.stat().st_size,
         int(manifest["components"][0]["size"]),
         {name: int(value) for name, value in manifest["components"][0]["tables"].items()},
+        analysis_size,
     )
 
 
@@ -1711,9 +2388,84 @@ def validate_catalogue_backup(
         return _validate_archive_to_payload(
             path,
             Path(temp_directory) / PAYLOAD_PATH,
+            analysis_payload_path=Path(temp_directory) / ANALYSIS_PAYLOAD_PATH,
             progress_callback=progress_callback,
             cancel_callback=cancel_callback,
         )
+
+
+def _prepare_restore_build(db: Database) -> dict[str, str]:
+    """Tune and strip an unpublished restore database for fast bulk loading."""
+    connection = db.connection
+    connection.commit()
+    if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).casefold() == "wal":
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    journal_mode = str(
+        connection.execute("PRAGMA journal_mode = OFF").fetchone()[0]
+    ).casefold()
+    if journal_mode != "off":
+        raise CatalogueBackupError(
+            "The temporary restore database could not enter bulk-build mode."
+        )
+    connection.execute("PRAGMA synchronous = OFF")
+    connection.execute("PRAGMA temp_store = FILE")
+    connection.execute("PRAGMA cache_size = -131072")
+    connection.execute(f"PRAGMA threads = {max(1, min(4, os.cpu_count() or 1))}")
+    connection.execute("PRAGMA locking_mode = EXCLUSIVE")
+
+    index_definitions = {
+        str(row["name"]): str(row["sql"])
+        for row in connection.execute(
+            """
+            SELECT name, sql FROM sqlite_schema
+            WHERE type = 'index' AND sql IS NOT NULL
+            ORDER BY name
+            """
+        )
+    }
+    for name in index_definitions:
+        connection.execute(f'DROP INDEX "{name}"')
+    connection.commit()
+    return index_definitions
+
+
+def _create_restore_indexes(
+    db: Database,
+    index_definitions: Mapping[str, str],
+    names: Iterable[str],
+    *,
+    progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
+    phase: str = "rebuild_indexes",
+) -> None:
+    requested = [name for name in names if name in index_definitions]
+    if not requested:
+        return
+    with db.transaction() as connection:
+        for completed, name in enumerate(requested, start=1):
+            _check_cancel(cancel_callback)
+            connection.execute(index_definitions[name])
+            _emit(
+                progress_callback,
+                phase,
+                completed,
+                len(requested),
+                "Building catalogue indexes…",
+            )
+
+
+def _finish_restore_build(db: Database) -> None:
+    connection = db.connection
+    connection.commit()
+    connection.execute("PRAGMA locking_mode = NORMAL")
+    journal_mode = str(
+        connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+    ).casefold()
+    if journal_mode != "delete":
+        raise CatalogueBackupError(
+            "The restored catalogue could not return to normal journal mode."
+        )
+    connection.execute("PRAGMA synchronous = NORMAL")
 
 
 def _copy_payload_to_catalogue(
@@ -1722,14 +2474,28 @@ def _copy_payload_to_catalogue(
     manifest: Mapping[str, Any],
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
+    analysis_payload_path: Path | None = None,
 ) -> None:
     connection = db.connection
     connection.set_progress_handler(_sqlite_cancel_handler(cancel_callback), 10_000)
+    analysis = manifest["reconstruction"]["backup_analysis"]
+    analysis_attached = False
     connection.execute(
         "ATTACH DATABASE ? AS source_backup",
         (str(payload_path.resolve()),),
     )
     try:
+        if analysis["storage"] == "accelerator":
+            if analysis_payload_path is None or not analysis_payload_path.is_file():
+                raise InvalidBackupError(
+                    "The backup-analysis accelerator was not extracted."
+                )
+            connection.execute(
+                "ATTACH DATABASE ? AS analysis_accelerator",
+                (str(analysis_payload_path.resolve()),),
+            )
+            analysis_attached = True
+
         with db.transaction(immediate=True) as conn:
             conn.execute("PRAGMA defer_foreign_keys = ON")
             for trigger in FTS_TRIGGERS:
@@ -1820,9 +2586,18 @@ def _copy_payload_to_catalogue(
                     f"Restoring {table.replace('_', ' ')}…",
                 )
 
-            analysis = manifest["reconstruction"]["backup_analysis"]
-            if analysis["storage"] == "stored":
+            if analysis["storage"] in {"stored", "accelerator"}:
                 conn.execute("DELETE FROM backup_analysis_state")
+                analysis_database = (
+                    "analysis_accelerator"
+                    if analysis["storage"] == "accelerator"
+                    else "source_backup"
+                )
+                analysis_component = _manifest_components_by_path(manifest)[
+                    ANALYSIS_PAYLOAD_PATH
+                    if analysis["storage"] == "accelerator"
+                    else PAYLOAD_PATH
+                ]
                 analysis_order = (
                     "backup_analysis_runs",
                     "backup_analysis_volume_snapshots",
@@ -1836,11 +2611,18 @@ def _copy_payload_to_catalogue(
                 )
                 for table in analysis_order:
                     columns = ANALYSIS_TABLE_COLUMNS[table]
+                    changes_before = conn.total_changes
                     conn.execute(
                         f'INSERT INTO "{table}" ({_quoted_columns(columns)}) '
                         f'SELECT {_quoted_columns(columns)} '
-                        f'FROM source_backup."{table}"'
+                        f'FROM {analysis_database}."{table}"'
                     )
+                    copied = conn.total_changes - changes_before
+                    expected = int(analysis_component["tables"][table])
+                    if copied != expected:
+                        raise InvalidBackupError(
+                            f"The backup-evidence table '{table}' could not be copied exactly."
+                        )
                 _emit(
                     progress_callback,
                     "restore_source",
@@ -1848,6 +2630,31 @@ def _copy_payload_to_catalogue(
                     len(SOURCE_TABLES),
                     "Restoring preserved backup evidence…",
                 )
+
+                if analysis["storage"] == "accelerator":
+                    sequence_rows = list(
+                        conn.execute(
+                            f"SELECT name, seq FROM analysis_accelerator."
+                            f'"{ANALYSIS_SEQUENCE_TABLE}" ORDER BY name'
+                        )
+                    )
+                    if any(
+                        str(row["name"]) not in ANALYSIS_AUTOINCREMENT_TABLES
+                        for row in sequence_rows
+                    ):
+                        raise InvalidBackupError(
+                            "The backup-analysis accelerator has an invalid ID sequence."
+                        )
+                    for name in ANALYSIS_AUTOINCREMENT_TABLES:
+                        conn.execute(
+                            "DELETE FROM sqlite_sequence WHERE name = ?",
+                            (name,),
+                        )
+                    for row in sequence_rows:
+                        conn.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                            (row["name"], row["seq"]),
+                        )
 
             for row in conn.execute(
                 "SELECT name, seq FROM source_backup.catalogue_sequences ORDER BY name"
@@ -1866,6 +2673,8 @@ def _copy_payload_to_catalogue(
             f"restored safely: {exc}"
         ) from exc
     finally:
+        if analysis_attached:
+            connection.execute("DETACH DATABASE analysis_accelerator")
         connection.execute("DETACH DATABASE source_backup")
 
 
@@ -1947,10 +2756,12 @@ def _restore_regenerated_analysis_identity(
     source_run_id = int(source_run["id"])
     connection = db.connection
     connection.commit()
-    connection.execute("PRAGMA foreign_keys = OFF")
+    remap_run_id = generated_run_id != source_run_id
+    if remap_run_id:
+        connection.execute("PRAGMA foreign_keys = OFF")
     try:
         connection.execute("BEGIN IMMEDIATE")
-        if generated_run_id != source_run_id:
+        if remap_run_id:
             for table in (
                 "backup_analysis_volume_snapshots",
                 "backup_file_results",
@@ -1994,11 +2805,39 @@ def _restore_regenerated_analysis_identity(
         connection.rollback()
         raise
     finally:
-        connection.execute("PRAGMA foreign_keys = ON")
-    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-        raise CatalogueBackupError(
-            "Regenerated backup evidence could not retain its original identity safely."
-        )
+        if remap_run_id:
+            connection.execute("PRAGMA foreign_keys = ON")
+
+    if remap_run_id:
+        for table in (
+            "backup_analysis_volume_snapshots",
+            "backup_file_results",
+            "backup_folder_results",
+            "backup_folder_drive_matches",
+            "backup_volume_results",
+            "backup_mirror_candidates",
+        ):
+            if connection.execute(
+                f"""
+                SELECT 1 FROM "{table}" child
+                LEFT JOIN backup_analysis_runs parent ON parent.id = child.run_id
+                WHERE parent.id IS NULL LIMIT 1
+                """
+            ).fetchone() is not None:
+                raise CatalogueBackupError(
+                    "Regenerated backup evidence could not retain its original identity safely."
+                )
+        if connection.execute(
+            """
+            SELECT 1 FROM backup_analysis_state state
+            LEFT JOIN backup_analysis_runs parent ON parent.id = state.active_run_id
+            WHERE state.active_run_id IS NOT NULL AND parent.id IS NULL
+            LIMIT 1
+            """
+        ).fetchone() is not None:
+            raise CatalogueBackupError(
+                "Regenerated backup evidence state refers to a missing analysis run."
+            )
 
 
 def _regenerate_derived_data(
@@ -2007,6 +2846,8 @@ def _regenerate_derived_data(
     manifest: Mapping[str, Any],
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
+    *,
+    defer_search: bool = False,
 ) -> tuple[str, ...]:
     volumes = list(
         db.connection.execute(
@@ -2014,29 +2855,30 @@ def _regenerate_derived_data(
         )
     )
     total_volumes = len(volumes)
-    for index, volume in enumerate(volumes, start=1):
-        _check_cancel(cancel_callback)
-
-        def folder_progress(completed: int, total: int, message: str) -> None:
+    with db.transaction() as conn:
+        for index, volume in enumerate(volumes, start=1):
             _check_cancel(cancel_callback)
-            _emit(
-                progress_callback,
-                "rebuild_folder_aggregates",
-                completed,
-                total,
-                f"{message} (volume {index}/{max(total_volumes, 1)})…",
+
+            def folder_progress(completed: int, total: int, message: str) -> None:
+                _check_cancel(cancel_callback)
+                _emit(
+                    progress_callback,
+                    "rebuild_folder_aggregates",
+                    completed,
+                    total,
+                    f"{message} (volume {index}/{max(total_volumes, 1)})…",
+                )
+
+            db.rebuild_folder_statistics(
+                int(volume["id"]),
+                # A never-scanned legacy volume has no last_scan_at. Its saved
+                # updated_at gives reconstruction a stable catalogue-owned time
+                # instead of introducing the wall clock into derived state.
+                stats_updated_at=volume["last_scan_at"] or volume["updated_at"],
+                progress_callback=folder_progress,
+                clear_existing=False,
             )
 
-        db.rebuild_folder_statistics(
-            int(volume["id"]),
-            # A never-scanned legacy volume has no last_scan_at. Its saved
-            # updated_at gives reconstruction a stable catalogue-owned time
-            # instead of introducing the wall clock into derived state.
-            stats_updated_at=volume["last_scan_at"] or volume["updated_at"],
-            progress_callback=folder_progress,
-        )
-
-    with db.transaction() as conn:
         conn.execute(
             """
             UPDATE volumes
@@ -2051,13 +2893,23 @@ def _regenerate_derived_data(
             """
         )
     _apply_derived_exceptions(db, payload_path)
-    _emit(progress_callback, "rebuild_search", 0, 0, "Rebuilding search indexes…")
-    db.rebuild_search_indexes()
-    regenerated = ["folder aggregates", "volume counts", "search indexes"]
+    regenerated = ["folder aggregates", "volume counts"]
 
     analysis = manifest.get("reconstruction", {}).get("backup_analysis", {})
     if isinstance(analysis, dict) and analysis.get("storage") == "regenerate":
         _emit(progress_callback, "rebuild_analysis", 0, 0, "Rebuilding backup evidence…")
+        source_run_id = int(analysis["source_run"]["id"])
+        # Make the regenerated run use its original ID from the outset. Older
+        # code generated run 1 and could then rewrite millions of result rows
+        # when restoring a later source run.
+        with db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM sqlite_sequence WHERE name = 'backup_analysis_runs'"
+            )
+            connection.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                ("backup_analysis_runs", max(0, source_run_id - 1)),
+            )
         engine = BackupAnalysisEngine(db)
 
         def analysis_progress(value: Any) -> None:
@@ -2072,6 +2924,7 @@ def _regenerate_derived_data(
         summary = engine.analyse(
             progress_callback=analysis_progress,
             cancel_callback=cancel_callback,
+            defer_persistent_indexes=True,
         )
         if summary.status == "cancelled":
             raise BackupCancelled("The catalogue restore operation was cancelled.")
@@ -2083,12 +2936,51 @@ def _regenerate_derived_data(
             raise CatalogueBackupError("Backup evidence regeneration returned no run ID.")
         _restore_regenerated_analysis_identity(db, analysis, int(summary.run_id))
         regenerated.append("backup evidence")
+
+    if not defer_search:
+        _regenerate_search_indexes(db, progress_callback)
+        regenerated.append("search indexes")
     return tuple(regenerated)
 
 
-def _has_difference(connection: sqlite3.Connection, left: str, right: str) -> bool:
+def _regenerate_search_indexes(
+    db: Database,
+    progress_callback: ProgressCallback | None,
+) -> None:
+    # Backup analysis and semantic source validation do not use FTS. Build it
+    # last so those scans do not compete with a multi-gigabyte search index for
+    # cache and temporary I/O.
+    _emit(progress_callback, "rebuild_search", 0, 0, "Rebuilding search indexes…")
+    db.rebuild_search_indexes()
+
+
+def _table_has_keyed_difference(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: Iterable[str],
+    key_columns: Iterable[str],
+    expected_count: int,
+    *,
+    source_database: str = "source_backup",
+) -> bool:
+    """Compare a restored table using its key without multi-GB EXCEPT sorts."""
+    if int(
+        connection.execute(f'SELECT COUNT(*) FROM main."{table}"').fetchone()[0]
+    ) != expected_count:
+        return True
+    keys = tuple(key_columns)
+    join = " AND ".join(f'm."{column}" = s."{column}"' for column in keys)
+    different = " OR ".join(
+        f'm."{column}" IS NOT s."{column}"' for column in columns
+    )
     return connection.execute(
-        f"SELECT 1 FROM ({left} EXCEPT {right}) LIMIT 1"
+        f"""
+        SELECT 1
+        FROM {source_database}."{table}" s
+        LEFT JOIN main."{table}" m ON {join}
+        WHERE m."{keys[0]}" IS NULL OR {different}
+        LIMIT 1
+        """
     ).fetchone() is not None
 
 
@@ -2097,13 +2989,28 @@ def _validate_restored_semantics(
     payload_path: Path,
     manifest: Mapping[str, Any],
     cancel_callback: CancelCallback | None,
+    analysis_payload_path: Path | None = None,
 ) -> None:
     connection = db.connection
+    table_rows = manifest["components"][0]["tables"]
+    analysis = manifest["reconstruction"]["backup_analysis"]
+    analysis_attached = False
     connection.execute(
         "ATTACH DATABASE ? AS source_backup",
         (str(payload_path.resolve()),),
     )
     try:
+        if analysis["storage"] == "accelerator":
+            if analysis_payload_path is None or not analysis_payload_path.is_file():
+                raise CatalogueBackupError(
+                    "The restored backup-evidence accelerator is unavailable."
+                )
+            connection.execute(
+                "ATTACH DATABASE ? AS analysis_accelerator",
+                (str(analysis_payload_path.resolve()),),
+            )
+            analysis_attached = True
+
         for table in (
             "volumes",
             "volume_register",
@@ -2113,102 +3020,164 @@ def _validate_restored_semantics(
             "scan_errors",
         ):
             columns = AUTHORITATIVE_TABLE_COLUMNS[table]
-            restored = f'SELECT {_quoted_columns(columns)} FROM main."{table}"'
-            source = f'SELECT {_quoted_columns(columns)} FROM source_backup."{table}"'
-            if _has_difference(connection, restored, source) or _has_difference(
-                connection, source, restored
+            if _table_has_keyed_difference(
+                connection,
+                table,
+                columns,
+                TABLE_PRIMARY_KEYS[table],
+                int(table_rows[table]),
             ):
                 raise CatalogueBackupError(
                     f"Restored source validation failed for the '{table}' component."
                 )
 
-        restored_files = """
-            SELECT f.id, f.volume_id, f.folder_id, f.name, f.relative_path,
-                   f.extension, f.size_bytes, f.modified_at, f.missing,
-                   f.scanned_at, f.identity_device, f.identity_inode,
-                   f.content_hash, f.content_hash_algorithm
-            FROM main.files f
-        """
-        source_files = """
-            SELECT f.id, f.volume_id, f.folder_id, f.name, f.relative_path,
-                   f.extension, f.size_bytes, f.modified_at, f.missing,
-                   f.scanned_at, f.identity_device, f.identity_inode,
-                   b.digest, f.content_hash_algorithm
-            FROM source_backup.files f
-            LEFT JOIN source_backup.content_blobs b ON b.id = f.content_hash_id
-        """
-        if _has_difference(connection, restored_files, source_files) or _has_difference(
-            connection, source_files, restored_files
-        ):
+        if int(connection.execute("SELECT COUNT(*) FROM main.files").fetchone()[0]) != int(
+            table_rows["files"]
+        ) or connection.execute(
+            """
+            SELECT 1
+            FROM source_backup.files s
+            LEFT JOIN source_backup.content_blobs b ON b.id = s.content_hash_id
+            LEFT JOIN main.files m ON m.id = s.id
+            WHERE m.id IS NULL
+               OR m.volume_id IS NOT s.volume_id
+               OR m.folder_id IS NOT s.folder_id
+               OR m.name IS NOT s.name
+               OR m.relative_path IS NOT s.relative_path
+               OR m.extension IS NOT s.extension
+               OR m.size_bytes IS NOT s.size_bytes
+               OR m.modified_at IS NOT s.modified_at
+               OR m.missing IS NOT s.missing
+               OR m.scanned_at IS NOT s.scanned_at
+               OR m.identity_device IS NOT s.identity_device
+               OR m.identity_inode IS NOT s.identity_inode
+               OR m.content_hash IS NOT b.digest
+               OR m.content_hash_algorithm IS NOT s.content_hash_algorithm
+            LIMIT 1
+            """
+        ).fetchone() is not None:
             raise CatalogueBackupError("Restored source validation failed for file records.")
 
-        restored_folder_exceptions = """
-            SELECT f.id, f.recursive_size_bytes, f.recursive_file_count,
-                   f.recursive_subfolder_count, f.direct_file_count,
-                   f.direct_subfolder_count, f.stats_updated_at
-            FROM main.folders f
-            JOIN source_backup.folder_state_exceptions e ON e.folder_id = f.id
-        """
-        source_folder_exceptions = """
-            SELECT folder_id, recursive_size_bytes, recursive_file_count,
-                   recursive_subfolder_count, direct_file_count,
-                   direct_subfolder_count, stats_updated_at
-            FROM source_backup.folder_state_exceptions
-        """
-        if _has_difference(
-            connection,
-            restored_folder_exceptions,
-            source_folder_exceptions,
-        ) or _has_difference(
-            connection,
-            source_folder_exceptions,
-            restored_folder_exceptions,
-        ):
+        if connection.execute(
+            """
+            SELECT 1
+            FROM source_backup.folder_state_exceptions e
+            LEFT JOIN main.folders f ON f.id = e.folder_id
+            WHERE f.id IS NULL
+               OR f.recursive_size_bytes IS NOT e.recursive_size_bytes
+               OR f.recursive_file_count IS NOT e.recursive_file_count
+               OR f.recursive_subfolder_count IS NOT e.recursive_subfolder_count
+               OR f.direct_file_count IS NOT e.direct_file_count
+               OR f.direct_subfolder_count IS NOT e.direct_subfolder_count
+               OR f.stats_updated_at IS NOT e.stats_updated_at
+            LIMIT 1
+            """
+        ).fetchone() is not None:
             raise CatalogueBackupError(
                 "Restored folder-statistic exception validation failed."
             )
 
-        restored_volume_exceptions = """
-            SELECT v.id, v.indexed_file_count, v.indexed_folder_count
-            FROM main.volumes v
-            JOIN source_backup.volume_count_exceptions e ON e.volume_id = v.id
-        """
-        source_volume_exceptions = """
-            SELECT volume_id, indexed_file_count, indexed_folder_count
-            FROM source_backup.volume_count_exceptions
-        """
-        if _has_difference(
-            connection,
-            restored_volume_exceptions,
-            source_volume_exceptions,
-        ) or _has_difference(
-            connection,
-            source_volume_exceptions,
-            restored_volume_exceptions,
-        ):
+        if connection.execute(
+            """
+            SELECT 1
+            FROM source_backup.volume_count_exceptions e
+            LEFT JOIN main.volumes v ON v.id = e.volume_id
+            WHERE v.id IS NULL
+               OR v.indexed_file_count IS NOT e.indexed_file_count
+               OR v.indexed_folder_count IS NOT e.indexed_folder_count
+            LIMIT 1
+            """
+        ).fetchone() is not None:
             raise CatalogueBackupError("Restored volume-count exception validation failed.")
 
-        restored_sequences = """
-            SELECT m.name, m.seq FROM main.sqlite_sequence m
-            JOIN source_backup.catalogue_sequences s ON s.name = m.name
-        """
-        source_sequences = "SELECT name, seq FROM source_backup.catalogue_sequences"
-        if _has_difference(connection, source_sequences, restored_sequences):
+        if connection.execute(
+            """
+            SELECT 1
+            FROM source_backup.catalogue_sequences s
+            LEFT JOIN main.sqlite_sequence m ON m.name = s.name
+            WHERE m.name IS NULL OR m.seq IS NOT s.seq
+            LIMIT 1
+            """
+        ).fetchone() is not None:
             raise CatalogueBackupError("Restored catalogue ID sequence validation failed.")
 
-        analysis = manifest["reconstruction"]["backup_analysis"]
         if analysis["storage"] == "stored":
             for table, columns in ANALYSIS_TABLE_COLUMNS.items():
-                restored = f'SELECT {_quoted_columns(columns)} FROM main."{table}"'
-                source = f'SELECT {_quoted_columns(columns)} FROM source_backup."{table}"'
-                if _has_difference(connection, restored, source) or _has_difference(
+                if _table_has_keyed_difference(
                     connection,
-                    source,
-                    restored,
+                    table,
+                    columns,
+                    TABLE_PRIMARY_KEYS[table],
+                    int(table_rows[table]),
                 ):
                     raise CatalogueBackupError(
                         f"Preserved backup-evidence validation failed for '{table}'."
                     )
+        elif analysis["storage"] == "accelerator":
+            component = _manifest_components_by_path(manifest)[ANALYSIS_PAYLOAD_PATH]
+            # The accelerator was checksum/integrity validated and copied with
+            # identical column lists. Counts catch incomplete writes cheaply;
+            # the compact identity/summary tables are also compared field for
+            # field without rescanning millions of derived item rows.
+            exact_tables = {
+                "backup_analysis_runs",
+                "backup_analysis_state",
+                "backup_analysis_volume_snapshots",
+                "backup_volume_results",
+                "backup_mirror_candidates",
+                "backup_analysis_invalidations",
+            }
+            for table, columns in ANALYSIS_TABLE_COLUMNS.items():
+                expected_count = int(component["tables"][table])
+                actual_count = int(
+                    connection.execute(
+                        f'SELECT COUNT(*) FROM main."{table}"'
+                    ).fetchone()[0]
+                )
+                if actual_count != expected_count or (
+                    table in exact_tables
+                    and _table_has_keyed_difference(
+                        connection,
+                        table,
+                        columns,
+                        TABLE_PRIMARY_KEYS[table],
+                        expected_count,
+                        source_database="analysis_accelerator",
+                    )
+                ):
+                    raise CatalogueBackupError(
+                        f"Accelerated backup-evidence validation failed for '{table}'."
+                    )
+
+            source_sequences = {
+                str(row["name"]): int(row["seq"])
+                for row in connection.execute(
+                    f'SELECT name, seq FROM analysis_accelerator."{ANALYSIS_SEQUENCE_TABLE}"'
+                )
+            }
+            restored_sequences = {
+                str(row["name"]): int(row["seq"])
+                for row in connection.execute(
+                    "SELECT name, seq FROM main.sqlite_sequence "
+                    "WHERE name IN ('backup_analysis_runs', "
+                    "'backup_analysis_invalidations')"
+                )
+            }
+            if restored_sequences != source_sequences:
+                raise CatalogueBackupError(
+                    "Accelerated backup-evidence ID sequence validation failed."
+                )
+
+            state = BackupAnalysisEngine(db).state()
+            if (
+                state.status != "completed"
+                or state.is_stale
+                or state.active_run_id is None
+                or state.rules_version != RULES_VERSION
+            ):
+                raise CatalogueBackupError(
+                    "Accelerated backup evidence does not match the restored catalogue."
+                )
         elif analysis["storage"] == "regenerate":
             run_id = int(analysis["source_run"]["id"])
             run = connection.execute(
@@ -2244,6 +3213,8 @@ def _validate_restored_semantics(
             raise BackupCancelled("The catalogue restore operation was cancelled.") from exc
         raise CatalogueBackupError(f"The restored catalogue could not be validated: {exc}") from exc
     finally:
+        if analysis_attached:
+            connection.execute("DETACH DATABASE analysis_accelerator")
         connection.execute("DETACH DATABASE source_backup")
 
 
@@ -2259,12 +3230,18 @@ def restore_catalogue_backup(
     target = catalogue_path_with_extension(catalogue_path).resolve(strict=False)
     if not backup.is_file():
         raise InvalidBackupError(f"Backup file does not exist: {backup}")
+    # Capture this before the long restore. The archive is fully extracted and
+    # validated up front, so its later removal must not turn a completed,
+    # atomically published catalogue into a reported failure.
+    backup_size = backup.stat().st_size
 
     with tempfile.TemporaryDirectory(prefix="jvvv-restore-source-") as temp_directory:
         payload = Path(temp_directory) / PAYLOAD_PATH
+        analysis_payload = Path(temp_directory) / ANALYSIS_PAYLOAD_PATH
         inspection = _validate_archive_to_payload(
             backup,
             payload,
+            analysis_payload_path=analysis_payload,
             progress_callback=progress_callback,
             cancel_callback=cancel_callback,
         )
@@ -2295,12 +3272,22 @@ def restore_catalogue_backup(
         regenerated: tuple[str, ...] = ()
         try:
             db = Database(output)
+            index_definitions = _prepare_restore_build(db)
             _copy_payload_to_catalogue(
                 db,
                 payload,
                 inspection.manifest,
                 progress_callback,
                 cancel_callback,
+                analysis_payload,
+            )
+            _create_restore_indexes(
+                db,
+                index_definitions,
+                sorted(RESTORE_WORK_INDEXES),
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+                phase="prepare_reconstruction",
             )
             regenerated = _regenerate_derived_data(
                 db,
@@ -2308,6 +3295,7 @@ def restore_catalogue_backup(
                 inspection.manifest,
                 progress_callback,
                 cancel_callback,
+                defer_search=True,
             )
             db.connection.set_progress_handler(
                 _sqlite_cancel_handler(cancel_callback),
@@ -2319,14 +3307,22 @@ def restore_catalogue_backup(
                 payload,
                 inspection.manifest,
                 cancel_callback,
+                analysis_payload,
             )
-            _check_sqlite_integrity(db.connection, "main", CatalogueBackupError)
+            _regenerate_search_indexes(db, progress_callback)
+            regenerated = (*regenerated, "search indexes")
             db.connection.execute("INSERT INTO files_fts(files_fts, rank) VALUES('integrity-check', 1)")
             db.connection.execute("INSERT INTO folders_fts(folders_fts, rank) VALUES('integrity-check', 1)")
             db.connection.commit()
+            _create_restore_indexes(
+                db,
+                index_definitions,
+                sorted(set(index_definitions) - RESTORE_WORK_INDEXES),
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
             db.connection.set_progress_handler(None, 0)
-            db.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            db.connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+            _finish_restore_build(db)
             db.close()
             db = None
             _check_cancel(cancel_callback)
@@ -2343,7 +3339,7 @@ def restore_catalogue_backup(
     return RestoreResult(
         backup,
         target,
-        backup.stat().st_size,
+        backup_size,
         target.stat().st_size,
         regenerated,
     )

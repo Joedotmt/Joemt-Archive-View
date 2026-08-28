@@ -2129,6 +2129,8 @@ class Database:
         volume_id: int,
         stats_updated_at: str | None = None,
         progress_callback: FolderStatsProgress | None = None,
+        *,
+        clear_existing: bool = True,
     ) -> int:
         updated_at = stats_updated_at or utc_now()
         with self.transaction() as conn:
@@ -2214,19 +2216,20 @@ class Database:
 
             self._dedupe_linked_file_sizes(conn, volume_id, stats, parent_by_id)
 
-            conn.execute(
-                """
-                UPDATE folders
-                SET recursive_size_bytes = NULL,
-                    recursive_file_count = NULL,
-                    recursive_subfolder_count = NULL,
-                    direct_file_count = NULL,
-                    direct_subfolder_count = NULL,
-                    stats_updated_at = NULL
-                WHERE volume_id = ?
-                """,
-                (volume_id,),
-            )
+            if clear_existing:
+                conn.execute(
+                    """
+                    UPDATE folders
+                    SET recursive_size_bytes = NULL,
+                        recursive_file_count = NULL,
+                        recursive_subfolder_count = NULL,
+                        direct_file_count = NULL,
+                        direct_subfolder_count = NULL,
+                        stats_updated_at = NULL
+                    WHERE volume_id = ?
+                    """,
+                    (volume_id,),
+                )
             update_rows = [
                 (
                     folder_stats["recursive_size"],
