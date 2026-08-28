@@ -13,6 +13,8 @@ component.
 
 - Create, edit, delete, and scan catalogue volumes.
 - Store each catalogue as a single SQLite-backed `.jvvv` file.
+- Create a compact, lossless semantic backup as one versioned `.zip`, and
+  restore it atomically to a normal `.jvvv` catalogue.
 - Browse indexed folders and files offline.
 - Search by filename, partial filename, extension, and folder name across all
   volumes, with optional relative-path matching in **Settings > Preferences**.
@@ -66,6 +68,22 @@ python -m jvvv
 JVVV starts without opening a catalogue. Use **File > New Catalogue** to create
 a `.jvvv` file, or **File > Open Catalogue** to open an existing one. The file
 is a valid SQLite database and contains the full catalogue.
+
+Use **File > Create Catalogue Backup…** to save the open catalogue as a single
+ZIP. The backup stores irreducible catalogue state (including IDs,
+relationships, paths, hashes, media observations, user metadata, scan history,
+and ID high-water marks) while omitting only data JVVV can reconstruct safely,
+such as ordinary indexes, FTS search structures, canonical folder aggregates,
+volume counts, and current Backup Evidence results. Identical saved hash blobs
+are deduplicated. Noncanonical aggregate values and stale/old-rule evidence are
+retained as lossless exceptions rather than silently changed.
+
+Use **File > Restore Catalogue from Backup…** to validate the manifest,
+component inventory, SHA-256 checksum, SQLite integrity, schema, row counts, and
+relationships before creating anything at the chosen destination. JVVV builds
+and verifies a temporary catalogue, regenerates omitted data, and atomically
+replaces the destination only after the complete restore succeeds. The result
+is a normal `.jvvv` file.
 
 ## Usage
 
@@ -131,7 +149,8 @@ pytest
 
 The automated tests cover database initialization and migration, volume
 operations, streaming hashes, media inspection, scan cancellation/change review
-and rollback, hash-first backup evidence, offline browsing, and search.
+and rollback, hash-first backup evidence, semantic backup/restore integrity and
+atomicity, offline browsing, and search.
 
 ## Packaging With PyInstaller
 

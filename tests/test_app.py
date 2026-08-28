@@ -8,6 +8,8 @@ from PySide6.QtWidgets import QApplication, QDialog
 from jvvv.app import (
     ACCENT_COLOR_SETTING,
     CatalogueInfoWorker,
+    CatalogueBackupWorker,
+    CatalogueRestoreWorker,
     CatalogueOpenWorker,
     CATALOGUE_PROBE_INVALID,
     CATALOGUE_PROBE_OK,
@@ -25,6 +27,7 @@ from jvvv.app import (
     probe_catalogue_location,
     suggested_new_volume_drive_id,
 )
+from jvvv.catalogue_backup import BackupProgress, BackupResult, RestoreResult
 from jvvv.database import CatalogueError, create_catalogue
 from jvvv.theme import (
     ADOBE_ACCENT_COLOR,
@@ -37,6 +40,83 @@ from jvvv.theme import (
     LIGHT_MODE,
 )
 from jvvv.utils import VolumeSnapshot
+
+
+def test_file_menu_exposes_backup_and_restore_with_correct_availability(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        file_menu = window.menuBar().actions()[0].menu()
+        action_texts = [action.text() for action in file_menu.actions()]
+        assert "Create Catalogue Backup…" in action_texts
+        assert "Restore Catalogue from Backup…" in action_texts
+        assert not window.create_catalogue_backup_action.isEnabled()
+        assert window.restore_catalogue_backup_action.isEnabled()
+        assert window.create_catalogue_backup_action in window.catalogue_actions
+        assert window.create_catalogue_backup_action in window.scan_blocked_actions
+        assert window.restore_catalogue_backup_action not in window.catalogue_actions
+        assert window.restore_catalogue_backup_action in window.scan_blocked_actions
+        window._set_catalogue_loading(True)
+        assert not window.restore_catalogue_backup_action.isEnabled()
+        window._set_catalogue_loading(False)
+        assert window.restore_catalogue_backup_action.isEnabled()
+    finally:
+        window.close()
+    assert application is not None
+
+
+def test_catalogue_backup_worker_reports_progress_and_result(monkeypatch, tmp_path):
+    source = tmp_path / "source.jvvv"
+    target = tmp_path / "source.zip"
+    expected = BackupResult(source, target, 1000, 250, 500, 750, 75.0, {"files": 2})
+    calls = []
+
+    def fake_create(source_path, backup_path, **kwargs):
+        calls.append((source_path, backup_path, kwargs["overwrite"]))
+        kwargs["progress_callback"](BackupProgress("compress", 3, 4, "Compressing"))
+        return expected
+
+    monkeypatch.setattr("jvvv.app.create_catalogue_backup", fake_create)
+    worker = CatalogueBackupWorker(source, target, overwrite=True)
+    progress = []
+    finished = []
+    worker.progress.connect(lambda done, total, message: progress.append((done, total, message)))
+    worker.finished.connect(finished.append)
+
+    worker.run()
+
+    assert calls == [(source, target, True)]
+    assert progress == [(3, 4, "Compressing")]
+    assert finished == [expected]
+
+
+def test_catalogue_restore_worker_delegates_normal_catalogue_target(monkeypatch, tmp_path):
+    backup = tmp_path / "source.zip"
+    target = tmp_path / "restored.jvvv"
+    expected = RestoreResult(
+        backup,
+        target,
+        250,
+        1000,
+        ("folder aggregates", "search indexes"),
+    )
+    calls = []
+
+    def fake_restore(backup_path, catalogue_path, **kwargs):
+        calls.append((backup_path, catalogue_path, kwargs["overwrite"]))
+        return expected
+
+    monkeypatch.setattr("jvvv.app.restore_catalogue_backup", fake_restore)
+    worker = CatalogueRestoreWorker(backup, target, overwrite=False)
+    finished = []
+    worker.finished.connect(finished.append)
+
+    worker.run()
+
+    assert calls == [(backup, target, False)]
+    assert finished == [expected]
 
 
 def test_content_date_guess_skips_invalid_timestamps():

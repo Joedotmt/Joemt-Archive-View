@@ -2317,7 +2317,9 @@ class Database:
 
             folder_id = int(row["folder_id"])
             current = folder_id
-            while current is not None and current in stats:
+            visited: set[int] = set()
+            while current is not None and current in stats and current not in visited:
+                visited.add(current)
                 ancestor_counts[current] = ancestor_counts.get(current, 0) + 1
                 current = parent_by_id.get(current)
 
@@ -2661,6 +2663,11 @@ class Database:
                 include_paths=include_paths,
             )
         )
+
+    def rebuild_search_indexes(self) -> None:
+        """Recreate the external-content FTS indexes from authoritative rows."""
+        with self.transaction():
+            self._apply_migration_7()
 
     def prune_scan_history(self, keep_per_volume: int = 100) -> None:
         volume_ids = [row["id"] for row in self.list_volumes()]

@@ -86,6 +86,15 @@ from .backup_analysis import (
     MirrorCandidate,
     VolumeBackupSummary,
 )
+from .catalogue_backup import (
+    BACKUP_FILE_FILTER,
+    BackupCancelled,
+    BackupProgress,
+    BackupResult,
+    RestoreResult,
+    create_catalogue_backup,
+    restore_catalogue_backup,
+)
 from .database import (
     ARCHIVE_STATUSES,
     CATALOGUE_EXTENSION,
@@ -3043,6 +3052,11 @@ class HelpDialog(QDialog):
              "The analysis does not reconnect, rescan, or reread file contents. It first "
              "uses SHA-256 values recorded by scans, then clearly labels metadata-only "
              "fallbacks when a comparable hash is unavailable."),
+            ("6. Back up or restore a catalogue",
+             "Choose <b>File &gt; Create Catalogue Backup</b> for a compact, lossless "
+             "<code>.zip</code>. Choose <b>File &gt; Restore Catalogue from Backup</b> "
+             "to validate it, rebuild omitted indexes and other derived data, and save "
+             "the result as a normal <code>.jvvv</code> file."),
         ]
         section_html = "".join(
             f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
@@ -3216,6 +3230,98 @@ class DeleteVolumeWorker(QObject):
             self.finished.emit(self.volume_id)
         else:
             self.failed.emit(error_details)
+
+
+class CatalogueBackupWorker(QObject):
+    progress = Signal(object, object, str)
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(object, str)
+
+    def __init__(self, source_path: Path, backup_path: Path, *, overwrite: bool) -> None:
+        super().__init__()
+        self.source_path = source_path
+        self.backup_path = backup_path
+        self.overwrite = overwrite
+        self.cancel_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        result: BackupResult | None = None
+        error: Exception | None = None
+        details = ""
+        try:
+            result = create_catalogue_backup(
+                self.source_path,
+                self.backup_path,
+                overwrite=self.overwrite,
+                progress_callback=self._report_progress,
+                cancel_callback=lambda: self.cancel_requested,
+            )
+        except BackupCancelled:
+            self.cancel_requested = True
+        except Exception as exc:
+            error = exc
+            details = traceback.format_exc()
+
+        if self.cancel_requested:
+            self.cancelled.emit()
+        elif error is not None:
+            self.failed.emit(error, details)
+        elif result is not None:
+            self.finished.emit(result)
+
+    def _report_progress(self, progress: BackupProgress) -> None:
+        self.progress.emit(progress.completed, progress.total, progress.message)
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+
+class CatalogueRestoreWorker(QObject):
+    progress = Signal(object, object, str)
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(object, str)
+
+    def __init__(self, backup_path: Path, catalogue_path: Path, *, overwrite: bool) -> None:
+        super().__init__()
+        self.backup_path = backup_path
+        self.catalogue_path = catalogue_path
+        self.overwrite = overwrite
+        self.cancel_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        result: RestoreResult | None = None
+        error: Exception | None = None
+        details = ""
+        try:
+            result = restore_catalogue_backup(
+                self.backup_path,
+                self.catalogue_path,
+                overwrite=self.overwrite,
+                progress_callback=self._report_progress,
+                cancel_callback=lambda: self.cancel_requested,
+            )
+        except BackupCancelled:
+            self.cancel_requested = True
+        except Exception as exc:
+            error = exc
+            details = traceback.format_exc()
+
+        if self.cancel_requested:
+            self.cancelled.emit()
+        elif error is not None:
+            self.failed.emit(error, details)
+        elif result is not None:
+            self.finished.emit(result)
+
+    def _report_progress(self, progress: BackupProgress) -> None:
+        self.progress.emit(progress.completed, progress.total, progress.message)
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
 
 
 class CatalogueInfoWorker(QObject):
@@ -3700,6 +3806,10 @@ class MainWindow(QMainWindow):
         self.delete_worker: DeleteVolumeWorker | None = None
         self.catalogue_info_thread: QThread | None = None
         self.catalogue_info_worker: CatalogueInfoWorker | None = None
+        self.catalogue_archive_thread: QThread | None = None
+        self.catalogue_archive_worker: CatalogueBackupWorker | CatalogueRestoreWorker | None = None
+        self.catalogue_archive_operation = ""
+        self.pending_restored_catalogue_path: Path | None = None
         self.backup_analysis_thread: QThread | None = None
         self.backup_analysis_worker: BackupAnalysisWorker | None = None
         self.backup_evidence_dialog: BackupEvidenceDialog | None = None
@@ -3805,6 +3915,26 @@ class MainWindow(QMainWindow):
         self.open_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Open))
         self.open_catalogue_action.triggered.connect(self.open_catalogue_from_dialog)
         file_menu.addAction(self.open_catalogue_action)
+
+        file_menu.addSeparator()
+
+        self.create_catalogue_backup_action = QAction(
+            "Create Catalogue Backup\u2026",
+            self,
+        )
+        self.create_catalogue_backup_action.triggered.connect(
+            self.create_catalogue_backup_from_dialog
+        )
+        file_menu.addAction(self.create_catalogue_backup_action)
+
+        self.restore_catalogue_backup_action = QAction(
+            "Restore Catalogue from Backup\u2026",
+            self,
+        )
+        self.restore_catalogue_backup_action.triggered.connect(
+            self.restore_catalogue_backup_from_dialog
+        )
+        file_menu.addAction(self.restore_catalogue_backup_action)
 
         file_menu.addSeparator()
 
@@ -4576,6 +4706,7 @@ class MainWindow(QMainWindow):
         self.catalogue_actions = [
             self.close_catalogue_action,
             self.open_catalogue_location_action,
+            self.create_catalogue_backup_action,
             self.new_volume_action,
             self.backup_evidence_action,
             self.catalogue_info_action,
@@ -4588,7 +4719,11 @@ class MainWindow(QMainWindow):
             self.browser_backup_filter_combo,
             self.search_backup_filter_combo,
         ]
-        self.scan_blocked_actions = [self.new_volume_action]
+        self.scan_blocked_actions = [
+            self.new_volume_action,
+            self.create_catalogue_backup_action,
+            self.restore_catalogue_backup_action,
+        ]
         self.scan_blocked_widgets = []
 
         self.add_browser_shortcut(QKeySequence("Backspace"), self.navigate_parent_folder)
@@ -5015,8 +5150,254 @@ class MainWindow(QMainWindow):
         self.catalogue_info_thread = None
         self._set_catalogue_busy(False)
 
+    def create_catalogue_backup_from_dialog(self) -> None:
+        if self.db is None or self.catalogue_path is None:
+            return
+        if self._catalogue_job_running() or self._catalogue_open_in_progress():
+            self._show_catalogue_job_running_message()
+            return
+        selected = self._choose_catalogue_backup_path()
+        if selected is None:
+            return
+        path, overwrite = selected
+        worker = CatalogueBackupWorker(self.catalogue_path, path, overwrite=overwrite)
+        self._start_catalogue_archive_worker(worker, "backup")
+
+    def restore_catalogue_backup_from_dialog(self) -> None:
+        if self._catalogue_job_running() or self._catalogue_open_in_progress():
+            self._show_catalogue_job_running_message()
+            return
+        backup_text, _ = QFileDialog.getOpenFileName(
+            self,
+            "Restore Catalogue from Backup",
+            str(self.catalogue_path.parent if self.catalogue_path else Path.home()),
+            BACKUP_FILE_FILTER,
+        )
+        if not backup_text:
+            return
+        backup_path = Path(backup_text).expanduser()
+        selected = self._choose_restored_catalogue_path(backup_path)
+        if selected is None:
+            return
+        target, overwrite = selected
+        if (
+            self.catalogue_path is not None
+            and target.resolve(strict=False) == self.catalogue_path.resolve(strict=False)
+        ):
+            QMessageBox.warning(
+                self,
+                "Catalogue Is Open",
+                "Choose a different destination, or close the current catalogue before "
+                "replacing it from a backup.",
+            )
+            return
+        worker = CatalogueRestoreWorker(backup_path, target, overwrite=overwrite)
+        self._start_catalogue_archive_worker(worker, "restore")
+
+    def _choose_catalogue_backup_path(self) -> tuple[Path, bool] | None:
+        if self.catalogue_path is None:
+            return None
+        dialog = QFileDialog(self, "Create Catalogue Backup")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter(BACKUP_FILE_FILTER)
+        dialog.setDefaultSuffix("zip")
+        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
+        dialog.setDirectory(str(self.catalogue_path.parent))
+        dialog.selectFile(f"{self.catalogue_path.stem}.backup.zip")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        selected = dialog.selectedFiles()
+        if not selected:
+            return None
+        path = Path(selected[0]).expanduser()
+        if path.suffix.casefold() != ".zip":
+            path = Path(f"{path}.zip")
+        overwrite = path.exists()
+        if overwrite:
+            answer = QMessageBox.question(
+                self,
+                "Overwrite Catalogue Backup",
+                f"Replace the existing backup file?\n\n{path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+        return path, overwrite
+
+    def _choose_restored_catalogue_path(
+        self,
+        backup_path: Path,
+    ) -> tuple[Path, bool] | None:
+        dialog = QFileDialog(self, "Save Restored Catalogue")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter(CATALOGUE_FILE_FILTER)
+        dialog.setDefaultSuffix(CATALOGUE_EXTENSION.lstrip("."))
+        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
+        dialog.setDirectory(str(backup_path.parent))
+        suggested_stem = backup_path.stem
+        if suggested_stem.casefold().endswith(".backup"):
+            suggested_stem = suggested_stem[:-7]
+        dialog.selectFile(f"{suggested_stem}{CATALOGUE_EXTENSION}")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        selected = dialog.selectedFiles()
+        if not selected:
+            return None
+        path = catalogue_path_with_extension(selected[0])
+        overwrite = path.exists()
+        if overwrite:
+            answer = QMessageBox.question(
+                self,
+                "Overwrite Catalogue",
+                f"Replace the existing catalogue file?\n\n{path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+        return path, overwrite
+
+    def _start_catalogue_archive_worker(
+        self,
+        worker: CatalogueBackupWorker | CatalogueRestoreWorker,
+        operation: str,
+    ) -> None:
+        self.catalogue_archive_operation = operation
+        self.pending_restored_catalogue_path = None
+        self.catalogue_archive_thread = QThread(self)
+        self.catalogue_archive_worker = worker
+        worker.moveToThread(self.catalogue_archive_thread)
+        self.catalogue_archive_thread.started.connect(worker.run)
+        worker.progress.connect(self.on_catalogue_archive_progress)
+        if operation == "backup":
+            worker.finished.connect(self.on_catalogue_backup_finished)
+        else:
+            worker.finished.connect(self.on_catalogue_restore_finished)
+        worker.cancelled.connect(self.on_catalogue_archive_cancelled)
+        worker.failed.connect(self.on_catalogue_archive_failed)
+        worker.finished.connect(self.catalogue_archive_thread.quit)
+        worker.cancelled.connect(self.catalogue_archive_thread.quit)
+        worker.failed.connect(self.catalogue_archive_thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        self.catalogue_archive_thread.finished.connect(
+            self.catalogue_archive_thread.deleteLater
+        )
+        self.catalogue_archive_thread.finished.connect(
+            self.clear_catalogue_archive_worker
+        )
+        self._set_catalogue_archive_running(True)
+        self.catalogue_archive_thread.start()
+
+    @Slot(object, object, str)
+    def on_catalogue_archive_progress(
+        self,
+        completed: object,
+        total: object,
+        message: str,
+    ) -> None:
+        completed_value = max(0, int(completed or 0))
+        total_value = max(0, int(total or 0))
+        if total_value:
+            maximum = 1000
+            value = min(maximum, (completed_value * maximum) // total_value)
+            self.scan_progress.setRange(0, maximum)
+            self.scan_progress.setValue(value)
+        else:
+            self.scan_progress.setRange(0, 0)
+        self.scan_progress.setFormat(message or "Processing catalogue archive…")
+        self.statusBar().showMessage(message or "Processing catalogue archive…")
+
+    @Slot(object)
+    def on_catalogue_backup_finished(self, result: BackupResult) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_progress.setFormat("Catalogue backup created")
+        if result.savings_bytes >= 0:
+            saving_text = (
+                f"Saved {format_size(result.savings_bytes)} "
+                f"({result.savings_percent:.1f}%)."
+            )
+        else:
+            saving_text = f"The ZIP is {format_size(-result.savings_bytes)} larger."
+        QMessageBox.information(
+            self,
+            "Catalogue Backup Created",
+            "The lossless catalogue backup was created successfully.\n\n"
+            f"Original catalogue: {format_size(result.original_size)}\n"
+            f"Backup ZIP: {format_size(result.backup_size)}\n"
+            f"{saving_text}\n\n{result.backup_path}",
+        )
+        self.statusBar().showMessage("Catalogue backup created.", 5000)
+
+    @Slot(object)
+    def on_catalogue_restore_finished(self, result: RestoreResult) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_progress.setFormat("Catalogue restored")
+        regenerated = ", ".join(result.regenerated_components)
+        QMessageBox.information(
+            self,
+            "Catalogue Restored",
+            "The backup passed validation and was restored atomically.\n\n"
+            f"Catalogue: {result.catalogue_path}\n"
+            f"Restored size: {format_size(result.catalogue_size)}\n"
+            f"Regenerated: {regenerated}",
+        )
+        self.pending_restored_catalogue_path = result.catalogue_path
+        self.statusBar().showMessage("Catalogue restored.", 5000)
+
+    @Slot()
+    def on_catalogue_archive_cancelled(self) -> None:
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Catalogue archive operation cancelled")
+        self.statusBar().showMessage("Catalogue archive operation cancelled.", 4000)
+
+    @Slot(object, str)
+    def on_catalogue_archive_failed(self, exc: Exception, details: str) -> None:
+        operation = "Restore" if self.catalogue_archive_operation == "restore" else "Backup"
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat(f"Catalogue {operation.casefold()} failed")
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setWindowTitle(f"Catalogue {operation} Failed")
+        dialog.setText(str(exc) or f"The catalogue {operation.casefold()} failed.")
+        diagnostic = format_exception_diagnostics(exc)
+        dialog.setDetailedText(diagnostic or details)
+        dialog.exec()
+        self.statusBar().showMessage(f"Catalogue {operation.casefold()} failed.", 5000)
+
+    @Slot()
+    def clear_catalogue_archive_worker(self) -> None:
+        restored_path = self.pending_restored_catalogue_path
+        self.pending_restored_catalogue_path = None
+        self.catalogue_archive_worker = None
+        self.catalogue_archive_thread = None
+        self.catalogue_archive_operation = ""
+        self._set_catalogue_archive_running(False)
+        if restored_path is not None:
+            self.open_catalogue_path(restored_path, status_message="Catalogue restored and opened.")
+
+    def _set_catalogue_archive_running(self, running: bool) -> None:
+        self._set_catalogue_busy(running)
+        enabled = not running and not self._catalogue_open_in_progress()
+        self.new_catalogue_action.setEnabled(enabled)
+        self.open_catalogue_action.setEnabled(enabled)
+        self.restore_catalogue_backup_action.setEnabled(enabled)
+        self.welcome_new_button.setEnabled(enabled)
+        self.welcome_open_button.setEnabled(enabled)
+        if running:
+            label = "Creating catalogue backup…" if self.catalogue_archive_operation == "backup" else "Restoring catalogue…"
+            self.scan_progress.setRange(0, 0)
+            self.scan_progress.setFormat(label)
+            self.statusBar().showMessage(label)
+
     def new_catalogue(self) -> None:
-        if self._catalogue_open_in_progress():
+        if self._catalogue_open_in_progress() or self.catalogue_archive_worker is not None:
             return
         path = self._choose_new_catalogue_path()
         if path is None:
@@ -5041,7 +5422,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Catalogue created.", 4000)
 
     def open_catalogue_from_dialog(self) -> None:
-        if self._catalogue_open_in_progress():
+        if self._catalogue_open_in_progress() or self.catalogue_archive_worker is not None:
             return
         path_text, _ = QFileDialog.getOpenFileName(
             self,
@@ -5054,7 +5435,11 @@ class MainWindow(QMainWindow):
         self.open_catalogue_path(catalogue_path_with_extension(path_text))
 
     def open_last_catalogue(self) -> None:
-        if self.db is not None or self._catalogue_open_in_progress():
+        if (
+            self.db is not None
+            or self._catalogue_open_in_progress()
+            or self.catalogue_archive_worker is not None
+        ):
             return
         path_text = self.settings.value(LAST_CATALOGUE_PATH_SETTING, "", type=str)
         if not path_text:
@@ -5064,7 +5449,7 @@ class MainWindow(QMainWindow):
         self.open_catalogue_path(path, status_message="Last catalogue opened.")
 
     def open_catalogue_path(self, path: str | Path, status_message: str = "Catalogue opened.") -> None:
-        if self._catalogue_open_in_progress():
+        if self._catalogue_open_in_progress() or self.catalogue_archive_worker is not None:
             return
         path = catalogue_path_with_extension(path)
         if self.db is not None and not self.close_catalogue(show_status=False):
@@ -5278,9 +5663,14 @@ class MainWindow(QMainWindow):
         )
 
     def _set_catalogue_loading(self, loading: bool, path: Path | None = None) -> None:
-        enabled = not loading and not self._catalogue_open_in_progress()
+        enabled = (
+            not loading
+            and not self._catalogue_open_in_progress()
+            and getattr(self, "catalogue_archive_worker", None) is None
+        )
         self.new_catalogue_action.setEnabled(enabled)
         self.open_catalogue_action.setEnabled(enabled)
+        self.restore_catalogue_backup_action.setEnabled(enabled)
         self.welcome_new_button.setEnabled(enabled)
         self.welcome_open_button.setEnabled(enabled)
         self.catalogue_loading_cancel_button.setEnabled(
@@ -5294,6 +5684,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Opening catalogue...")
 
     def close_catalogue(self, show_status: bool = True) -> bool:
+        if not self._stop_catalogue_archive_for_close():
+            return False
         if self.db is None:
             self._set_catalogue_open(False)
             return True
@@ -5440,6 +5832,39 @@ class MainWindow(QMainWindow):
             self.on_search_selection_changed()
         self.statusBar().showMessage("Connected volumes updated.", 3000)
 
+    def _stop_catalogue_archive_for_close(self) -> bool:
+        worker = getattr(self, "catalogue_archive_worker", None)
+        thread = getattr(self, "catalogue_archive_thread", None)
+        if worker is None or thread is None or not thread.isRunning():
+            return True
+        operation = (
+            "restore"
+            if getattr(self, "catalogue_archive_operation", "") == "restore"
+            else "backup"
+        )
+        answer = QMessageBox.question(
+            self,
+            f"Catalogue {operation.title()} Running",
+            f"A catalogue {operation} is still running. Cancel it before closing?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        worker.cancel()
+        self.scan_progress.setFormat("Cancelling…")
+        self.statusBar().showMessage(f"Cancelling catalogue {operation}…")
+        for _ in range(50):
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+            if self.catalogue_archive_thread is None or not self.catalogue_archive_thread.isRunning():
+                return True
+            self.catalogue_archive_thread.wait(100)
+        QMessageBox.information(
+            self,
+            f"Catalogue {operation.title()} Cancelling",
+            "Cancellation has been requested. Close the application after the operation stops.",
+        )
+        return False
+
     def _stop_scan_for_catalogue_close(self) -> bool:
         if self.scan_worker is None:
             return True
@@ -5551,6 +5976,8 @@ class MainWindow(QMainWindow):
         return (
             self.scan_worker is not None
             or self.delete_worker is not None
+            or self.catalogue_info_worker is not None
+            or getattr(self, "catalogue_archive_worker", None) is not None
             or getattr(self, "backup_analysis_worker", None) is not None
         )
 
@@ -5560,6 +5987,19 @@ class MainWindow(QMainWindow):
                 self,
                 "Volume Deleting",
                 "Wait for the current volume delete to finish.",
+            )
+        elif self.catalogue_info_worker is not None:
+            QMessageBox.information(
+                self,
+                "Catalogue Info Loading",
+                "Wait for catalogue information to finish loading.",
+            )
+        elif getattr(self, "catalogue_archive_worker", None) is not None:
+            operation = getattr(self, "catalogue_archive_operation", "backup")
+            QMessageBox.information(
+                self,
+                f"Catalogue {operation.title()} Running",
+                f"Wait for the catalogue {operation} to finish before starting another job.",
             )
         elif getattr(self, "backup_analysis_worker", None) is not None:
             QMessageBox.information(
@@ -5582,6 +6022,12 @@ class MainWindow(QMainWindow):
             widget.setEnabled(enabled)
         for shortcut in self.browser_shortcuts:
             shortcut.setEnabled(enabled)
+        if hasattr(self, "restore_catalogue_backup_action"):
+            self.restore_catalogue_backup_action.setEnabled(
+                not busy
+                and not self._catalogue_open_in_progress()
+                and getattr(self, "catalogue_archive_worker", None) is None
+            )
 
         if hasattr(self, "volume_table"):
             self.volume_table.setEnabled(enabled)
