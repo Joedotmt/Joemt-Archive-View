@@ -67,7 +67,9 @@ python -m jvvv
 
 JVVV starts without opening a catalogue. Use **File > New Catalogue** to create
 a `.jvvv` file, or **File > Open Catalogue** to open an existing one. The file
-is a valid SQLite database and contains the full catalogue.
+is a valid SQLite database and contains the full catalogue. This build opens
+only its current `.jvvv` schema and does not migrate catalogues from older
+schema versions.
 
 Use **File > Create Catalogue Backup…** to save the open catalogue as a single
 ZIP. The backup stores irreducible catalogue state (including IDs,
@@ -147,7 +149,7 @@ real file or reveal it in the operating system file manager.
 pytest
 ```
 
-The automated tests cover database initialization and migration, volume
+The automated tests cover database initialization and current-schema validation, volume
 operations, streaming hashes, media inspection, scan cancellation/change review
 and rollback, hash-first backup evidence, semantic backup/restore integrity and
 atomicity, offline browsing, and search.

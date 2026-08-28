@@ -551,12 +551,6 @@ class BackupAnalysisEngine:
                 (_utc_now(),),
             )
 
-    def _schema_available(self) -> bool:
-        row = self.connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='backup_analysis_state'"
-        ).fetchone()
-        return row is not None
-
     def _volume_snapshot_rows(self) -> list[sqlite3.Row]:
         return list(
             self.connection.execute(
@@ -586,8 +580,6 @@ class BackupAnalysisEngine:
         ).hexdigest()
 
     def state(self) -> AnalysisState:
-        if not self._schema_available():
-            return AnalysisState("not_analyzed")
         row = self.connection.execute(
             """
             SELECT s.active_run_id, s.forced_stale, s.stale_reason,

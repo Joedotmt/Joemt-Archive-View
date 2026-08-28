@@ -668,13 +668,13 @@ def _validate_catalogue_schema(connection: sqlite3.Connection) -> None:
     version = int(connection.execute("PRAGMA original.user_version").fetchone()[0])
     if version > SCHEMA_VERSION:
         raise UnsupportedBackupError(
-            f"The catalogue uses schema version {version}; this JVVV version supports "
-            f"up to version {SCHEMA_VERSION}."
+            f"The catalogue uses schema version {version}; this JVVV build only supports "
+            f"version {SCHEMA_VERSION}."
         )
     if version != SCHEMA_VERSION:
         raise CatalogueBackupError(
-            f"The catalogue must be upgraded to schema version {SCHEMA_VERSION} before "
-            "it can be backed up. Open it in JVVV, then try again."
+            f"The catalogue uses the retired schema version {version}. This JVVV build "
+            f"only backs up the current schema version {SCHEMA_VERSION}."
         )
 
     tables = {
@@ -1920,10 +1920,10 @@ def _read_manifest(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> dict[str,
     catalogue_version = manifest.get("catalogue_schema_version")
     if not isinstance(catalogue_version, int) or isinstance(catalogue_version, bool):
         raise InvalidBackupError("The backup has no valid catalogue schema version.")
-    if catalogue_version > SCHEMA_VERSION:
+    if catalogue_version != SCHEMA_VERSION:
         raise UnsupportedBackupError(
-            f"The restored catalogue requires schema version {catalogue_version}; this "
-            f"JVVV version supports up to version {SCHEMA_VERSION}."
+            f"The backup was created for catalogue schema version {catalogue_version}; "
+            f"this JVVV build only restores schema version {SCHEMA_VERSION}."
         )
     components = manifest.get("components")
     expected_component_count = (

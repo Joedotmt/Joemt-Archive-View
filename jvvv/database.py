@@ -276,6 +276,162 @@ REQUIRED_COLUMNS = {
 }
 
 
+CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
+    """
+    CREATE TABLE volumes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE COLLATE NOCASE,
+        source_path TEXT NOT NULL,
+        capacity_bytes INTEGER NOT NULL DEFAULT 0,
+        used_bytes INTEGER NOT NULL DEFAULT 0,
+        free_bytes INTEGER NOT NULL DEFAULT 0,
+        indexed_file_count INTEGER NOT NULL DEFAULT 0,
+        indexed_folder_count INTEGER NOT NULL DEFAULT 0,
+        last_scan_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        identity_kind TEXT NOT NULL DEFAULT '',
+        identity_token TEXT NOT NULL DEFAULT '',
+        identity_label TEXT NOT NULL DEFAULT '',
+        identity_serial TEXT NOT NULL DEFAULT '',
+        identity_filesystem TEXT NOT NULL DEFAULT '',
+        source_relative_path TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE folders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+        parent_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        missing INTEGER NOT NULL DEFAULT 0,
+        scanned_at TEXT,
+        modified_at TEXT,
+        recursive_size_bytes INTEGER,
+        recursive_file_count INTEGER,
+        recursive_subfolder_count INTEGER,
+        direct_file_count INTEGER,
+        direct_subfolder_count INTEGER,
+        stats_updated_at TEXT,
+        UNIQUE(volume_id, relative_path)
+    )
+    """,
+    """
+    CREATE TABLE files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+        folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        extension TEXT NOT NULL DEFAULT '',
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        modified_at TEXT,
+        missing INTEGER NOT NULL DEFAULT 0,
+        scanned_at TEXT,
+        identity_device INTEGER,
+        identity_inode INTEGER,
+        content_hash BLOB,
+        content_hash_algorithm TEXT,
+        UNIQUE(volume_id, relative_path)
+    )
+    """,
+    """
+    CREATE TABLE file_media_metadata (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        media_kind TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT '',
+        container TEXT,
+        duration_ms INTEGER,
+        width INTEGER,
+        height INTEGER,
+        video_codecs TEXT,
+        audio_codecs TEXT,
+        sample_rate_hz INTEGER,
+        channels INTEGER,
+        bit_rate INTEGER,
+        message TEXT NOT NULL DEFAULT '',
+        probed_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE scan_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        status TEXT NOT NULL,
+        files_seen INTEGER NOT NULL DEFAULT 0,
+        folders_seen INTEGER NOT NULL DEFAULT 0,
+        errors_count INTEGER NOT NULL DEFAULT 0,
+        message TEXT,
+        files_added INTEGER,
+        files_removed INTEGER,
+        files_changed INTEGER,
+        folders_added INTEGER,
+        folders_removed INTEGER,
+        bytes_before INTEGER,
+        bytes_after INTEGER,
+        files_hashed INTEGER NOT NULL DEFAULT 0,
+        bytes_hashed INTEGER NOT NULL DEFAULT 0,
+        hash_errors INTEGER NOT NULL DEFAULT 0,
+        media_files INTEGER NOT NULL DEFAULT 0,
+        media_metadata_collected INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE scan_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_id INTEGER REFERENCES scan_history(id) ON DELETE CASCADE,
+        volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE volume_register (
+        volume_id INTEGER PRIMARY KEY REFERENCES volumes(id) ON DELETE CASCADE,
+        drive_id TEXT UNIQUE COLLATE NOCASE,
+        is_mirror INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'Archive',
+        condition TEXT NOT NULL DEFAULT 'Unknown',
+        description TEXT NOT NULL DEFAULT '',
+        earliest_content_date TEXT,
+        latest_content_date TEXT,
+        connector TEXT NOT NULL DEFAULT 'Unknown',
+        date_added TEXT NOT NULL,
+        retired_date TEXT,
+        mirror_date TEXT,
+        master_volume_id INTEGER REFERENCES volumes(id) ON DELETE RESTRICT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (is_mirror IN (0, 1))
+    )
+    """,
+    "CREATE INDEX idx_folders_volume_parent ON folders(volume_id, parent_id)",
+    "CREATE INDEX idx_folders_name ON folders(name COLLATE NOCASE)",
+    "CREATE INDEX idx_folders_path ON folders(relative_path COLLATE NOCASE)",
+    "CREATE INDEX idx_folders_volume_stats_size ON folders(volume_id, recursive_size_bytes)",
+    "CREATE INDEX idx_folders_parent ON folders(parent_id)",
+    "CREATE INDEX idx_files_volume_folder ON files(volume_id, folder_id)",
+    "CREATE INDEX idx_files_name ON files(name COLLATE NOCASE)",
+    "CREATE INDEX idx_files_extension ON files(extension COLLATE NOCASE)",
+    "CREATE INDEX idx_files_path ON files(relative_path COLLATE NOCASE)",
+    "CREATE INDEX idx_files_identity ON files(volume_id, identity_device, identity_inode)",
+    "CREATE INDEX idx_files_folder ON files(folder_id)",
+    "CREATE INDEX idx_scan_history_volume ON scan_history(volume_id)",
+    "CREATE INDEX idx_scan_errors_scan ON scan_errors(scan_id)",
+    "CREATE INDEX idx_scan_errors_volume ON scan_errors(volume_id)",
+    "CREATE INDEX idx_volume_register_status ON volume_register(status COLLATE NOCASE)",
+    "CREATE INDEX idx_volume_register_condition ON volume_register(condition COLLATE NOCASE)",
+    "CREATE INDEX idx_volume_register_connector ON volume_register(connector COLLATE NOCASE)",
+    "CREATE INDEX idx_volume_register_master ON volume_register(master_volume_id)",
+    "CREATE INDEX idx_volumes_identity ON volumes(identity_kind, identity_token)",
+)
+
+
 class CatalogueError(Exception):
     def __init__(self, message: str, *, diagnostic_details: str = "") -> None:
         super().__init__(message)
@@ -402,6 +558,11 @@ class Database:
                 "This network catalogue is still in WAL mode. Move it to a local drive, "
                 "open and close it there to convert it, then move it back to the network share."
             )
+        stored_schema_version = self._database_header_schema_version(self.path)
+        if stored_schema_version not in (None, 0, SCHEMA_VERSION):
+            raise UnsupportedCatalogueError(
+                self._unsupported_schema_message(stored_schema_version)
+            )
         if create:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connect_target = str(self.path)
@@ -480,6 +641,19 @@ class Database:
             return "Rollback"
         return f"Unknown ({header[18]}/{header[19]})"
 
+    @staticmethod
+    def _database_header_schema_version(path: Path) -> int | None:
+        if not path.is_file():
+            return None
+        try:
+            with path.open("rb") as database_file:
+                header = database_file.read(64)
+        except OSError:
+            return None
+        if len(header) < 64 or header[:16] != b"SQLite format 3\x00":
+            return None
+        return int.from_bytes(header[60:64], "big")
+
     def _configure_connection(self) -> None:
         self._operation = "enabling SQLite foreign-key checks"
         self.connection.execute("PRAGMA foreign_keys = ON")
@@ -548,59 +722,51 @@ class Database:
 
     def initialize(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-        if version > SCHEMA_VERSION:
+        if version == SCHEMA_VERSION:
+            self.validate_schema()
+            return
+        if version != 0 or self._table_names():
             raise UnsupportedCatalogueError(
-                f"This catalogue uses schema version {version}, but this version of JVVV "
-                f"supports up to version {SCHEMA_VERSION}."
+                self._unsupported_schema_message(int(version))
             )
-        if version < SCHEMA_VERSION:
-            disable_foreign_keys = version < 4
-            try:
-                if disable_foreign_keys:
-                    self.connection.execute("PRAGMA foreign_keys = OFF")
-                self.connection.execute("BEGIN IMMEDIATE")
-                if version < 1:
-                    self._apply_migration_1()
-                    version = 1
-                if version < 2:
-                    self._apply_migration_2()
-                    version = 2
-                if version < 3:
-                    self._apply_migration_3()
-                    version = 3
-                if version < 4:
-                    self._apply_migration_4()
-                    version = 4
-                if version < 5:
-                    self._apply_migration_5()
-                    version = 5
-                if version < 6:
-                    self._apply_migration_6()
-                    version = 6
-                if version < 7:
-                    self._apply_migration_7()
-                    version = 7
-                if version < 8:
-                    self._apply_migration_8()
-                    version = 8
-                if version < 9:
-                    self._apply_migration_9()
-                    version = 9
-                if version < 10:
-                    self._apply_migration_10()
-                    version = 10
-                if version < 11:
-                    self._apply_migration_11()
-                    version = 11
-                self.connection.execute(f"PRAGMA user_version = {version}")
-                self.connection.commit()
-            except sqlite3.Error:
-                self.connection.rollback()
-                raise
-            finally:
-                if disable_foreign_keys:
-                    self.connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            for statement in CATALOGUE_SCHEMA_SQL:
+                self.connection.execute(statement)
+
+            # Imported here to keep the core database module independent from
+            # the analysis implementation during normal module loading.
+            from .backup_analysis import ANALYSIS_SCHEMA_SQL
+
+            for statement in ANALYSIS_SCHEMA_SQL:
+                self.connection.execute(statement)
+            self.connection.execute(
+                """
+                INSERT INTO backup_analysis_state (
+                    id, active_run_id, forced_stale, stale_reason, updated_at
+                ) VALUES (1, NULL, 0, '', ?)
+                """,
+                (utc_now(),),
+            )
+            self._create_or_rebuild_search_indexes()
+            self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.connection.commit()
+        except sqlite3.Error:
+            self.connection.rollback()
+            raise
         self.validate_schema()
+
+    @staticmethod
+    def _unsupported_schema_message(version: int) -> str:
+        if version < SCHEMA_VERSION:
+            return (
+                f"This catalogue uses the retired schema version {version}. "
+                f"This JVVV build only opens the current schema version {SCHEMA_VERSION}."
+            )
+        return (
+            f"This catalogue uses schema version {version}, but this JVVV build only "
+            f"supports version {SCHEMA_VERSION}."
+        )
 
     def validate_catalogue(self) -> None:
         try:
@@ -629,17 +795,12 @@ class Database:
                 raise InvalidCatalogueError(
                     "The selected file is a SQLite database, but it is not a JVVV catalogue."
                 )
-            if version > SCHEMA_VERSION:
+            if version != SCHEMA_VERSION:
                 raise UnsupportedCatalogueError(
-                    f"This catalogue uses schema version {version}, but this version of JVVV "
-                    f"supports up to version {SCHEMA_VERSION}."
+                    self._unsupported_schema_message(int(version))
                 )
-            if version < SCHEMA_VERSION:
-                self._operation = "migrating the catalogue schema"
-                self.initialize()
-            else:
-                self._operation = "validating the catalogue schema"
-                self.validate_schema()
+            self._operation = "validating the catalogue schema"
+            self.validate_schema()
         except sqlite3.Error as exc:
             raise self._catalogue_error(exc) from exc
 
@@ -671,233 +832,7 @@ class Database:
     def _column_names(self, table: str) -> set[str]:
         return {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")}
 
-    def _apply_migration_1(self) -> None:
-        statements = [
-            """
-            CREATE TABLE IF NOT EXISTS volumes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE COLLATE NOCASE,
-                source_path TEXT NOT NULL,
-                capacity_bytes INTEGER NOT NULL DEFAULT 0,
-                used_bytes INTEGER NOT NULL DEFAULT 0,
-                free_bytes INTEGER NOT NULL DEFAULT 0,
-                indexed_file_count INTEGER NOT NULL DEFAULT 0,
-                indexed_folder_count INTEGER NOT NULL DEFAULT 0,
-                last_scan_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
-                parent_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                relative_path TEXT NOT NULL,
-                missing INTEGER NOT NULL DEFAULT 0,
-                scanned_at TEXT,
-                modified_at TEXT,
-                UNIQUE(volume_id, relative_path)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
-                folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                relative_path TEXT NOT NULL,
-                extension TEXT NOT NULL DEFAULT '',
-                size_bytes INTEGER NOT NULL DEFAULT 0,
-                modified_at TEXT,
-                missing INTEGER NOT NULL DEFAULT 0,
-                scanned_at TEXT,
-                UNIQUE(volume_id, relative_path)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS scan_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                status TEXT NOT NULL,
-                files_seen INTEGER NOT NULL DEFAULT 0,
-                folders_seen INTEGER NOT NULL DEFAULT 0,
-                errors_count INTEGER NOT NULL DEFAULT 0,
-                message TEXT
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS scan_errors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scan_id INTEGER REFERENCES scan_history(id) ON DELETE CASCADE,
-                volume_id INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
-                path TEXT NOT NULL,
-                message TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_folders_volume_parent ON folders(volume_id, parent_id)",
-            "CREATE INDEX IF NOT EXISTS idx_folders_name ON folders(name COLLATE NOCASE)",
-            "CREATE INDEX IF NOT EXISTS idx_folders_path ON folders(relative_path COLLATE NOCASE)",
-            "CREATE INDEX IF NOT EXISTS idx_files_volume_folder ON files(volume_id, folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_files_name ON files(name COLLATE NOCASE)",
-            "CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension COLLATE NOCASE)",
-            "CREATE INDEX IF NOT EXISTS idx_files_path ON files(relative_path COLLATE NOCASE)",
-            "CREATE INDEX IF NOT EXISTS idx_scan_errors_scan ON scan_errors(scan_id)",
-        ]
-        for statement in statements:
-            self.connection.execute(statement)
-
-    def _apply_migration_2(self) -> None:
-        folder_columns = {
-            "recursive_size_bytes": "INTEGER",
-            "recursive_file_count": "INTEGER",
-            "recursive_subfolder_count": "INTEGER",
-            "direct_file_count": "INTEGER",
-            "direct_subfolder_count": "INTEGER",
-            "stats_updated_at": "TEXT",
-        }
-        file_columns = {
-            "identity_device": "INTEGER",
-            "identity_inode": "INTEGER",
-        }
-        for column, definition in folder_columns.items():
-            self._add_column_if_missing("folders", column, definition)
-        for column, definition in file_columns.items():
-            self._add_column_if_missing("files", column, definition)
-
-        statements = [
-            "CREATE INDEX IF NOT EXISTS idx_folders_volume_stats_size ON folders(volume_id, recursive_size_bytes)",
-            "CREATE INDEX IF NOT EXISTS idx_files_identity ON files(volume_id, identity_device, identity_inode)",
-        ]
-        for statement in statements:
-            self.connection.execute(statement)
-
-    def _apply_migration_3(self) -> None:
-        self.connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS volume_register (
-                volume_id INTEGER PRIMARY KEY REFERENCES volumes(id) ON DELETE CASCADE,
-                drive_id TEXT UNIQUE COLLATE NOCASE,
-                is_mirror INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'Archive',
-                condition TEXT NOT NULL DEFAULT 'Unknown',
-                description TEXT NOT NULL DEFAULT '',
-                earliest_content_date TEXT,
-                latest_content_date TEXT,
-                connector TEXT NOT NULL DEFAULT 'Unknown',
-                date_added TEXT NOT NULL,
-                retired_date TEXT,
-                mirror_date TEXT,
-                master_volume_id INTEGER REFERENCES volumes(id) ON DELETE RESTRICT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                CHECK (is_mirror IN (0, 1))
-            )
-            """
-        )
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_volume_register_status ON volume_register(status COLLATE NOCASE)"
-        )
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_volume_register_condition ON volume_register(condition COLLATE NOCASE)"
-        )
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_volume_register_connector ON volume_register(connector COLLATE NOCASE)"
-        )
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_volume_register_master ON volume_register(master_volume_id)"
-        )
-
-        existing = list(
-            self.connection.execute(
-                """
-                SELECT v.id
-                FROM volumes v
-                LEFT JOIN volume_register r ON r.volume_id = v.id
-                WHERE r.volume_id IS NULL
-                ORDER BY v.id
-                """
-            )
-        )
-        for row in existing:
-            self._insert_default_volume_register(self.connection, int(row["id"]))
-
-    def _apply_migration_4(self) -> None:
-        name_column = next(
-            (row for row in self.connection.execute("PRAGMA table_info(volumes)") if row["name"] == "name"),
-            None,
-        )
-        if name_column is None or not bool(name_column["notnull"]):
-            return
-
-        self.connection.execute(
-            """
-            CREATE TABLE volumes_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE COLLATE NOCASE,
-                source_path TEXT NOT NULL,
-                identity_kind TEXT NOT NULL DEFAULT '',
-                identity_token TEXT NOT NULL DEFAULT '',
-                identity_label TEXT NOT NULL DEFAULT '',
-                identity_serial TEXT NOT NULL DEFAULT '',
-                identity_filesystem TEXT NOT NULL DEFAULT '',
-                source_relative_path TEXT NOT NULL DEFAULT '',
-                capacity_bytes INTEGER NOT NULL DEFAULT 0,
-                used_bytes INTEGER NOT NULL DEFAULT 0,
-                free_bytes INTEGER NOT NULL DEFAULT 0,
-                indexed_file_count INTEGER NOT NULL DEFAULT 0,
-                indexed_folder_count INTEGER NOT NULL DEFAULT 0,
-                last_scan_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        self.connection.execute(
-            """
-            INSERT INTO volumes_new (
-                id, name, source_path, capacity_bytes, used_bytes, free_bytes,
-                indexed_file_count, indexed_folder_count, last_scan_at, created_at, updated_at
-            )
-            SELECT
-                id, NULLIF(name, ''), source_path, capacity_bytes, used_bytes, free_bytes,
-                indexed_file_count, indexed_folder_count, last_scan_at, created_at, updated_at
-            FROM volumes
-            """
-        )
-        self.connection.execute("DROP TABLE volumes")
-        self.connection.execute("ALTER TABLE volumes_new RENAME TO volumes")
-
-    def _apply_migration_5(self) -> None:
-        volume_columns = {
-            "identity_kind": "TEXT NOT NULL DEFAULT ''",
-            "identity_token": "TEXT NOT NULL DEFAULT ''",
-            "identity_label": "TEXT NOT NULL DEFAULT ''",
-            "identity_serial": "TEXT NOT NULL DEFAULT ''",
-            "identity_filesystem": "TEXT NOT NULL DEFAULT ''",
-            "source_relative_path": "TEXT NOT NULL DEFAULT ''",
-        }
-        for column, definition in volume_columns.items():
-            self._add_column_if_missing("volumes", column, definition)
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_volumes_identity ON volumes(identity_kind, identity_token)"
-        )
-
-    def _apply_migration_6(self) -> None:
-        statements = [
-            "CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id)",
-            "CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_scan_history_volume ON scan_history(volume_id)",
-            "CREATE INDEX IF NOT EXISTS idx_scan_errors_volume ON scan_errors(volume_id)",
-        ]
-        for statement in statements:
-            self.connection.execute(statement)
-
-    def _apply_migration_7(self) -> None:
+    def _create_or_rebuild_search_indexes(self) -> None:
         statements = [
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
@@ -978,112 +913,6 @@ class Database:
             self.connection.execute(statement)
         self.connection.execute("INSERT INTO files_fts(files_fts) VALUES ('rebuild')")
         self.connection.execute("INSERT INTO folders_fts(folders_fts) VALUES ('rebuild')")
-
-    def _apply_migration_8(self) -> None:
-        definitions = {
-            row["name"]: (row["sql"] or "").casefold().replace(" ", "")
-            for row in self.connection.execute(
-                """
-                SELECT name, sql
-                FROM sqlite_master
-                WHERE name IN ('files_fts', 'folders_fts')
-                """
-            )
-        }
-        if all(
-            "detail='column'" in definitions.get(table, "")
-            for table in ("files_fts", "folders_fts")
-        ):
-            return
-
-        for trigger in (
-            "files_fts_insert",
-            "files_fts_delete",
-            "files_fts_update",
-            "folders_fts_insert",
-            "folders_fts_delete",
-            "folders_fts_update",
-        ):
-            self.connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        self.connection.execute("DROP TABLE IF EXISTS files_fts")
-        self.connection.execute("DROP TABLE IF EXISTS folders_fts")
-        self._apply_migration_7()
-
-    def _apply_migration_9(self) -> None:
-        scan_history_columns = {
-            "files_added": "INTEGER",
-            "files_removed": "INTEGER",
-            "files_changed": "INTEGER",
-            "folders_added": "INTEGER",
-            "folders_removed": "INTEGER",
-            "bytes_before": "INTEGER",
-            "bytes_after": "INTEGER",
-        }
-        for column, definition in scan_history_columns.items():
-            self._add_column_if_missing("scan_history", column, definition)
-
-    def _apply_migration_10(self) -> None:
-        # Imported here to keep the core database module independent from the
-        # optional analysis implementation during normal module loading.
-        from .backup_analysis import ANALYSIS_SCHEMA_SQL
-
-        for statement in ANALYSIS_SCHEMA_SQL:
-            self.connection.execute(statement)
-        self.connection.execute(
-            """
-            INSERT OR IGNORE INTO backup_analysis_state (
-                id, active_run_id, forced_stale, stale_reason, updated_at
-            ) VALUES (1, NULL, 0, '', ?)
-            """,
-            (utc_now(),),
-        )
-
-    def _apply_migration_11(self) -> None:
-        for column, definition in {
-            "content_hash": "BLOB",
-            "content_hash_algorithm": "TEXT",
-        }.items():
-            self._add_column_if_missing("files", column, definition)
-
-        for column, definition in {
-            "files_hashed": "INTEGER NOT NULL DEFAULT 0",
-            "bytes_hashed": "INTEGER NOT NULL DEFAULT 0",
-            "hash_errors": "INTEGER NOT NULL DEFAULT 0",
-            "media_files": "INTEGER NOT NULL DEFAULT 0",
-            "media_metadata_collected": "INTEGER NOT NULL DEFAULT 0",
-        }.items():
-            self._add_column_if_missing("scan_history", column, definition)
-
-        self._add_column_if_missing(
-            "backup_file_results",
-            "verified_volume_ids",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )
-        self.connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS file_media_metadata (
-                file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-                status TEXT NOT NULL,
-                media_kind TEXT NOT NULL DEFAULT '',
-                source TEXT NOT NULL DEFAULT '',
-                container TEXT,
-                duration_ms INTEGER,
-                width INTEGER,
-                height INTEGER,
-                video_codecs TEXT,
-                audio_codecs TEXT,
-                sample_rate_hz INTEGER,
-                channels INTEGER,
-                bit_rate INTEGER,
-                message TEXT NOT NULL DEFAULT '',
-                probed_at TEXT
-            )
-            """
-        )
-
-    def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
-        if column not in self._column_names(table):
-            self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -2670,7 +2499,7 @@ class Database:
     def rebuild_search_indexes(self) -> None:
         """Recreate the external-content FTS indexes from authoritative rows."""
         with self.transaction():
-            self._apply_migration_7()
+            self._create_or_rebuild_search_indexes()
 
     def prune_scan_history(self, keep_per_volume: int = 100) -> None:
         volume_ids = [row["id"] for row in self.list_volumes()]
@@ -2773,10 +2602,6 @@ def open_catalogue(
     except Exception:
         db.close()
         raise
-
-
-def open_database(path: str | Path) -> Database:
-    return open_catalogue(path)
 
 
 def count_rows(db: Database, table: str) -> int:

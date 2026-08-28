@@ -3503,8 +3503,8 @@ class SearchWorker(QObject):
                     for item_id, status in engine.item_statuses(item_type, ids).items():
                         statuses[(item_type, int(item_id))] = status
                 except Exception:
-                    # Search remains usable if an older catalogue has not had its
-                    # auxiliary analysis schema initialized yet.
+                    # Name results remain usable if auxiliary backup evidence
+                    # cannot be read.
                     pass
 
         items: list[SearchResultItem] = []

@@ -1274,6 +1274,35 @@ def test_unsupported_backup_version_is_distinct_from_invalid_backup(
         validate_catalogue_backup(unsupported_path)
 
 
+@pytest.mark.parametrize(
+    "catalogue_schema_version",
+    [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1],
+)
+def test_backup_from_noncurrent_catalogue_schema_is_unsupported(
+    catalogue_schema_version: int,
+    representative_catalogue: Path,
+    tmp_path: Path,
+):
+    valid_path = tmp_path / "valid.zip"
+    unsupported_path = tmp_path / f"schema-{catalogue_schema_version}.zip"
+    create_catalogue_backup(representative_catalogue, valid_path)
+    manifest, payload = _read_archive(valid_path)
+    manifest["catalogue_schema_version"] = catalogue_schema_version
+    _write_archive(
+        unsupported_path,
+        [
+            ("manifest.json", json.dumps(manifest).encode("utf-8")),
+            ("source.sqlite", payload),
+        ],
+    )
+
+    with pytest.raises(
+        UnsupportedBackupError,
+        match=rf"catalogue schema version {catalogue_schema_version}",
+    ):
+        validate_catalogue_backup(unsupported_path)
+
+
 @pytest.mark.parametrize("archive_shape", ["missing", "extra", "duplicate"])
 def test_noncanonical_archive_member_sets_are_rejected(
     archive_shape: str,

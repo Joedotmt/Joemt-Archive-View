@@ -9,6 +9,8 @@ from jvvv import database as database_module
 from jvvv.database import (
     Database,
     InvalidCatalogueError,
+    SCHEMA_VERSION,
+    UnsupportedCatalogueError,
     count_rows,
     create_catalogue,
     open_catalogue,
@@ -158,8 +160,6 @@ def test_database_initializes_schema(tmp_path):
         } <= register_columns
     finally:
         db.close()
-
-
 def test_finishing_scans_keeps_only_compact_recent_history(tmp_path):
     db = Database(tmp_path / "catalogue.sqlite3")
     try:
@@ -237,8 +237,10 @@ def test_network_storage_recognizes_mapped_windows_drive(monkeypatch):
 
 def test_network_catalogue_preserves_existing_rollback_journal(monkeypatch, tmp_path):
     path = tmp_path / "network-catalogue.jvvv"
+    created = Database(path)
+    created.close()
     connection = sqlite3.connect(path)
-    connection.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+    connection.execute("PRAGMA journal_mode = DELETE").fetchone()
     connection.commit()
     connection.close()
     assert Database._database_header_journal_mode(path) == "Rollback"
@@ -757,136 +759,48 @@ def test_mirror_relationships_are_validated_and_block_master_deletion(tmp_path):
         db.close()
 
 
-def test_version_1_catalogue_migrates_folder_stats_as_unknown(tmp_path):
-    path = tmp_path / "catalogue.jvvv"
-    db = Database(path, initialize=False)
-    try:
-        with db.transaction() as conn:
-            db._apply_migration_1()
-            conn.execute("PRAGMA user_version = 1")
-            now = "2026-06-25T12:00:00.000000+0000"
-            volume_id = conn.execute(
-                """
-                INSERT INTO volumes (name, source_path, created_at, updated_at)
-                VALUES ('Archive', ?, ?, ?)
-                """,
-                (str(tmp_path), now, now),
-            ).lastrowid
-            folder_id = db.ensure_folder(
-                volume_id=volume_id,
-                parent_id=None,
-                name="Archive",
-                relative_path="",
-                scanned_at="2026-06-25T12:00:00.000000+0000",
-            )
-            conn.execute(
-                """
-                INSERT INTO files (
-                    volume_id, folder_id, name, relative_path, extension,
-                    size_bytes, modified_at, missing, scanned_at
-                )
-                VALUES (?, ?, 'file.txt', 'file.txt', 'txt', 123, NULL, 0, ?)
-                """,
-                (volume_id, folder_id, "2026-06-25T12:00:00.000000+0000"),
-            )
-    finally:
-        db.close()
+@pytest.mark.parametrize("schema_version", range(1, SCHEMA_VERSION))
+def test_retired_catalogue_versions_are_rejected_without_modification(
+    tmp_path,
+    schema_version,
+):
+    path = tmp_path / f"catalogue-v{schema_version}.jvvv"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    connection.execute("INSERT INTO marker VALUES ('unchanged')")
+    connection.execute(f"PRAGMA user_version = {schema_version}")
+    connection.commit()
+    connection.close()
+    original_bytes = path.read_bytes()
+    original_journal_mode = Database._database_header_journal_mode(path)
 
-    migrated = open_catalogue(path)
-    try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 11
-        root = migrated.get_root_folder(volume_id)
-        assert root is not None
-        assert root["recursive_size_bytes"] is None
-        assert root["recursive_file_count"] is None
+    with pytest.raises(
+        UnsupportedCatalogueError,
+        match=rf"retired schema version {schema_version}",
+    ):
+        open_catalogue(path)
 
-        migrated.rebuild_folder_statistics(volume_id)
-        root = migrated.get_root_folder(volume_id)
-        assert root["recursive_size_bytes"] == 123
-        assert root["recursive_file_count"] == 1
-        assert root["direct_file_count"] == 1
-        assert [row["name"] for row in migrated.search("file.txt")] == ["file.txt"]
-    finally:
-        migrated.close()
+    assert path.read_bytes() == original_bytes
+    assert Database._database_header_journal_mode(path) == original_journal_mode
 
 
-def test_version_7_search_index_migrates_to_column_detail(tmp_path):
-    path = tmp_path / "catalogue.jvvv"
-    db = Database(path)
-    try:
-        volume_id = db.create_volume("Archive", str(tmp_path))
-        with db.transaction():
-            folder_id = db.ensure_folder(
-                volume_id=volume_id,
-                parent_id=None,
-                name="Archive",
-                relative_path="",
-                scanned_at="2026-06-25T12:00:00.000000+0000",
-            )
-            db.upsert_file(
-                volume_id=volume_id,
-                folder_id=folder_id,
-                name="needle.txt",
-                relative_path="needle.txt",
-                extension="txt",
-                size_bytes=1,
-                modified_at=None,
-                scanned_at="2026-06-25T12:00:00.000000+0000",
-            )
+def test_future_catalogue_version_is_rejected_without_modification(tmp_path):
+    schema_version = SCHEMA_VERSION + 1
+    path = tmp_path / "future-catalogue.jvvv"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    connection.execute(f"PRAGMA user_version = {schema_version}")
+    connection.commit()
+    connection.close()
+    original_bytes = path.read_bytes()
 
-        with db.transaction() as conn:
-            for trigger in (
-                "files_fts_insert",
-                "files_fts_delete",
-                "files_fts_update",
-                "folders_fts_insert",
-                "folders_fts_delete",
-                "folders_fts_update",
-            ):
-                conn.execute(f"DROP TRIGGER {trigger}")
-            conn.execute("DROP TABLE files_fts")
-            conn.execute("DROP TABLE folders_fts")
-            conn.execute(
-                """
-                CREATE VIRTUAL TABLE files_fts USING fts5(
-                    name, relative_path, extension,
-                    content='files', content_rowid='id',
-                    tokenize='trigram', detail='none'
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE VIRTUAL TABLE folders_fts USING fts5(
-                    name, relative_path,
-                    content='folders', content_rowid='id',
-                    tokenize='trigram', detail='none'
-                )
-                """
-            )
-            conn.execute("INSERT INTO files_fts(files_fts) VALUES ('rebuild')")
-            conn.execute("INSERT INTO folders_fts(folders_fts) VALUES ('rebuild')")
-            conn.execute("PRAGMA user_version = 7")
-    finally:
-        db.close()
+    with pytest.raises(
+        UnsupportedCatalogueError,
+        match=rf"schema version {schema_version}.*only supports version {SCHEMA_VERSION}",
+    ):
+        open_catalogue(path)
 
-    migrated = open_catalogue(path)
-    try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 11
-        definitions = {
-            row["name"]: row["sql"]
-            for row in migrated.connection.execute(
-                """
-                SELECT name, sql FROM sqlite_master
-                WHERE name IN ('files_fts', 'folders_fts')
-                """
-            )
-        }
-        assert "detail='column'" in definitions["files_fts"]
-        assert "detail='column'" in definitions["folders_fts"]
-        assert [row["name"] for row in migrated.search("needle")] == ["needle.txt"]
-    finally:
-        migrated.close()
+    assert path.read_bytes() == original_bytes
 
 
 def test_upsert_file_accepts_unsigned_64_bit_identity_values(tmp_path):
@@ -1101,67 +1015,3 @@ def test_file_media_metadata_api_replaces_and_clears_one_to_one_record(tmp_path)
         assert db.get_file_media_metadata(file_id) is None
     finally:
         db.close()
-
-
-def test_version_10_catalogue_migrates_hash_and_media_fields_as_unknown(tmp_path):
-    path = tmp_path / "catalogue.jvvv"
-    legacy = Database(path, initialize=False)
-    try:
-        legacy.connection.execute("PRAGMA foreign_keys = OFF")
-        with legacy.transaction() as conn:
-            for version in range(1, 11):
-                getattr(legacy, f"_apply_migration_{version}")()
-            conn.execute("PRAGMA user_version = 10")
-        legacy.connection.execute("PRAGMA foreign_keys = ON")
-
-        now = "2026-08-27T12:00:00.000000+0000"
-        volume_id = legacy.create_volume("Legacy", str(tmp_path))
-        with legacy.transaction() as conn:
-            folder_id = legacy.ensure_folder(
-                volume_id=volume_id,
-                parent_id=None,
-                name="Legacy",
-                relative_path="",
-                scanned_at=now,
-            )
-            file_id = conn.execute(
-                """
-                INSERT INTO files (
-                    volume_id, folder_id, name, relative_path, extension,
-                    size_bytes, modified_at, missing, scanned_at,
-                    identity_device, identity_inode
-                ) VALUES (?, ?, 'legacy.bin', 'legacy.bin', 'bin', 7, NULL, 0, ?, NULL, NULL)
-                """,
-                (volume_id, folder_id, now),
-            ).lastrowid
-            scan_id = conn.execute(
-                """
-                INSERT INTO scan_history (
-                    volume_id, started_at, finished_at, status,
-                    files_seen, folders_seen, errors_count
-                ) VALUES (?, ?, ?, 'completed', 1, 1, 0)
-                """,
-                (volume_id, now, now),
-            ).lastrowid
-    finally:
-        legacy.close()
-
-    migrated = open_catalogue(path)
-    try:
-        assert migrated.connection.execute("PRAGMA user_version").fetchone()[0] == 11
-        file_row = migrated.get_file(file_id)
-        assert file_row["content_hash"] is None
-        assert file_row["content_hash_algorithm"] is None
-
-        history = migrated.connection.execute(
-            "SELECT * FROM scan_history WHERE id = ?",
-            (scan_id,),
-        ).fetchone()
-        assert history["files_hashed"] == 0
-        assert history["bytes_hashed"] == 0
-        assert history["hash_errors"] == 0
-        assert history["media_files"] == 0
-        assert history["media_metadata_collected"] == 0
-        assert migrated.get_file_media_metadata(file_id) is None
-    finally:
-        migrated.close()
