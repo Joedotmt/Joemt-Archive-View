@@ -132,10 +132,6 @@ class MediaMetadataExtractor:
         self.ffprobe_path = os.fspath(discovered) if discovered else None
         self.ffprobe_timeout_seconds = float(ffprobe_timeout_seconds)
 
-    @property
-    def ffprobe_available(self) -> bool:
-        return bool(self.ffprobe_path)
-
     def inspect(
         self,
         path: str | os.PathLike[str],
@@ -298,29 +294,6 @@ class MediaMetadataExtractor:
                 message="ffprobe returned metadata in an unexpected format.",
             )
         return _metadata_from_ffprobe(payload, media_kind)
-
-
-def inspect_media(
-    path: str | os.PathLike[str],
-    *,
-    extension: str | None = None,
-    ffprobe_path: str | os.PathLike[str] | None = None,
-    discover_ffprobe: bool = True,
-    ffprobe_timeout_seconds: float = DEFAULT_FFPROBE_TIMEOUT_SECONDS,
-    cancel_callback: CancelCallback | None = None,
-) -> MediaMetadata | None:
-    """Convenience wrapper for one-off inspection.
-
-    Drive scans should reuse ``MediaMetadataExtractor`` to avoid repeating the
-    optional executable lookup for every file.
-    """
-
-    return MediaMetadataExtractor(
-        ffprobe_path,
-        discover_ffprobe=discover_ffprobe,
-        ffprobe_timeout_seconds=ffprobe_timeout_seconds,
-    ).inspect(path, extension=extension, cancel_callback=cancel_callback)
-
 
 def _inspect_image(
     path: Path,

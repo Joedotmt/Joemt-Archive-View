@@ -53,7 +53,7 @@ class ConnectedVolumeResolver:
         for snapshot in self.snapshots:
             if snapshot.identity_kind == kind and snapshot.identity_token.casefold() == token.casefold():
                 source_path = path_with_relative(snapshot.mount_root, relative)
-                return source_path if Path(source_path).exists() else None
+                return str(source_path) if source_path.exists() else None
 
         if not self.check_source_path:
             return None
@@ -140,12 +140,12 @@ def volume_identity_known(volume: Any) -> bool:
     return bool(_record_value(volume, "identity_kind") and _record_value(volume, "identity_token"))
 
 
-def path_with_relative(mount_root: str, relative_path: str) -> str:
+def path_with_relative(mount_root: str | Path, relative_path: str) -> Path:
     path = Path(mount_root)
     for part in posixpath.normpath(relative_path or "").split("/"):
         if part not in {"", "."}:
             path /= part
-    return str(path)
+    return path
 
 
 def _record_value(record: Any, key: str) -> str:

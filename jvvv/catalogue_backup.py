@@ -12,15 +12,21 @@ from typing import Any, Callable, Iterable, Mapping
 import zipfile
 
 from . import __version__ as APPLICATION_VERSION
-from .backup_analysis import ANALYSIS_SCHEMA_SQL, BackupAnalysisEngine, RULES_VERSION
+from .backup_analysis import (
+    ANALYSIS_SCHEMA_SQL,
+    ANALYSIS_TABLE_COLUMNS,
+    BackupAnalysisEngine,
+    RULES_VERSION,
+)
 from .database import (
-    CATALOGUE_EXTENSION,
     REQUIRED_COLUMNS,
     REQUIRED_TABLES,
     SCHEMA_VERSION,
     Database,
     catalogue_path_with_extension,
+    sqlite_file_uri,
 )
+from .folder_statistics import calculate_folder_statistics
 
 
 BACKUP_FORMAT = "jvvv-semantic-backup"
@@ -249,120 +255,6 @@ ANALYSIS_AUTOINCREMENT_TABLES = (
     "backup_analysis_runs",
     "backup_analysis_invalidations",
 )
-
-ANALYSIS_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
-    "backup_analysis_runs": (
-        "id",
-        "started_at",
-        "completed_at",
-        "status",
-        "rules_version",
-        "source_signature",
-        "files_analyzed",
-        "folders_analyzed",
-        "likely_files",
-        "possible_files",
-        "ambiguous_files",
-        "excluded_files",
-        "single_files",
-        "message",
-    ),
-    "backup_analysis_state": (
-        "id",
-        "active_run_id",
-        "forced_stale",
-        "stale_reason",
-        "updated_at",
-    ),
-    "backup_analysis_volume_snapshots": (
-        "run_id",
-        "volume_id",
-        "drive_id",
-        "last_scan_at",
-        "indexed_file_count",
-        "indexed_folder_count",
-    ),
-    "backup_file_results": (
-        "run_id",
-        "file_id",
-        "volume_id",
-        "status",
-        "other_volume_ids",
-        "evidence_text",
-        "strong_volume_ids",
-        "possible_volume_ids",
-        "verified_volume_ids",
-    ),
-    "backup_folder_results": (
-        "run_id",
-        "folder_id",
-        "volume_id",
-        "status",
-        "other_volume_ids",
-        "evidence_text",
-        "best_target_volume_id",
-        "matched_files",
-        "total_files",
-        "matched_bytes",
-        "total_bytes",
-        "best_coverage_files_percent",
-        "best_coverage_bytes_percent",
-        "scattered",
-    ),
-    "backup_folder_drive_matches": (
-        "run_id",
-        "folder_id",
-        "target_volume_id",
-        "status",
-        "matched_files",
-        "total_files",
-        "matched_bytes",
-        "total_bytes",
-        "evidence_text",
-    ),
-    "backup_volume_results": (
-        "run_id",
-        "volume_id",
-        "status",
-        "health_status",
-        "coverage_eligible",
-        "total_files",
-        "total_bytes",
-        "coverage_files",
-        "coverage_bytes",
-        "likely_files",
-        "likely_bytes",
-        "possible_files",
-        "possible_bytes",
-        "ambiguous_files",
-        "ambiguous_bytes",
-        "excluded_files",
-        "excluded_bytes",
-        "single_files",
-        "single_bytes",
-        "likely_files_percent",
-        "likely_bytes_percent",
-        "latest_scan_status",
-        "latest_scan_errors",
-    ),
-    "backup_mirror_candidates": (
-        "run_id",
-        "source_volume_id",
-        "target_volume_id",
-        "source_coverage_percent",
-        "target_coverage_percent",
-        "matched_files",
-        "complete_structure",
-        "evidence_text",
-        "manual_mirror_link",
-    ),
-    "backup_analysis_invalidations": (
-        "id",
-        "volume_id",
-        "reason",
-        "created_at",
-    ),
-}
 
 ANALYSIS_SEQUENCE_TABLE = "analysis_sequences"
 ANALYSIS_ACCELERATOR_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -624,20 +516,13 @@ def _quoted_columns(columns: Iterable[str], *, prefix: str = "") -> str:
     return ", ".join(f'{prefix}"{column}"' for column in columns)
 
 
-def _source_uri(path: Path) -> str:
-    resolved = path.resolve(strict=True)
-    uri = resolved.as_uri()
-    if resolved.drive.startswith("\\\\"):
-        uri = f"file:////{uri[len('file://'):]}"
-    return f"{uri}?mode=ro"
-
-
 def _attach_catalogue_read_only(
     connection: sqlite3.Connection,
     source_path: Path,
 ) -> None:
     try:
-        connection.execute("ATTACH DATABASE ? AS original", (_source_uri(source_path),))
+        source_uri = sqlite_file_uri(source_path, mode="ro", strict=True)
+        connection.execute("ATTACH DATABASE ? AS original", (source_uri,))
         return
     except sqlite3.OperationalError as first_error:
         # A cleanly closed WAL-header database on genuinely read-only storage
@@ -651,7 +536,7 @@ def _attach_catalogue_read_only(
         try:
             connection.execute(
                 "ATTACH DATABASE ? AS original",
-                (f"{_source_uri(source_path)}&immutable=1",),
+                (f"{source_uri}&immutable=1",),
             )
         except sqlite3.OperationalError:
             raise first_error
@@ -789,33 +674,7 @@ def _canonical_folder_statistics(
             (volume_id,),
         )
     )
-    stats: dict[int, dict[str, int]] = {}
-    depth_by_id: dict[int, int] = {}
-    parent_by_id: dict[int, int | None] = {}
-    children_by_parent: dict[int, list[int]] = {}
-    for row in folder_rows:
-        folder_id = int(row["id"])
-        relative_path = str(row["relative_path"] or "")
-        parent_id = int(row["parent_id"]) if row["parent_id"] is not None else None
-        stats[folder_id] = {
-            "direct_size": 0,
-            "direct_file_count": 0,
-            "direct_subfolder_count": 0,
-            "recursive_size": 0,
-            "recursive_file_count": 0,
-            "recursive_subfolder_count": 0,
-        }
-        depth_by_id[folder_id] = 0 if not relative_path else relative_path.count("/") + 1
-        parent_by_id[folder_id] = parent_id
-        if parent_id is not None:
-            children_by_parent.setdefault(parent_id, []).append(folder_id)
-
-    for folder_id, children in children_by_parent.items():
-        if folder_id in stats:
-            stats[folder_id]["direct_subfolder_count"] = len(children)
-
-    indexed_file_count = 0
-    for row in connection.execute(
+    direct_file_rows = connection.execute(
         """
         SELECT folder_id, COUNT(*) AS direct_file_count,
                COALESCE(SUM(size_bytes), 0) AS direct_size
@@ -824,33 +683,8 @@ def _canonical_folder_statistics(
         GROUP BY folder_id
         """,
         (volume_id,),
-    ):
-        direct_file_count = int(row["direct_file_count"] or 0)
-        indexed_file_count += direct_file_count
-        if row["folder_id"] is None:
-            continue
-        folder_id = int(row["folder_id"])
-        if folder_id in stats:
-            stats[folder_id]["direct_size"] = int(row["direct_size"] or 0)
-            stats[folder_id]["direct_file_count"] = direct_file_count
-
-    for folder_id in sorted(depth_by_id, key=depth_by_id.get, reverse=True):
-        folder_stats = stats[folder_id]
-        recursive_size = folder_stats["direct_size"]
-        recursive_file_count = folder_stats["direct_file_count"]
-        recursive_subfolder_count = folder_stats["direct_subfolder_count"]
-        for child_id in children_by_parent.get(folder_id, ()):
-            child_stats = stats.get(child_id)
-            if child_stats is None:
-                continue
-            recursive_size += child_stats["recursive_size"]
-            recursive_file_count += child_stats["recursive_file_count"]
-            recursive_subfolder_count += child_stats["recursive_subfolder_count"]
-        folder_stats["recursive_size"] = recursive_size
-        folder_stats["recursive_file_count"] = recursive_file_count
-        folder_stats["recursive_subfolder_count"] = recursive_subfolder_count
-
-    duplicate_rows = connection.execute(
+    )
+    duplicate_file_rows = connection.execute(
         """
         WITH duplicate_identities AS (
             SELECT identity_device, identity_inode, MAX(size_bytes) AS size_bytes
@@ -870,34 +704,11 @@ def _canonical_folder_statistics(
         """,
         (volume_id, volume_id),
     )
-    current_identity: tuple[int, int] | None = None
-    current_size = 0
-    ancestor_counts: dict[int, int] = {}
-
-    def apply_identity_group() -> None:
-        if current_identity is None:
-            return
-        for folder_id, count in ancestor_counts.items():
-            if count > 1 and folder_id in stats:
-                stats[folder_id]["recursive_size"] -= (count - 1) * current_size
-
-    for row in duplicate_rows:
-        identity = (int(row["identity_device"]), int(row["identity_inode"]))
-        if identity != current_identity:
-            apply_identity_group()
-            current_identity = identity
-            current_size = int(row["size_bytes"] or 0)
-            ancestor_counts = {}
-        current = int(row["folder_id"])
-        visited: set[int] = set()
-        while current in stats and current not in visited:
-            visited.add(current)
-            ancestor_counts[current] = ancestor_counts.get(current, 0) + 1
-            parent = parent_by_id.get(current)
-            if parent is None:
-                break
-            current = parent
-    apply_identity_group()
+    stats, indexed_file_count = calculate_folder_statistics(
+        folder_rows,
+        direct_file_rows,
+        duplicate_file_rows,
+    )
 
     canonical = {
         folder_id: (

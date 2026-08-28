@@ -10,6 +10,9 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
+from .backup_analysis import ANALYSIS_SCHEMA_SQL, ANALYSIS_TABLE_COLUMNS
+from .folder_statistics import calculate_folder_statistics
+
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
 SCHEMA_VERSION = 11
@@ -30,16 +33,7 @@ WINDOWS_DRIVE_REMOTE = 4
 SQLITE_EXTENDED_ERROR_NAMES = {
     8714: "SQLITE_IOERR_IN_PAGE",
 }
-REQUIRED_TABLES = {
-    "backup_analysis_invalidations",
-    "backup_analysis_runs",
-    "backup_analysis_state",
-    "backup_analysis_volume_snapshots",
-    "backup_file_results",
-    "backup_folder_drive_matches",
-    "backup_folder_results",
-    "backup_mirror_candidates",
-    "backup_volume_results",
+REQUIRED_TABLES = set(ANALYSIS_TABLE_COLUMNS) | {
     "volumes",
     "volume_register",
     "folders",
@@ -51,112 +45,7 @@ REQUIRED_TABLES = {
     "scan_errors",
 }
 REQUIRED_COLUMNS = {
-    "backup_analysis_runs": {
-        "id",
-        "started_at",
-        "completed_at",
-        "status",
-        "rules_version",
-        "source_signature",
-        "files_analyzed",
-        "folders_analyzed",
-        "likely_files",
-        "possible_files",
-        "ambiguous_files",
-        "excluded_files",
-        "single_files",
-        "message",
-    },
-    "backup_analysis_state": {
-        "id",
-        "active_run_id",
-        "forced_stale",
-        "stale_reason",
-        "updated_at",
-    },
-    "backup_analysis_volume_snapshots": {
-        "run_id",
-        "volume_id",
-        "drive_id",
-        "last_scan_at",
-        "indexed_file_count",
-        "indexed_folder_count",
-    },
-    "backup_file_results": {
-        "run_id",
-        "file_id",
-        "volume_id",
-        "status",
-        "other_volume_ids",
-        "evidence_text",
-        "strong_volume_ids",
-        "possible_volume_ids",
-        "verified_volume_ids",
-    },
-    "backup_folder_results": {
-        "run_id",
-        "folder_id",
-        "volume_id",
-        "status",
-        "other_volume_ids",
-        "evidence_text",
-        "best_target_volume_id",
-        "matched_files",
-        "total_files",
-        "matched_bytes",
-        "total_bytes",
-        "best_coverage_files_percent",
-        "best_coverage_bytes_percent",
-        "scattered",
-    },
-    "backup_folder_drive_matches": {
-        "run_id",
-        "folder_id",
-        "target_volume_id",
-        "status",
-        "matched_files",
-        "total_files",
-        "matched_bytes",
-        "total_bytes",
-        "evidence_text",
-    },
-    "backup_volume_results": {
-        "run_id",
-        "volume_id",
-        "status",
-        "health_status",
-        "coverage_eligible",
-        "total_files",
-        "total_bytes",
-        "coverage_files",
-        "coverage_bytes",
-        "likely_files",
-        "likely_bytes",
-        "possible_files",
-        "possible_bytes",
-        "ambiguous_files",
-        "ambiguous_bytes",
-        "excluded_files",
-        "excluded_bytes",
-        "single_files",
-        "single_bytes",
-        "likely_files_percent",
-        "likely_bytes_percent",
-        "latest_scan_status",
-        "latest_scan_errors",
-    },
-    "backup_mirror_candidates": {
-        "run_id",
-        "source_volume_id",
-        "target_volume_id",
-        "source_coverage_percent",
-        "target_coverage_percent",
-        "matched_files",
-        "complete_structure",
-        "evidence_text",
-        "manual_mirror_link",
-    },
-    "backup_analysis_invalidations": {"id", "volume_id", "reason", "created_at"},
+    **{table: set(columns) for table, columns in ANALYSIS_TABLE_COLUMNS.items()},
     "volumes": {
         "id",
         "name",
@@ -453,6 +342,22 @@ class UnsupportedCatalogueError(CatalogueError):
 FolderStatsProgress = Callable[[int, int, str], None]
 
 
+def sqlite_file_uri(
+    path: Path,
+    *,
+    mode: str = "rw",
+    strict: bool = False,
+) -> str:
+    """Return a SQLite file URI, including Windows UNC path handling."""
+    resolved = path.resolve(strict=strict)
+    uri = resolved.as_uri()
+    if resolved.drive.startswith("\\\\"):
+        # pathlib represents a UNC host as a file-URI authority, but SQLite
+        # rejects non-local authorities. Keep the UNC name in the URI path.
+        uri = f"file:////{uri[len('file://'):]}"
+    return f"{uri}?mode={mode}"
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime(ISO_FORMAT)
 
@@ -570,7 +475,7 @@ class Database:
         else:
             if not self.path.is_file():
                 raise InvalidCatalogueError(f"Catalogue file does not exist: {self.path}")
-            connect_target = self._sqlite_uri(
+            connect_target = sqlite_file_uri(
                 self.path,
                 mode="ro" if self.read_only else "rw",
             )
@@ -606,16 +511,6 @@ class Database:
                 self.connection.rollback()
         finally:
             self.connection.close()
-
-    @staticmethod
-    def _sqlite_uri(path: Path, *, mode: str = "rw") -> str:
-        resolved = path.resolve(strict=False)
-        uri = resolved.as_uri()
-        if resolved.drive.startswith("\\\\"):
-            # pathlib represents a UNC host as a file-URI authority, but SQLite
-            # rejects non-local authorities. Keep the UNC name in the URI path.
-            uri = f"file:////{uri[len('file://'):]}"
-        return f"{uri}?mode={mode}"
 
     @staticmethod
     def _uses_network_storage(path: Path) -> bool:
@@ -733,10 +628,6 @@ class Database:
             self.connection.execute("BEGIN IMMEDIATE")
             for statement in CATALOGUE_SCHEMA_SQL:
                 self.connection.execute(statement)
-
-            # Imported here to keep the core database module independent from
-            # the analysis implementation during normal module loading.
-            from .backup_analysis import ANALYSIS_SCHEMA_SQL
 
             for statement in ANALYSIS_SCHEMA_SQL:
                 self.connection.execute(statement)
@@ -991,28 +882,6 @@ class Database:
             if sequence is not None:
                 highest = max(highest, sequence)
         return f"AID-{highest + 1:03d}"
-
-    def _insert_default_volume_register(self, conn: sqlite3.Connection, volume_id: int) -> None:
-        now = utc_now()
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO volume_register (
-                volume_id, drive_id, status, condition, description, connector,
-                date_added, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, '', ?, ?, ?, ?)
-            """,
-            (
-                volume_id,
-                self.next_drive_id(conn),
-                ARCHIVE_STATUSES[0],
-                "Unknown",
-                "Unknown",
-                date.today().isoformat(),
-                now,
-                now,
-            ),
-        )
 
     def _coerce_volume_register(
         self,
@@ -1431,14 +1300,6 @@ class Database:
                 """,
                 (row["earliest"], row["latest"], utc_now(), volume_id),
             )
-
-    def volume_is_connected(self, volume: sqlite3.Row | int) -> bool:
-        row = self.get_volume(volume) if isinstance(volume, int) else volume
-        if not row:
-            return False
-        from .utils import resolve_volume_source_path
-
-        return resolve_volume_source_path(row) is not None
 
     def update_volume_storage(
         self,
@@ -1977,31 +1838,6 @@ class Database:
             if progress_callback:
                 progress_callback(0, total, "Preparing folder statistics")
 
-            stats: dict[int, dict[str, int]] = {}
-            depth_by_id: dict[int, int] = {}
-            parent_by_id: dict[int, int | None] = {}
-            children_by_parent: dict[int, list[int]] = {}
-            for row in folder_rows:
-                folder_id = int(row["id"])
-                relative_path = row["relative_path"] or ""
-                parent_id = row["parent_id"]
-                stats[folder_id] = {
-                    "direct_size": 0,
-                    "direct_file_count": 0,
-                    "direct_subfolder_count": 0,
-                    "recursive_size": 0,
-                    "recursive_file_count": 0,
-                    "recursive_subfolder_count": 0,
-                }
-                depth_by_id[folder_id] = 0 if not relative_path else relative_path.count("/") + 1
-                parent_by_id[folder_id] = int(parent_id) if parent_id is not None else None
-                if parent_id is not None:
-                    children_by_parent.setdefault(int(parent_id), []).append(folder_id)
-
-            for folder_id, children in children_by_parent.items():
-                if folder_id in stats:
-                    stats[folder_id]["direct_subfolder_count"] = len(children)
-
             direct_file_rows = conn.execute(
                 """
                 SELECT
@@ -2016,34 +1852,44 @@ class Database:
                 """,
                 (volume_id,),
             )
-            for row in direct_file_rows:
-                folder_id = int(row["folder_id"])
-                if folder_id in stats:
-                    stats[folder_id]["direct_size"] = int(row["direct_size"] or 0)
-                    stats[folder_id]["direct_file_count"] = int(row["direct_file_count"] or 0)
-
-            processed = 0
-            for folder_id in sorted(depth_by_id, key=lambda key: depth_by_id[key], reverse=True):
-                folder_stats = stats[folder_id]
-                recursive_size = folder_stats["direct_size"]
-                recursive_file_count = folder_stats["direct_file_count"]
-                recursive_subfolder_count = folder_stats["direct_subfolder_count"]
-                for child_id in children_by_parent.get(folder_id, []):
-                    if child_id not in stats:
-                        continue
-                    child_stats = stats[child_id]
-                    recursive_size += child_stats["recursive_size"]
-                    recursive_file_count += child_stats["recursive_file_count"]
-                    recursive_subfolder_count += child_stats["recursive_subfolder_count"]
-                folder_stats["recursive_size"] = recursive_size
-                folder_stats["recursive_file_count"] = recursive_file_count
-                folder_stats["recursive_subfolder_count"] = recursive_subfolder_count
-
-                processed += 1
-                if progress_callback and (processed == total or processed % 1000 == 0):
-                    progress_callback(processed, total, "Calculating folder statistics")
-
-            self._dedupe_linked_file_sizes(conn, volume_id, stats, parent_by_id)
+            duplicate_file_rows = conn.execute(
+                """
+                WITH duplicate_identities AS (
+                    SELECT
+                        identity_device,
+                        identity_inode,
+                        MAX(size_bytes) AS size_bytes
+                    FROM files
+                    WHERE volume_id = ?
+                      AND missing = 0
+                      AND folder_id IS NOT NULL
+                      AND identity_device IS NOT NULL
+                      AND identity_inode IS NOT NULL
+                    GROUP BY identity_device, identity_inode
+                    HAVING COUNT(*) > 1
+                )
+                SELECT
+                    f.identity_device,
+                    f.identity_inode,
+                    f.folder_id,
+                    d.size_bytes
+                FROM files f
+                JOIN duplicate_identities d
+                  ON d.identity_device = f.identity_device
+                 AND d.identity_inode = f.identity_inode
+                WHERE f.volume_id = ?
+                  AND f.missing = 0
+                  AND f.folder_id IS NOT NULL
+                ORDER BY f.identity_device, f.identity_inode
+                """,
+                (volume_id, volume_id),
+            )
+            stats, _ = calculate_folder_statistics(
+                folder_rows,
+                direct_file_rows,
+                duplicate_file_rows,
+                progress_callback,
+            )
 
             if clear_existing:
                 conn.execute(
@@ -2087,75 +1933,6 @@ class Database:
             if progress_callback:
                 progress_callback(total, total, "Folder statistics updated")
             return total
-
-    def _dedupe_linked_file_sizes(
-        self,
-        conn: sqlite3.Connection,
-        volume_id: int,
-        stats: dict[int, dict[str, int]],
-        parent_by_id: dict[int, int | None],
-    ) -> None:
-        rows = conn.execute(
-            """
-            WITH duplicate_identities AS (
-                SELECT
-                    identity_device,
-                    identity_inode,
-                    MAX(size_bytes) AS size_bytes
-                FROM files
-                WHERE volume_id = ?
-                  AND missing = 0
-                  AND folder_id IS NOT NULL
-                  AND identity_device IS NOT NULL
-                  AND identity_inode IS NOT NULL
-                GROUP BY identity_device, identity_inode
-                HAVING COUNT(*) > 1
-            )
-            SELECT
-                f.identity_device,
-                f.identity_inode,
-                f.folder_id,
-                d.size_bytes
-            FROM files f
-            JOIN duplicate_identities d
-              ON d.identity_device = f.identity_device
-             AND d.identity_inode = f.identity_inode
-            WHERE f.volume_id = ?
-              AND f.missing = 0
-              AND f.folder_id IS NOT NULL
-            ORDER BY f.identity_device, f.identity_inode
-            """,
-            (volume_id, volume_id),
-        )
-
-        current_identity: tuple[int, int] | None = None
-        current_size = 0
-        ancestor_counts: dict[int, int] = {}
-
-        def apply_current_group() -> None:
-            if current_identity is None:
-                return
-            for folder_id, count in ancestor_counts.items():
-                if count > 1:
-                    stats[folder_id]["recursive_size"] -= (count - 1) * current_size
-
-        for row in rows:
-            identity = (int(row["identity_device"]), int(row["identity_inode"]))
-            if identity != current_identity:
-                apply_current_group()
-                current_identity = identity
-                current_size = int(row["size_bytes"] or 0)
-                ancestor_counts = {}
-
-            folder_id = int(row["folder_id"])
-            current = folder_id
-            visited: set[int] = set()
-            while current is not None and current in stats and current not in visited:
-                visited.add(current)
-                ancestor_counts[current] = ancestor_counts.get(current, 0) + 1
-                current = parent_by_id.get(current)
-
-        apply_current_group()
 
     def refresh_volume_counts(self, volume_id: int, scanned_at: str | None = None) -> None:
         file_count = self.connection.execute(
@@ -2500,16 +2277,6 @@ class Database:
         """Recreate the external-content FTS indexes from authoritative rows."""
         with self.transaction():
             self._create_or_rebuild_search_indexes()
-
-    def prune_scan_history(self, keep_per_volume: int = 100) -> None:
-        volume_ids = [row["id"] for row in self.list_volumes()]
-        with self.transaction() as conn:
-            for volume_id in volume_ids:
-                self._prune_scan_history_for_volume(
-                    conn,
-                    volume_id=int(volume_id),
-                    keep=keep_per_volume,
-                )
 
     def _prune_scan_history_for_volume(
         self,

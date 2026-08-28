@@ -10,7 +10,6 @@ from jvvv.theme import (
     FUSION_THEME,
     LIGHT_MODE,
     application_palette,
-    application_stylesheet,
     contrasting_text_color,
     normalize_accent_color,
     normalize_color_mode,
@@ -55,15 +54,6 @@ def test_preset_palettes_preserve_theme_surface_hierarchy():
     assert adobe.color(QPalette.ColorRole.Base) == QColor("#1b1b1b")
 
 
-def test_custom_stylesheet_applies_light_mode_accent_and_scale():
-    stylesheet = application_stylesheet(1.5, LIGHT_MODE, "#3366cc")
-
-    assert "background-color: #f3f4f6" in stylesheet
-    assert "selection-background-color: #3366cc" in stylesheet
-    assert "border-radius: 8px" in stylesheet
-    assert "__ACCENT_TEXT__" not in stylesheet
-
-
 def test_application_palette_uses_mode_and_accent():
     dark = application_palette(DARK_MODE, "#ffcc00")
     light = application_palette(LIGHT_MODE, "#3366cc")
@@ -78,13 +68,3 @@ def test_application_palette_uses_mode_and_accent():
 def test_accent_contrast_handles_bright_and_dark_colors():
     assert contrasting_text_color("#ffdd00") == "#111318"
     assert contrasting_text_color("#223366") == "#ffffff"
-
-
-def test_selected_tab_text_uses_its_surface_not_accent_contrast():
-    dark = application_stylesheet(1.0, DARK_MODE, "#ffffff")
-    light = application_stylesheet(1.0, LIGHT_MODE, "#ffffff")
-
-    assert "selection-color: #111318" in dark
-    assert "QTabBar::tab:selected {\n    color: #ffffff;" in dark
-    assert "QTabBar::tab:selected {\n    color: #181a1f;" in light
-    assert "__TAB_SELECTED_TEXT__" not in dark

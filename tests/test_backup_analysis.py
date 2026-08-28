@@ -109,15 +109,6 @@ def add_catalogued_volume(
     return volume_id, file_ids, folder_ids
 
 
-def object_field(value, *names):
-    for name in names:
-        if hasattr(value, name):
-            return getattr(value, name)
-        if isinstance(value, dict) and name in value:
-            return value[name]
-    raise AssertionError(f"Expected one of these report fields: {', '.join(names)}")
-
-
 def status_text(value) -> str:
     raw = getattr(value, "value", value)
     return str(raw or "").strip().casefold()
@@ -868,47 +859,21 @@ def test_volume_health_distinguishes_clean_empty_error_empty_and_not_scanned(tmp
 
         engine = BackupAnalysisEngine(db)
         assert engine.analyse().status == "completed"
-        summaries = {
-            int(object_field(summary, "volume_id")): summary
-            for summary in engine.volume_summaries()
-        }
+        summaries = {summary.volume_id: summary for summary in engine.volume_summaries()}
 
         clean = summaries[clean_id]
-        assert int(object_field(clean, "total_files", "indexed_files", "file_count")) == 0
-        assert bool(object_field(clean, "coverage_eligible")) is False
-        assert status_text(
-            object_field(clean, "health_status", "status", "scan_health")
-        ) in {"empty", "healthy_empty", "completed_empty"}
-        assert object_field(
-            clean,
-            "strong_files_percent",
-            "file_coverage_percent",
-            "coverage_files_percent",
-        ) is None
+        assert clean.total_files == 0
+        assert clean.coverage_eligible is False
+        assert status_text(clean.health_status) == "empty"
+        assert clean.likely_files_percent is None
 
         errored = summaries[errored_id]
-        assert status_text(
-            object_field(errored, "health_status", "status", "scan_health")
-        ) in {
-            "unknown",
-            "check_scan",
-            "completed_with_errors",
-            "scan_errors",
-            "incomplete",
-        }
-        assert status_text(
-            object_field(errored, "health_status", "status", "scan_health")
-        ) not in {"empty", "healthy_empty", "completed_empty"}
-        assert bool(object_field(errored, "coverage_eligible")) is False
+        assert status_text(errored.health_status) == "completed_with_errors"
+        assert errored.coverage_eligible is False
 
         never_scanned = summaries[never_scanned_id]
-        assert status_text(
-            object_field(never_scanned, "health_status", "status", "scan_health")
-        ) in {"not_scanned", "unknown", "no_applied_scan"}
-        assert status_text(
-            object_field(never_scanned, "health_status", "status", "scan_health")
-        ) not in {"empty", "healthy_empty", "completed_empty"}
-        assert bool(object_field(never_scanned, "coverage_eligible")) is False
+        assert status_text(never_scanned.health_status) == "not_scanned"
+        assert never_scanned.coverage_eligible is False
     finally:
         db.close()
 
@@ -1100,20 +1065,10 @@ def test_scan_report_keeps_latest_attempt_separate_from_last_applied_data(tmp_pa
         )
 
         assert engine.state().is_stale is False
-        records = {
-            int(object_field(record, "volume_id")): record
-            for record in engine.scan_records()
-        }
+        records = {record.volume_id: record for record in engine.scan_records()}
         record = records[volume_id]
-        assert status_text(
-            object_field(record, "latest_attempt_status", "status")
-        ) == "failed"
-        assert object_field(
-            record,
-            "last_applied_at",
-            "applied_scan_at",
-            "catalogue_scan_at",
-        )
+        assert status_text(record.latest_attempt_status) == "failed"
+        assert record.last_applied_at
     finally:
         db.close()
 
@@ -1143,18 +1098,18 @@ def test_later_failed_attempt_does_not_reclassify_clean_applied_empty_drive(tmp_
         summary = next(
             row
             for row in engine.volume_summaries()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
         scan = next(
             row
             for row in engine.scan_records()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
 
-        assert status_text(object_field(summary, "health_status", "scan_health")) == "empty"
-        assert status_text(object_field(scan, "health_status")) == "empty"
-        assert status_text(object_field(scan, "latest_attempt_status", "status")) == "failed"
-        assert object_field(scan, "last_applied_at", "applied_scan_at")
+        assert status_text(summary.health_status) == "empty"
+        assert status_text(scan.health_status) == "empty"
+        assert status_text(scan.latest_attempt_status) == "failed"
+        assert scan.last_applied_at
     finally:
         db.close()
 
@@ -1183,14 +1138,12 @@ def test_populated_volume_with_applied_scan_errors_has_unknown_coverage(tmp_path
         summary = next(
             row
             for row in engine.volume_summaries()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
 
-        assert status_text(object_field(summary, "health_status", "scan_health")) == (
-            "completed_with_errors"
-        )
-        assert bool(object_field(summary, "coverage_eligible")) is False
-        assert status_text(object_field(summary, "status")) == "unknown"
+        assert status_text(summary.health_status) == "completed_with_errors"
+        assert summary.coverage_eligible is False
+        assert status_text(summary.status) == "unknown"
     finally:
         db.close()
 
@@ -1271,42 +1224,14 @@ def test_complete_drive_copy_report_does_not_change_manual_mirror_settings(tmp_p
             candidate
             for candidate in candidates
             if {
-                int(
-                    object_field(
-                        candidate,
-                        "volume_a_id",
-                        "first_volume_id",
-                        "source_volume_id",
-                    )
-                ),
-                int(
-                    object_field(
-                        candidate,
-                        "volume_b_id",
-                        "second_volume_id",
-                        "target_volume_id",
-                    )
-                ),
+                candidate.source_volume_id,
+                candidate.target_volume_id,
             }
             == {first_id, second_id}
         )
-        assert bool(object_field(candidate, "complete", "is_complete", "exact")) is True
-        assert float(
-            object_field(
-                candidate,
-                "a_on_b_percent",
-                "first_on_second_percent",
-                "source_coverage_percent",
-            )
-        ) == 100.0
-        assert float(
-            object_field(
-                candidate,
-                "b_on_a_percent",
-                "second_on_first_percent",
-                "target_coverage_percent",
-            )
-        ) == 100.0
+        assert candidate.complete_structure is True
+        assert candidate.source_coverage_percent == 100.0
+        assert candidate.target_coverage_percent == 100.0
 
         after = {
             volume_id: (
@@ -1384,12 +1309,10 @@ def test_old_scan_errors_do_not_taint_a_later_clean_empty_scan(tmp_path):
         summary = next(
             row
             for row in engine.volume_summaries()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
 
-        assert status_text(
-            object_field(summary, "health_status", "status", "scan_health")
-        ) in {"empty", "healthy_empty", "completed_empty"}
+        assert status_text(summary.health_status) == "empty"
     finally:
         db.close()
 
@@ -1431,17 +1354,17 @@ def test_protected_system_metadata_warning_does_not_make_empty_drive_unhealthy(
         summary = next(
             row
             for row in engine.volume_summaries()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
         scan = next(
             row
             for row in engine.scan_records()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
 
-        assert status_text(object_field(summary, "health_status", "scan_health")) == "empty"
-        assert status_text(object_field(scan, "health_status")) == "empty"
-        assert int(object_field(scan, "latest_attempt_errors")) == 1
+        assert status_text(summary.health_status) == "empty"
+        assert status_text(scan.health_status) == "empty"
+        assert scan.latest_attempt_errors == 1
     finally:
         db.close()
 
@@ -1476,19 +1399,17 @@ def test_user_tree_access_error_still_makes_empty_scan_health_unknown(tmp_path):
         summary = next(
             row
             for row in engine.volume_summaries()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
         scan = next(
             row
             for row in engine.scan_records()
-            if int(object_field(row, "volume_id")) == volume_id
+            if row.volume_id == volume_id
         )
 
-        assert status_text(object_field(summary, "health_status", "scan_health")) == (
-            "completed_with_errors"
-        )
-        assert status_text(object_field(scan, "health_status")) == "completed_with_errors"
-        assert int(object_field(scan, "latest_attempt_errors")) == 1
+        assert status_text(summary.health_status) == "completed_with_errors"
+        assert status_text(scan.health_status) == "completed_with_errors"
+        assert scan.latest_attempt_errors == 1
     finally:
         db.close()
 

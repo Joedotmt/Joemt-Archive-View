@@ -79,13 +79,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import APP_NAME
-from .backup_analysis import (
-    AnalysisState,
-    BackupAnalysisEngine,
-    ItemBackupStatus,
-    MirrorCandidate,
-    VolumeBackupSummary,
-)
+from .backup_analysis import BackupAnalysisEngine
 from .catalogue_backup import (
     BACKUP_FILE_FILTER,
     BackupCancelled,
@@ -99,7 +93,6 @@ from .database import (
     ARCHIVE_STATUSES,
     CATALOGUE_EXTENSION,
     CONNECTOR_OPTIONS,
-    CatalogueError,
     CatalogueInUseError,
     Database,
     VOLUME_CONDITIONS,
@@ -109,6 +102,7 @@ from .database import (
     is_valid_drive_id,
     open_catalogue,
     parse_db_time,
+    sqlite_file_uri,
 )
 from .scanner import VolumeScanner
 from .media_metadata import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
@@ -134,6 +128,7 @@ from .utils import (
     format_size,
     list_connected_volume_snapshots,
     open_in_file_manager,
+    path_with_relative,
     percentage_full,
     rename_volume_label,
     relative_path_for_display,
@@ -194,7 +189,7 @@ def probe_catalogue_location(path: str | Path) -> int:
             return CATALOGUE_PROBE_INVALID
 
         connection = sqlite3.connect(
-            Database._sqlite_uri(catalogue_path, mode="ro"),
+            sqlite_file_uri(catalogue_path, mode="ro"),
             timeout=0.25,
             uri=True,
         )
@@ -427,14 +422,6 @@ def object_value(value: Any, name: str, default: Any = None) -> Any:
         return value[name]
     except (KeyError, IndexError, TypeError):
         return default
-
-
-def first_object_value(value: Any, *names: str, default: Any = None) -> Any:
-    for name in names:
-        candidate = object_value(value, name, None)
-        if candidate is not None:
-            return candidate
-    return default
 
 
 def enum_value(value: Any) -> str:
@@ -711,12 +698,8 @@ def volume_backup_display(
     scan_record: Any = None,
     analysis_state: Any = None,
 ) -> BackupDisplay:
-    current_scan_health = enum_value(
-        first_object_value(scan_record, "health_status", default="")
-    )
-    analysed_health = enum_value(
-        first_object_value(summary, "health_status", "scan_health", default="")
-    )
+    current_scan_health = enum_value(object_value(scan_record, "health_status", ""))
+    analysed_health = enum_value(object_value(summary, "health_status", ""))
     # The report row belongs to the last backup-analysis run, while scan_record
     # describes the catalogue now.  An empty drive's label must follow the live
     # scan record so it cannot repeat an obsolete clean/error classification.
@@ -754,17 +737,9 @@ def volume_backup_display(
             f"{BACKUP_METADATA_DISCLAIMER}",
             2,
         )
-    latest_status = enum_value(
-        first_object_value(scan_record, "latest_attempt_status", "status", default="")
-    )
+    latest_status = enum_value(object_value(scan_record, "latest_attempt_status", ""))
     latest_errors = int(
-        first_object_value(
-            scan_record,
-            "latest_attempt_errors",
-            "errors_count",
-            "access_errors",
-            default=0,
-        )
+        object_value(scan_record, "latest_attempt_errors", 0)
         or 0
     )
     latest_ignored_errors = int(
@@ -854,47 +829,12 @@ def volume_backup_display(
             2,
         )
 
-    total_files = int(
-        first_object_value(summary, "total_files", "indexed_files", "file_count", default=indexed_file_count)
-        or 0
-    )
-    strong_files = int(
-        first_object_value(
-            summary,
-            "likely_files",
-            "strong_files",
-            "matched_files",
-            "protected_files",
-            default=0,
-        )
-        or 0
-    )
-    total_bytes = int(first_object_value(summary, "total_bytes", "indexed_bytes", default=0) or 0)
-    strong_bytes = int(
-        first_object_value(
-            summary,
-            "likely_bytes",
-            "strong_bytes",
-            "matched_bytes",
-            "protected_bytes",
-            default=0,
-        )
-        or 0
-    )
-    files_percent = first_object_value(
-        summary,
-        "likely_files_percent",
-        "strong_files_percent",
-        "file_coverage_percent",
-        "coverage_files_percent",
-    )
-    bytes_percent = first_object_value(
-        summary,
-        "likely_bytes_percent",
-        "strong_bytes_percent",
-        "byte_coverage_percent",
-        "coverage_bytes_percent",
-    )
+    total_files = int(object_value(summary, "total_files", indexed_file_count) or 0)
+    strong_files = int(object_value(summary, "likely_files", 0) or 0)
+    total_bytes = int(object_value(summary, "total_bytes", 0) or 0)
+    strong_bytes = int(object_value(summary, "likely_bytes", 0) or 0)
+    files_percent = object_value(summary, "likely_files_percent")
+    bytes_percent = object_value(summary, "likely_bytes_percent")
     coverage_bytes = int(
         object_value(summary, "coverage_bytes", max(0, total_bytes)) or 0
     )
@@ -995,8 +935,16 @@ def file_category(extension: str) -> str:
     return "unknown"
 
 
+class _FolderTypedItem:
+    item_type: str
+
+    @property
+    def is_folder(self) -> bool:
+        return self.item_type == "folder"
+
+
 @dataclass(frozen=True)
-class BrowserItem:
+class BrowserItem(_FolderTypedItem):
     item_type: str
     item_id: int
     name: str
@@ -1010,23 +958,13 @@ class BrowserItem:
     is_parent_entry: bool = False
     backup: BackupDisplay = NOT_ANALYSED_BACKUP_DISPLAY
 
-    @property
-    def is_folder(self) -> bool:
-        return self.item_type == "folder"
-
-
 @dataclass(frozen=True)
-class CatalogueItemRef:
+class CatalogueItemRef(_FolderTypedItem):
     item_type: str
     item_id: int
     volume_id: int
     relative_path: str
     missing: bool = False
-
-    @property
-    def is_folder(self) -> bool:
-        return self.item_type == "folder"
-
 
 class CatalogueIconProvider:
     CATEGORY_STYLES = {
@@ -1205,7 +1143,7 @@ def volume_item_from_record(
 
 
 @dataclass(frozen=True)
-class SearchResultItem:
+class SearchResultItem(_FolderTypedItem):
     item_type: str
     item_id: int
     name: str
@@ -1219,11 +1157,6 @@ class SearchResultItem:
     source_path: str
     connected: bool
     backup: BackupDisplay = NOT_ANALYSED_BACKUP_DISPLAY
-
-    @property
-    def is_folder(self) -> bool:
-        return self.item_type == "folder"
-
 
 class BrowserTableModel(StandardTableModel):
     def __init__(
@@ -1647,20 +1580,6 @@ def iter_content_date_timestamps(root: Path) -> Iterator[float]:
             continue
 
 
-def guess_content_dates_from_path(source_path: str) -> tuple[str | None, str | None]:
-    if not source_path:
-        return None, None
-    root = Path(source_path)
-    if not root.exists():
-        return None, None
-
-    earliest: str | None = None
-    latest: str | None = None
-    for timestamp in iter_content_date_timestamps(root):
-        earliest, latest = include_content_timestamp(earliest, latest, timestamp)
-    return earliest, latest
-
-
 def set_combo_value(combo: QComboBox, value: str) -> None:
     index = combo.findText(value)
     if index < 0:
@@ -1714,7 +1633,21 @@ class OptionalDateEdit(QWidget):
         self.set_value(None)
 
 
-class DriveIdDialog(QDialog):
+class _ValidatedDialog(QDialog):
+    validation_label: QLabel
+
+    def validate_form(self) -> str | None:
+        raise NotImplementedError
+
+    def accept(self) -> None:
+        message = self.validate_form()
+        if message is not None:
+            self.validation_label.setText(message)
+            return
+        super().accept()
+
+
+class DriveIdDialog(_ValidatedDialog):
     def __init__(
         self,
         parent: QWidget | None,
@@ -1821,15 +1754,7 @@ class DriveIdDialog(QDialog):
             return "Drive IDs must be unique within the catalogue."
         return None
 
-    def accept(self) -> None:
-        message = self.validate_form()
-        if message is not None:
-            self.validation_label.setText(message)
-            return
-        super().accept()
-
-
-class VolumeDialog(QDialog):
+class VolumeDialog(_ValidatedDialog):
     def __init__(
         self,
         parent: QWidget | None = None,
@@ -2178,13 +2103,6 @@ class VolumeDialog(QDialog):
 
         return None
 
-    def accept(self) -> None:
-        message = self.validate_form()
-        if message is not None:
-            self.validation_label.setText(message)
-            return
-        super().accept()
-
     def done(self, result: int) -> None:
         self.stop_content_date_guess()
         super().done(result)
@@ -2490,22 +2408,9 @@ class BackupEvidenceDialog(QDialog):
             state_text += f" · {display_db_time(str(analysed_at))}"
         self.analysis_state_label.setText(state_text)
 
-        total_files = sum(
-            int(first_object_value(row, "total_files", "indexed_files", "file_count", default=0) or 0)
-            for row in summaries
-        )
+        total_files = sum(int(object_value(row, "total_files", 0) or 0) for row in summaries)
         strong_files = sum(
-            int(
-                first_object_value(
-                    row,
-                    "likely_files",
-                    "strong_files",
-                    "matched_files",
-                    "protected_files",
-                    default=0,
-                )
-                or 0
-            )
+            int(object_value(row, "likely_files", 0) or 0)
             for row in summaries
         )
         possible_files = sum(
@@ -2568,40 +2473,16 @@ class BackupEvidenceDialog(QDialog):
         rows = []
         for summary in summaries:
             volume_id = int(object_value(summary, "volume_id", 0) or 0)
-            total_files = int(first_object_value(summary, "total_files", "indexed_files", "file_count", default=0) or 0)
-            strong_files = int(
-                first_object_value(
-                    summary,
-                    "likely_files",
-                    "strong_files",
-                    "matched_files",
-                    "protected_files",
-                    default=0,
-                )
-                or 0
-            )
+            total_files = int(object_value(summary, "total_files", 0) or 0)
+            strong_files = int(object_value(summary, "likely_files", 0) or 0)
             possible_files = int(object_value(summary, "possible_files", 0) or 0)
             ambiguous_files = int(object_value(summary, "ambiguous_files", 0) or 0)
             excluded_files = int(object_value(summary, "excluded_files", 0) or 0)
             summary_status = enum_value(object_value(summary, "status", ""))
-            files_percent = first_object_value(
-                summary,
-                "likely_files_percent",
-                "strong_files_percent",
-                "file_coverage_percent",
-                "coverage_files_percent",
-            )
-            bytes_percent = first_object_value(
-                summary,
-                "likely_bytes_percent",
-                "strong_bytes_percent",
-                "byte_coverage_percent",
-                "coverage_bytes_percent",
-            )
+            files_percent = object_value(summary, "likely_files_percent")
+            bytes_percent = object_value(summary, "likely_bytes_percent")
             stale = analysis_stale or bool(object_value(summary, "is_stale", False))
-            health = enum_value(
-                first_object_value(summary, "health_status", "scan_health", default="")
-            )
+            health = enum_value(object_value(summary, "health_status", ""))
             if stale:
                 status_text = "Outdated"
                 file_text = "Outdated"
@@ -2665,31 +2546,15 @@ class BackupEvidenceDialog(QDialog):
     ) -> None:
         rows = []
         for candidate in mirrors:
-            first_id = int(first_object_value(candidate, "volume_a_id", "first_volume_id", "source_volume_id", default=0) or 0)
-            second_id = int(first_object_value(candidate, "volume_b_id", "second_volume_id", "target_volume_id", default=0) or 0)
-            a_on_b = first_object_value(
-                candidate,
-                "a_on_b_percent",
-                "first_on_second_percent",
-                "source_coverage_percent",
+            first_id = int(object_value(candidate, "source_volume_id", 0) or 0)
+            second_id = int(object_value(candidate, "target_volume_id", 0) or 0)
+            a_on_b = object_value(candidate, "source_coverage_percent")
+            b_on_a = object_value(candidate, "target_coverage_percent")
+            complete = bool(object_value(candidate, "complete_structure", False))
+            reason = str(
+                object_value(candidate, "evidence_text", "Metadata overlap")
+                or "Metadata overlap"
             )
-            b_on_a = first_object_value(
-                candidate,
-                "b_on_a_percent",
-                "second_on_first_percent",
-                "target_coverage_percent",
-            )
-            complete = bool(
-                first_object_value(
-                    candidate,
-                    "complete_structure",
-                    "complete",
-                    "is_complete",
-                    "exact",
-                    default=False,
-                )
-            )
-            reason = str(first_object_value(candidate, "evidence_text", "reason", default="Metadata overlap") or "Metadata overlap")
             if (
                 bool(object_value(candidate, "manual_mirror_link", False))
                 and "manual mirror relationship" not in reason.casefold()
@@ -2719,37 +2584,12 @@ class BackupEvidenceDialog(QDialog):
         rows = []
         for scan in scans:
             volume_id = int(object_value(scan, "volume_id", 0) or 0)
-            status = enum_value(first_object_value(scan, "latest_attempt_status", "status", default="not_scanned"))
-            files = int(
-                first_object_value(
-                    scan,
-                    "latest_attempt_files",
-                    "files_seen",
-                    "indexed_files",
-                    default=0,
-                )
-                or 0
+            status = enum_value(
+                object_value(scan, "latest_attempt_status", "not_scanned")
             )
-            folders = int(
-                first_object_value(
-                    scan,
-                    "latest_attempt_folders",
-                    "folders_seen",
-                    "indexed_folders",
-                    default=0,
-                )
-                or 0
-            )
-            errors = int(
-                first_object_value(
-                    scan,
-                    "latest_attempt_errors",
-                    "errors_count",
-                    "access_errors",
-                    default=0,
-                )
-                or 0
-            )
+            files = int(object_value(scan, "latest_attempt_files", 0) or 0)
+            folders = int(object_value(scan, "latest_attempt_folders", 0) or 0)
+            errors = int(object_value(scan, "latest_attempt_errors", 0) or 0)
             ignored_errors = int(
                 object_value(scan, "latest_attempt_ignored_errors", 0) or 0
             )
@@ -2759,14 +2599,9 @@ class BackupEvidenceDialog(QDialog):
             access_errors = max(0, errors - hash_errors)
             actionable_access_errors = max(0, access_errors - ignored_errors)
             health = enum_value(object_value(scan, "health_status", ""))
-            attempted_at = first_object_value(scan, "started_at", "latest_attempt_at", "last_scan_at")
-            applied_at = first_object_value(
-                scan,
-                "last_applied_at",
-                "applied_scan_at",
-                "catalogue_scan_at",
-            )
-            applied = bool(first_object_value(scan, "applied", "is_applied", default=status == "completed"))
+            attempted_at = object_value(scan, "latest_attempt_at")
+            applied_at = object_value(scan, "last_applied_at")
+            applied = applied_at is not None
             if (
                 status == "completed"
                 and access_errors
@@ -3079,6 +2914,104 @@ class HelpDialog(QDialog):
         """
 
 
+class _SynchronousIoCanceller:
+    """Cancel blocking file I/O on the current worker thread on Windows."""
+
+    def __init__(self) -> None:
+        self._thread_handle: Any | None = None
+
+    def start(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenThread.restype = wintypes.HANDLE
+            # CancelSynchronousIo requires a handle with THREAD_TERMINATE access.
+            self._thread_handle = kernel32.OpenThread(
+                0x0001,
+                False,
+                kernel32.GetCurrentThreadId(),
+            )
+        except Exception:
+            self._thread_handle = None
+
+    def stop(self) -> None:
+        handle = self._thread_handle
+        self._thread_handle = None
+        if os.name != "nt" or not handle:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    def cancel(self) -> None:
+        handle = self._thread_handle
+        if os.name != "nt" or not handle:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+            kernel32.CancelSynchronousIo.restype = wintypes.BOOL
+            kernel32.CancelSynchronousIo(handle)
+        except Exception:
+            pass
+
+
+def _interrupt_database(db: Database | None) -> None:
+    if db is None:
+        return
+    try:
+        db.connection.interrupt()
+    except Exception:
+        pass
+
+
+def _create_worker_thread(
+    parent: QObject,
+    worker: QObject,
+    terminal_signals: tuple[Any, ...],
+    cleanup: Callable[[], None],
+) -> QThread:
+    """Create a worker thread with the shared Qt lifecycle connections."""
+    thread = QThread(parent)
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)  # type: ignore[attr-defined]
+    for signal in terminal_signals:
+        signal.connect(thread.quit)
+        signal.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
+    thread.finished.connect(cleanup)
+    return thread
+
+
+def _wait_for_worker_thread(
+    current_thread: Callable[[], QThread | None],
+) -> bool:
+    """Keep the UI responsive while waiting briefly for cancellation."""
+    for _ in range(50):
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+        thread = current_thread()
+        if thread is None or not thread.isRunning():
+            return True
+        thread.wait(100)
+    return False
+
+
 class ScanWorker(QObject):
     progress = Signal(int, int, str)
     stats_progress = Signal(int, int, str, int, int)
@@ -3093,48 +3026,13 @@ class ScanWorker(QObject):
         self.cancel_requested = False
         self._review_event = Event()
         self._apply_reviewed_changes = False
-        self._windows_thread_handle: Any | None = None
-
-    def _start_cancellable_io(self) -> None:
-        if os.name != "nt":
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-            kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel32.OpenThread.restype = wintypes.HANDLE
-            self._windows_thread_handle = kernel32.OpenThread(
-                0x0001,
-                False,
-                kernel32.GetCurrentThreadId(),
-            )
-        except Exception:
-            self._windows_thread_handle = None
-
-    def _stop_cancellable_io(self) -> None:
-        handle = self._windows_thread_handle
-        self._windows_thread_handle = None
-        if os.name != "nt" or not handle:
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle.restype = wintypes.BOOL
-            kernel32.CloseHandle(handle)
-        except Exception:
-            pass
+        self._io_canceller = _SynchronousIoCanceller()
 
     @Slot()
     def run(self) -> None:
         db: Database | None = None
         try:
-            self._start_cancellable_io()
+            self._io_canceller.start()
             db = Database(self.db_path)
             scanner = VolumeScanner(
                 db,
@@ -3170,7 +3068,7 @@ class ScanWorker(QObject):
         finally:
             if db is not None:
                 db.close()
-            self._stop_cancellable_io()
+            self._io_canceller.stop()
 
     def request_review(self, changes) -> bool:
         self._apply_reviewed_changes = False
@@ -3187,19 +3085,7 @@ class ScanWorker(QObject):
     def cancel(self) -> None:
         self.cancel_requested = True
         self._review_event.set()
-        handle = self._windows_thread_handle
-        if os.name != "nt" or not handle:
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
-            kernel32.CancelSynchronousIo.restype = wintypes.BOOL
-            kernel32.CancelSynchronousIo(handle)
-        except Exception:
-            pass
+        self._io_canceller.cancel()
 
 
 class DeleteVolumeWorker(QObject):
@@ -3232,28 +3118,44 @@ class DeleteVolumeWorker(QObject):
             self.failed.emit(error_details)
 
 
-class CatalogueBackupWorker(QObject):
+class _CancellableWorker(QObject):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+
+class _CatalogueArchiveWorker(_CancellableWorker):
     progress = Signal(object, object, str)
     finished = Signal(object)
     cancelled = Signal()
     failed = Signal(object, str)
 
-    def __init__(self, source_path: Path, backup_path: Path, *, overwrite: bool) -> None:
+    def __init__(
+        self,
+        source_path: Path,
+        target_path: Path,
+        *,
+        overwrite: bool,
+        operation: Callable[..., BackupResult | RestoreResult],
+    ) -> None:
         super().__init__()
         self.source_path = source_path
-        self.backup_path = backup_path
+        self.target_path = target_path
         self.overwrite = overwrite
-        self.cancel_requested = False
+        self.operation = operation
 
     @Slot()
     def run(self) -> None:
-        result: BackupResult | None = None
+        result: BackupResult | RestoreResult | None = None
         error: Exception | None = None
         details = ""
         try:
-            result = create_catalogue_backup(
+            result = self.operation(
                 self.source_path,
-                self.backup_path,
+                self.target_path,
                 overwrite=self.overwrite,
                 progress_callback=self._report_progress,
                 cancel_callback=lambda: self.cancel_requested,
@@ -3274,66 +3176,44 @@ class CatalogueBackupWorker(QObject):
     def _report_progress(self, progress: BackupProgress) -> None:
         self.progress.emit(progress.completed, progress.total, progress.message)
 
-    def cancel(self) -> None:
-        self.cancel_requested = True
+class CatalogueBackupWorker(_CatalogueArchiveWorker):
+    def __init__(self, source_path: Path, backup_path: Path, *, overwrite: bool) -> None:
+        super().__init__(
+            source_path,
+            backup_path,
+            overwrite=overwrite,
+            operation=create_catalogue_backup,
+        )
+        self.backup_path = backup_path
 
 
-class CatalogueRestoreWorker(QObject):
-    progress = Signal(object, object, str)
-    finished = Signal(object)
-    cancelled = Signal()
-    failed = Signal(object, str)
-
+class CatalogueRestoreWorker(_CatalogueArchiveWorker):
     def __init__(self, backup_path: Path, catalogue_path: Path, *, overwrite: bool) -> None:
-        super().__init__()
+        super().__init__(
+            backup_path,
+            catalogue_path,
+            overwrite=overwrite,
+            operation=restore_catalogue_backup,
+        )
         self.backup_path = backup_path
         self.catalogue_path = catalogue_path
-        self.overwrite = overwrite
-        self.cancel_requested = False
-
-    @Slot()
-    def run(self) -> None:
-        result: RestoreResult | None = None
-        error: Exception | None = None
-        details = ""
-        try:
-            result = restore_catalogue_backup(
-                self.backup_path,
-                self.catalogue_path,
-                overwrite=self.overwrite,
-                progress_callback=self._report_progress,
-                cancel_callback=lambda: self.cancel_requested,
-            )
-        except BackupCancelled:
-            self.cancel_requested = True
-        except Exception as exc:
-            error = exc
-            details = traceback.format_exc()
-
-        if self.cancel_requested:
-            self.cancelled.emit()
-        elif error is not None:
-            self.failed.emit(error, details)
-        elif result is not None:
-            self.finished.emit(result)
-
-    def _report_progress(self, progress: BackupProgress) -> None:
-        self.progress.emit(progress.completed, progress.total, progress.message)
-
-    def cancel(self) -> None:
-        self.cancel_requested = True
 
 
-class CatalogueInfoWorker(QObject):
-    finished = Signal(object)
-    cancelled = Signal()
-    failed = Signal(str)
-
+class _DatabaseWorker(_CancellableWorker):
     def __init__(self, db_path: Path) -> None:
         super().__init__()
         self.db_path = db_path
-        self.cancel_requested = False
         self._active_db: Database | None = None
+
+    def cancel(self) -> None:
+        super().cancel()
+        _interrupt_database(self._active_db)
+
+
+class CatalogueInfoWorker(_DatabaseWorker):
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
 
     @Slot()
     def run(self) -> None:
@@ -3370,27 +3250,11 @@ class CatalogueInfoWorker(QObject):
         else:
             self.finished.emit(info)
 
-    def cancel(self) -> None:
-        self.cancel_requested = True
-        db = self._active_db
-        if db is not None:
-            try:
-                db.connection.interrupt()
-            except Exception:
-                pass
-
-
-class BackupAnalysisWorker(QObject):
+class BackupAnalysisWorker(_DatabaseWorker):
     progress = Signal(int, int, str)
     finished = Signal(object)
     cancelled = Signal()
     failed = Signal(str)
-
-    def __init__(self, db_path: Path) -> None:
-        super().__init__()
-        self.db_path = db_path
-        self.cancel_requested = False
-        self._active_db: Database | None = None
 
     @Slot()
     def run(self) -> None:
@@ -3398,8 +3262,6 @@ class BackupAnalysisWorker(QObject):
         summary: Any = None
         error_details: str | None = None
         try:
-            if BackupAnalysisEngine is None:
-                raise RuntimeError("Backup analysis support is unavailable in this build.")
             db = Database(
                 self.db_path,
                 initialize=False,
@@ -3450,17 +3312,7 @@ class BackupAnalysisWorker(QObject):
         else:
             self.finished.emit(summary)
 
-    def cancel(self) -> None:
-        self.cancel_requested = True
-        db = self._active_db
-        if db is not None:
-            try:
-                db.connection.interrupt()
-            except Exception:
-                pass
-
-
-class SearchWorker(QObject):
+class SearchWorker(_CancellableWorker):
     batch_ready = Signal(int, list)
     finished = Signal(int, int)
     cancelled = Signal(int)
@@ -3483,7 +3335,6 @@ class SearchWorker(QObject):
         self.connected_volume_snapshots = connected_volume_snapshots
         self.include_paths = include_paths
         self.backup_filter_key = backup_filter_key
-        self.cancel_requested = False
 
     def _build_batch(
         self,
@@ -3569,7 +3420,7 @@ class SearchWorker(QObject):
                 }
             except (AttributeError, TypeError):
                 volume_references = {}
-            engine = BackupAnalysisEngine(db) if BackupAnalysisEngine is not None else None
+            engine = BackupAnalysisEngine(db)
             connected_by_volume: dict[int, bool] = {}
             raw_batch: list[Any] = []
             for result in db.iter_search(
@@ -3617,10 +3468,6 @@ class SearchWorker(QObject):
         else:
             self.finished.emit(self.request_id, result_count)
 
-    def cancel(self) -> None:
-        self.cancel_requested = True
-
-
 class _CatalogueOpenCancelled(Exception):
     pass
 
@@ -3636,43 +3483,7 @@ class CatalogueOpenWorker(QObject):
         self.path = path
         self.cancel_requested = False
         self._active_db: Database | None = None
-        self._windows_thread_handle: Any | None = None
-
-    def _start_cancellable_io(self) -> None:
-        if os.name != "nt":
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-            kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel32.OpenThread.restype = wintypes.HANDLE
-            # CancelSynchronousIo requires a handle with THREAD_TERMINATE access.
-            self._windows_thread_handle = kernel32.OpenThread(
-                0x0001,
-                False,
-                kernel32.GetCurrentThreadId(),
-            )
-        except Exception:
-            self._windows_thread_handle = None
-
-    def _stop_cancellable_io(self) -> None:
-        handle = self._windows_thread_handle
-        self._windows_thread_handle = None
-        if os.name != "nt" or not handle:
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle.restype = wintypes.BOOL
-            kernel32.CloseHandle(handle)
-        except Exception:
-            pass
+        self._io_canceller = _SynchronousIoCanceller()
 
     def _check_cancelled(self) -> None:
         if self.cancel_requested:
@@ -3685,7 +3496,7 @@ class CatalogueOpenWorker(QObject):
         result: tuple[Database, list[VolumeItem], list[VolumeSnapshot], QLockFile] | None = None
         error: Exception | None = None
         was_cancelled = False
-        self._start_cancellable_io()
+        self._io_canceller.start()
         try:
             self._check_cancelled()
             self.progress.emit(0, 0, "Acquiring catalogue lock...")
@@ -3734,7 +3545,7 @@ class CatalogueOpenWorker(QObject):
                 db.close()
             if lock is not None:
                 lock.unlock()
-            self._stop_cancellable_io()
+            self._io_canceller.stop()
 
         if result is not None:
             self.finished.emit(*result)
@@ -3745,26 +3556,8 @@ class CatalogueOpenWorker(QObject):
 
     def cancel(self) -> None:
         self.cancel_requested = True
-        db = self._active_db
-        if db is not None:
-            try:
-                db.connection.interrupt()
-            except Exception:
-                pass
-
-        handle = self._windows_thread_handle
-        if os.name != "nt" or not handle:
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
-            kernel32.CancelSynchronousIo.restype = wintypes.BOOL
-            kernel32.CancelSynchronousIo(handle)
-        except Exception:
-            pass
+        _interrupt_database(self._active_db)
+        self._io_canceller.cancel()
 
 
 class MainWindow(QMainWindow):
@@ -3904,19 +3697,20 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _build_menu_bar(self) -> None:
-        file_menu = self.menuBar().addMenu("&File")
+        self.app_menu_bar = self.menuBar()
+        self.file_menu = self.app_menu_bar.addMenu("&File")
 
         self.new_catalogue_action = QAction("New Catalogue\u2026", self)
         self.new_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.New))
         self.new_catalogue_action.triggered.connect(self.new_catalogue)
-        file_menu.addAction(self.new_catalogue_action)
+        self.file_menu.addAction(self.new_catalogue_action)
 
         self.open_catalogue_action = QAction("Open Catalogue\u2026", self)
         self.open_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Open))
         self.open_catalogue_action.triggered.connect(self.open_catalogue_from_dialog)
-        file_menu.addAction(self.open_catalogue_action)
+        self.file_menu.addAction(self.open_catalogue_action)
 
-        file_menu.addSeparator()
+        self.file_menu.addSeparator()
 
         self.create_catalogue_backup_action = QAction(
             "Create Catalogue Backup\u2026",
@@ -3925,7 +3719,7 @@ class MainWindow(QMainWindow):
         self.create_catalogue_backup_action.triggered.connect(
             self.create_catalogue_backup_from_dialog
         )
-        file_menu.addAction(self.create_catalogue_backup_action)
+        self.file_menu.addAction(self.create_catalogue_backup_action)
 
         self.restore_catalogue_backup_action = QAction(
             "Restore Catalogue from Backup\u2026",
@@ -3934,68 +3728,71 @@ class MainWindow(QMainWindow):
         self.restore_catalogue_backup_action.triggered.connect(
             self.restore_catalogue_backup_from_dialog
         )
-        file_menu.addAction(self.restore_catalogue_backup_action)
+        self.file_menu.addAction(self.restore_catalogue_backup_action)
 
-        file_menu.addSeparator()
+        self.file_menu.addSeparator()
 
         self.open_catalogue_location_action = QAction("Open Catalogue Location", self)
         self.open_catalogue_location_action.triggered.connect(self.open_catalogue_location)
-        file_menu.addAction(self.open_catalogue_location_action)
+        self.file_menu.addAction(self.open_catalogue_location_action)
 
         self.close_catalogue_action = QAction("Close Catalogue", self)
         self.close_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Close))
         self.close_catalogue_action.triggered.connect(lambda: self.close_catalogue())
-        file_menu.addAction(self.close_catalogue_action)
+        self.file_menu.addAction(self.close_catalogue_action)
 
-        file_menu.addSeparator()
+        self.file_menu.addSeparator()
 
         self.exit_action = QAction("Exit", self)
         self.exit_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Quit))
         self.exit_action.setMenuRole(QAction.MenuRole.QuitRole)
         self.exit_action.triggered.connect(QApplication.instance().quit)
-        file_menu.addAction(self.exit_action)
+        self.file_menu.addAction(self.exit_action)
 
-        catalogue_menu = self.menuBar().addMenu("&Catalogue")
+        self.catalogue_menu = self.app_menu_bar.addMenu("&Catalogue")
 
         self.new_volume_action = QAction("New Volume\u2026", self)
         self.new_volume_action.triggered.connect(self.add_volume)
-        catalogue_menu.addAction(self.new_volume_action)
+        self.catalogue_menu.addAction(self.new_volume_action)
 
-        catalogue_menu.addSeparator()
+        self.catalogue_menu.addSeparator()
 
         self.backup_evidence_action = QAction("Backup Evidence\u2026", self)
         self.backup_evidence_action.triggered.connect(self.show_backup_evidence)
         self.backup_evidence_action.setToolTip(
             "Compare metadata already saved in this catalogue; no drives are rescanned"
         )
-        catalogue_menu.addAction(self.backup_evidence_action)
+        self.catalogue_menu.addAction(self.backup_evidence_action)
 
         self.catalogue_info_action = QAction("Catalogue Info\u2026", self)
         self.catalogue_info_action.triggered.connect(self.show_catalogue_info)
-        catalogue_menu.addAction(self.catalogue_info_action)
+        self.catalogue_menu.addAction(self.catalogue_info_action)
 
-        view_menu = self.menuBar().addMenu("&View")
+        self.view_menu = self.app_menu_bar.addMenu("&View")
         self.zoom_in_action = QAction("Zoom In", self)
         self.zoom_in_action.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+=")])
         self.zoom_in_action.triggered.connect(self.zoom_in)
-        view_menu.addAction(self.zoom_in_action)
+        self.view_menu.addAction(self.zoom_in_action)
 
         self.zoom_out_action = QAction("Zoom Out", self)
         self.zoom_out_action.setShortcut("Ctrl + -")
         self.zoom_out_action.triggered.connect(self.zoom_out)
-        view_menu.addAction(self.zoom_out_action)
+        self.view_menu.addAction(self.zoom_out_action)
 
-        settings_menu = self.menuBar().addMenu("&Settings")
+        self.settings_menu = self.app_menu_bar.addMenu("&Settings")
         self.preferences_action = QAction("Preferences\u2026", self)
         self.preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
         self.preferences_action.triggered.connect(self.show_preferences)
-        settings_menu.addAction(self.preferences_action)
+        self.settings_menu.addAction(self.preferences_action)
 
-        help_menu = self.menuBar().addMenu("&Help")
+        self.help_menu = self.app_menu_bar.addMenu("&Help")
         self.help_action = QAction("Help", self)
         self.help_action.setShortcut(QKeySequence(QKeySequence.StandardKey.HelpContents))
         self.help_action.triggered.connect(self.show_help)
-        help_menu.addAction(self.help_action)
+        self.help_menu.addAction(self.help_action)
+        # Some Qt platform plugins require the PySide menu-action wrappers to
+        # stay alive alongside their C++ owners.
+        self.menu_actions = self.app_menu_bar.actions()
 
     def zoom_in(self) -> None:
         self.set_ui_zoom(self.ui_zoom + UI_ZOOM_STEP)
@@ -4865,7 +4662,7 @@ class MainWindow(QMainWindow):
         if dialog is None or self.db is None:
             return
         engine = getattr(self, "backup_engine", None)
-        if engine is None and BackupAnalysisEngine is not None:
+        if engine is None:
             try:
                 engine = BackupAnalysisEngine(self.db)
                 engine.ensure_schema()
@@ -4914,14 +4711,6 @@ class MainWindow(QMainWindow):
         if self.scan_worker is not None or self.delete_worker is not None:
             self._show_catalogue_job_running_message()
             return
-        if BackupAnalysisEngine is None:
-            QMessageBox.warning(
-                self,
-                "Backup Analysis Unavailable",
-                "Backup analysis support is unavailable in this build.",
-            )
-            return
-
         if self.backup_evidence_dialog is not None:
             self.backup_evidence_dialog.set_analysis_running(True)
         self.scan_progress.setRange(0, 0)
@@ -4930,22 +4719,21 @@ class MainWindow(QMainWindow):
             "Analysing saved catalogue evidence; no drives are being read…"
         )
 
-        self.backup_analysis_thread = QThread(self)
         self.backup_analysis_worker = BackupAnalysisWorker(self.db.path)
-        self.backup_analysis_worker.moveToThread(self.backup_analysis_thread)
-        self.backup_analysis_thread.started.connect(self.backup_analysis_worker.run)
         self.backup_analysis_worker.progress.connect(self.on_backup_analysis_progress)
         self.backup_analysis_worker.finished.connect(self.on_backup_analysis_finished)
         self.backup_analysis_worker.cancelled.connect(self.on_backup_analysis_cancelled)
         self.backup_analysis_worker.failed.connect(self.on_backup_analysis_failed)
-        self.backup_analysis_worker.finished.connect(self.backup_analysis_thread.quit)
-        self.backup_analysis_worker.cancelled.connect(self.backup_analysis_thread.quit)
-        self.backup_analysis_worker.failed.connect(self.backup_analysis_thread.quit)
-        self.backup_analysis_worker.finished.connect(self.backup_analysis_worker.deleteLater)
-        self.backup_analysis_worker.cancelled.connect(self.backup_analysis_worker.deleteLater)
-        self.backup_analysis_worker.failed.connect(self.backup_analysis_worker.deleteLater)
-        self.backup_analysis_thread.finished.connect(self.backup_analysis_thread.deleteLater)
-        self.backup_analysis_thread.finished.connect(self.clear_backup_analysis_worker)
+        self.backup_analysis_thread = _create_worker_thread(
+            self,
+            self.backup_analysis_worker,
+            (
+                self.backup_analysis_worker.finished,
+                self.backup_analysis_worker.cancelled,
+                self.backup_analysis_worker.failed,
+            ),
+            self.clear_backup_analysis_worker,
+        )
         self.backup_analysis_thread.start()
 
     @Slot(int, int, str)
@@ -5059,21 +4847,20 @@ class MainWindow(QMainWindow):
         self.scan_progress.setFormat("Loading catalogue info...")
         self.statusBar().showMessage("Loading catalogue info...")
 
-        self.catalogue_info_thread = QThread(self)
         self.catalogue_info_worker = CatalogueInfoWorker(db_path)
-        self.catalogue_info_worker.moveToThread(self.catalogue_info_thread)
-        self.catalogue_info_thread.started.connect(self.catalogue_info_worker.run)
         self.catalogue_info_worker.finished.connect(self.on_catalogue_info_finished)
         self.catalogue_info_worker.cancelled.connect(self.on_catalogue_info_cancelled)
         self.catalogue_info_worker.failed.connect(self.on_catalogue_info_failed)
-        self.catalogue_info_worker.finished.connect(self.catalogue_info_thread.quit)
-        self.catalogue_info_worker.cancelled.connect(self.catalogue_info_thread.quit)
-        self.catalogue_info_worker.failed.connect(self.catalogue_info_thread.quit)
-        self.catalogue_info_worker.finished.connect(self.catalogue_info_worker.deleteLater)
-        self.catalogue_info_worker.cancelled.connect(self.catalogue_info_worker.deleteLater)
-        self.catalogue_info_worker.failed.connect(self.catalogue_info_worker.deleteLater)
-        self.catalogue_info_thread.finished.connect(self.catalogue_info_thread.deleteLater)
-        self.catalogue_info_thread.finished.connect(self.clear_catalogue_info_worker)
+        self.catalogue_info_thread = _create_worker_thread(
+            self,
+            self.catalogue_info_worker,
+            (
+                self.catalogue_info_worker.finished,
+                self.catalogue_info_worker.cancelled,
+                self.catalogue_info_worker.failed,
+            ),
+            self.clear_catalogue_info_worker,
+        )
         self.catalogue_info_thread.start()
 
     @Slot(object)
@@ -5265,10 +5052,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         self.catalogue_archive_operation = operation
         self.pending_restored_catalogue_path = None
-        self.catalogue_archive_thread = QThread(self)
         self.catalogue_archive_worker = worker
-        worker.moveToThread(self.catalogue_archive_thread)
-        self.catalogue_archive_thread.started.connect(worker.run)
         worker.progress.connect(self.on_catalogue_archive_progress)
         if operation == "backup":
             worker.finished.connect(self.on_catalogue_backup_finished)
@@ -5276,17 +5060,11 @@ class MainWindow(QMainWindow):
             worker.finished.connect(self.on_catalogue_restore_finished)
         worker.cancelled.connect(self.on_catalogue_archive_cancelled)
         worker.failed.connect(self.on_catalogue_archive_failed)
-        worker.finished.connect(self.catalogue_archive_thread.quit)
-        worker.cancelled.connect(self.catalogue_archive_thread.quit)
-        worker.failed.connect(self.catalogue_archive_thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.cancelled.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        self.catalogue_archive_thread.finished.connect(
-            self.catalogue_archive_thread.deleteLater
-        )
-        self.catalogue_archive_thread.finished.connect(
-            self.clear_catalogue_archive_worker
+        self.catalogue_archive_thread = _create_worker_thread(
+            self,
+            worker,
+            (worker.finished, worker.cancelled, worker.failed),
+            self.clear_catalogue_archive_worker,
         )
         self._set_catalogue_archive_running(True)
         self.catalogue_archive_thread.start()
@@ -5558,22 +5336,21 @@ class MainWindow(QMainWindow):
         self.catalogue_loading_progress.setFormat("Acquiring catalogue lock...")
         self.statusBar().showMessage("Opening catalogue...")
 
-        self.catalogue_open_thread = QThread(self)
         self.catalogue_open_worker = CatalogueOpenWorker(path)
-        self.catalogue_open_worker.moveToThread(self.catalogue_open_thread)
-        self.catalogue_open_thread.started.connect(self.catalogue_open_worker.run)
         self.catalogue_open_worker.progress.connect(self.on_catalogue_open_progress)
         self.catalogue_open_worker.finished.connect(self.on_catalogue_open_finished)
         self.catalogue_open_worker.failed.connect(self.on_catalogue_open_failed)
         self.catalogue_open_worker.cancelled.connect(self.on_catalogue_open_cancelled)
-        self.catalogue_open_worker.finished.connect(self.catalogue_open_thread.quit)
-        self.catalogue_open_worker.failed.connect(self.catalogue_open_thread.quit)
-        self.catalogue_open_worker.cancelled.connect(self.catalogue_open_thread.quit)
-        self.catalogue_open_worker.finished.connect(self.catalogue_open_worker.deleteLater)
-        self.catalogue_open_worker.failed.connect(self.catalogue_open_worker.deleteLater)
-        self.catalogue_open_worker.cancelled.connect(self.catalogue_open_worker.deleteLater)
-        self.catalogue_open_thread.finished.connect(self.catalogue_open_thread.deleteLater)
-        self.catalogue_open_thread.finished.connect(self.clear_catalogue_open_worker)
+        self.catalogue_open_thread = _create_worker_thread(
+            self,
+            self.catalogue_open_worker,
+            (
+                self.catalogue_open_worker.finished,
+                self.catalogue_open_worker.failed,
+                self.catalogue_open_worker.cancelled,
+            ),
+            self.clear_catalogue_open_worker,
+        )
         self.catalogue_open_thread.start()
 
     @Slot()
@@ -5769,12 +5546,11 @@ class MainWindow(QMainWindow):
         connected_volume_snapshots: list[VolumeSnapshot] | None = None,
     ) -> None:
         self.db = db
-        if BackupAnalysisEngine is not None:
-            try:
-                self.backup_engine = BackupAnalysisEngine(db)
-                self.backup_engine.ensure_schema()
-            except Exception:
-                self.backup_engine = None
+        try:
+            self.backup_engine = BackupAnalysisEngine(db)
+            self.backup_engine.ensure_schema()
+        except Exception:
+            self.backup_engine = None
         self.catalogue_path = path
         self.catalogue_lock = lock
         self.settings.setValue(LAST_CATALOGUE_PATH_SETTING, str(path.resolve(strict=False)))
@@ -5784,9 +5560,6 @@ class MainWindow(QMainWindow):
             self.refresh_volumes()
         else:
             self._apply_volume_items(initial_volume_items)
-
-    def current_connected_volume_signature(self) -> tuple[tuple[str, str, str], ...]:
-        return connected_volume_signature(list_connected_volume_snapshots())
 
     def start_connected_volume_monitor(
         self,
@@ -5853,11 +5626,8 @@ class MainWindow(QMainWindow):
         worker.cancel()
         self.scan_progress.setFormat("Cancelling…")
         self.statusBar().showMessage(f"Cancelling catalogue {operation}…")
-        for _ in range(50):
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-            if self.catalogue_archive_thread is None or not self.catalogue_archive_thread.isRunning():
-                return True
-            self.catalogue_archive_thread.wait(100)
+        if _wait_for_worker_thread(lambda: self.catalogue_archive_thread):
+            return True
         QMessageBox.information(
             self,
             f"Catalogue {operation.title()} Cancelling",
@@ -5880,11 +5650,8 @@ class MainWindow(QMainWindow):
 
         self.cancel_scan()
 
-        for _ in range(50):
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-            if self.scan_thread is None or not self.scan_thread.isRunning():
-                return True
-            self.scan_thread.wait(100)
+        if _wait_for_worker_thread(lambda: self.scan_thread):
+            return True
 
         QMessageBox.information(
             self,
@@ -5906,11 +5673,8 @@ class MainWindow(QMainWindow):
         self.search_worker.cancel()
         self.statusBar().showMessage("Cancelling search...")
 
-        for _ in range(50):
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-            if self.search_thread is None or not self.search_thread.isRunning():
-                return True
-            self.search_thread.wait(100)
+        if _wait_for_worker_thread(lambda: self.search_thread):
+            return True
 
         QMessageBox.information(
             self,
@@ -5931,11 +5695,8 @@ class MainWindow(QMainWindow):
         self.scan_progress.setFormat("Cancelling...")
         self.statusBar().showMessage("Cancelling catalogue info...")
 
-        for _ in range(50):
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-            if self.catalogue_info_thread is None or not self.catalogue_info_thread.isRunning():
-                return True
-            self.catalogue_info_thread.wait(100)
+        if _wait_for_worker_thread(lambda: self.catalogue_info_thread):
+            return True
 
         QMessageBox.information(
             self,
@@ -5960,11 +5721,8 @@ class MainWindow(QMainWindow):
             return False
         worker.cancel()
         self.statusBar().showMessage("Cancelling backup analysis…")
-        for _ in range(50):
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-            if self.backup_analysis_thread is None or not self.backup_analysis_thread.isRunning():
-                return True
-            self.backup_analysis_thread.wait(100)
+        if _wait_for_worker_thread(lambda: self.backup_analysis_thread):
+            return True
         QMessageBox.information(
             self,
             "Backup Analysis Cancelling",
@@ -6440,19 +6198,16 @@ class MainWindow(QMainWindow):
         self.scan_progress.setFormat(f"Deleting {display_name}...")
         self.statusBar().showMessage(f"Deleting {display_name}...")
 
-        self.delete_thread = QThread(self)
         self.delete_worker = DeleteVolumeWorker(self.db.path, volume_id)
-        self.delete_worker.moveToThread(self.delete_thread)
-        self.delete_thread.started.connect(self.delete_worker.run)
         self.delete_worker.progress.connect(self.on_delete_progress)
         self.delete_worker.finished.connect(self.on_delete_finished)
         self.delete_worker.failed.connect(self.on_delete_failed)
-        self.delete_worker.finished.connect(self.delete_thread.quit)
-        self.delete_worker.failed.connect(self.delete_thread.quit)
-        self.delete_worker.finished.connect(self.delete_worker.deleteLater)
-        self.delete_worker.failed.connect(self.delete_worker.deleteLater)
-        self.delete_thread.finished.connect(self.delete_thread.deleteLater)
-        self.delete_thread.finished.connect(self.clear_delete_worker)
+        self.delete_thread = _create_worker_thread(
+            self,
+            self.delete_worker,
+            (self.delete_worker.finished, self.delete_worker.failed),
+            self.clear_delete_worker,
+        )
         self.delete_thread.start()
 
     def start_scan(
@@ -6498,21 +6253,18 @@ class MainWindow(QMainWindow):
         self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
         self._set_scan_running_ui(True)
 
-        self.scan_thread = QThread(self)
         self.scan_worker = ScanWorker(self.db.path, volume["id"])
-        self.scan_worker.moveToThread(self.scan_thread)
-        self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.stats_progress.connect(self.on_scan_stats_progress)
         self.scan_worker.review_requested.connect(self.on_scan_review_requested)
         self.scan_worker.finished.connect(self.on_scan_finished)
         self.scan_worker.failed.connect(self.on_scan_failed)
-        self.scan_worker.finished.connect(self.scan_thread.quit)
-        self.scan_worker.failed.connect(self.scan_thread.quit)
-        self.scan_worker.finished.connect(self.scan_worker.deleteLater)
-        self.scan_worker.failed.connect(self.scan_worker.deleteLater)
-        self.scan_thread.finished.connect(self.scan_thread.deleteLater)
-        self.scan_thread.finished.connect(self.clear_scan_worker)
+        self.scan_thread = _create_worker_thread(
+            self,
+            self.scan_worker,
+            (self.scan_worker.finished, self.scan_worker.failed),
+            self.clear_scan_worker,
+        )
         self.scan_thread.start()
 
     def choose_scan_location(self, volume) -> str | None:
@@ -7478,10 +7230,6 @@ class MainWindow(QMainWindow):
         if target is not None:
             self.copy_catalogue_item_path(target)
 
-    def browser_real_path(self, item: BrowserItem) -> Path | None:
-        target = self.catalogue_ref_for_browser_item(item)
-        return self.catalogue_item_real_path(target) if target is not None else None
-
     def real_path_for(self, volume, relative_path: str) -> Path | None:
         source_path = self.current_source_path_for_volume(volume)
         if source_path is None:
@@ -7489,11 +7237,7 @@ class MainWindow(QMainWindow):
         return self.physical_path_for_source(source_path, relative_path)
 
     def physical_path_for_source(self, source_path: str, relative_path: str) -> Path:
-        path = Path(source_path)
-        for part in PurePosixPath(relative_path).parts:
-            if part not in {"", "."}:
-                path /= part
-        return path
+        return path_with_relative(source_path, relative_path)
 
     def parent_catalogue_path(self, relative_path: str) -> str:
         parent = PurePosixPath(relative_path).parent
@@ -7565,7 +7309,6 @@ class MainWindow(QMainWindow):
         self.search_button.setText("Searching...")
         self.statusBar().showMessage(f'Searching for "{query}"...')
 
-        self.search_thread = QThread(self)
         self.search_worker = SearchWorker(
             db_path,
             query,
@@ -7574,20 +7317,20 @@ class MainWindow(QMainWindow):
             include_paths=include_paths,
             backup_filter_key=MainWindow.search_backup_filter_key(self),
         )
-        self.search_worker.moveToThread(self.search_thread)
-        self.search_thread.started.connect(self.search_worker.run)
         self.search_worker.batch_ready.connect(self.on_search_batch_ready)
         self.search_worker.finished.connect(self.on_search_finished)
         self.search_worker.cancelled.connect(self.on_search_cancelled)
         self.search_worker.failed.connect(self.on_search_failed)
-        self.search_worker.finished.connect(self.search_thread.quit)
-        self.search_worker.cancelled.connect(self.search_thread.quit)
-        self.search_worker.failed.connect(self.search_thread.quit)
-        self.search_worker.finished.connect(self.search_worker.deleteLater)
-        self.search_worker.cancelled.connect(self.search_worker.deleteLater)
-        self.search_worker.failed.connect(self.search_worker.deleteLater)
-        self.search_thread.finished.connect(self.search_thread.deleteLater)
-        self.search_thread.finished.connect(self.clear_search_worker)
+        self.search_thread = _create_worker_thread(
+            self,
+            self.search_worker,
+            (
+                self.search_worker.finished,
+                self.search_worker.cancelled,
+                self.search_worker.failed,
+            ),
+            self.clear_search_worker,
+        )
         self.search_thread.start()
 
     @Slot(int, list)

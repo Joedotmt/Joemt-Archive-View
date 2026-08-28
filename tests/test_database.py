@@ -14,6 +14,7 @@ from jvvv.database import (
     count_rows,
     create_catalogue,
     open_catalogue,
+    sqlite_file_uri,
 )
 
 
@@ -189,7 +190,7 @@ def test_sqlite_uri_encodes_unc_server_as_part_of_path():
             assert strict is False
             return ResolvedUncPath()
 
-    assert Database._sqlite_uri(UncPath()) == (
+    assert sqlite_file_uri(UncPath()) == (
         "file:////192.168.1.100/archive/Archive%20One.jvvv?mode=rw"
     )
     assert Database._uses_network_storage(UncPath()) is True

@@ -19,15 +19,6 @@ RULES_VERSION = 3
 CONTENT_HASH_LENGTHS = {
     "sha256": 32,
 }
-FILE_STATUS_VALUES = {
-    "likely",
-    "possible",
-    "single",
-    "ambiguous",
-    "excluded",
-    "unknown",
-}
-FOLDER_STATUS_VALUES = FILE_STATUS_VALUES | {"empty"}
 IGNORED_SYSTEM_SCAN_ROOTS = {
     "$recycle.bin",
     "recycler",
@@ -42,6 +33,120 @@ IGNORED_COPY_METADATA_NAMES = {
     "wpsettings.dat",
 }
 
+
+ANALYSIS_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "backup_analysis_runs": (
+        "id",
+        "started_at",
+        "completed_at",
+        "status",
+        "rules_version",
+        "source_signature",
+        "files_analyzed",
+        "folders_analyzed",
+        "likely_files",
+        "possible_files",
+        "ambiguous_files",
+        "excluded_files",
+        "single_files",
+        "message",
+    ),
+    "backup_analysis_state": (
+        "id",
+        "active_run_id",
+        "forced_stale",
+        "stale_reason",
+        "updated_at",
+    ),
+    "backup_analysis_volume_snapshots": (
+        "run_id",
+        "volume_id",
+        "drive_id",
+        "last_scan_at",
+        "indexed_file_count",
+        "indexed_folder_count",
+    ),
+    "backup_file_results": (
+        "run_id",
+        "file_id",
+        "volume_id",
+        "status",
+        "other_volume_ids",
+        "evidence_text",
+        "strong_volume_ids",
+        "possible_volume_ids",
+        "verified_volume_ids",
+    ),
+    "backup_folder_results": (
+        "run_id",
+        "folder_id",
+        "volume_id",
+        "status",
+        "other_volume_ids",
+        "evidence_text",
+        "best_target_volume_id",
+        "matched_files",
+        "total_files",
+        "matched_bytes",
+        "total_bytes",
+        "best_coverage_files_percent",
+        "best_coverage_bytes_percent",
+        "scattered",
+    ),
+    "backup_folder_drive_matches": (
+        "run_id",
+        "folder_id",
+        "target_volume_id",
+        "status",
+        "matched_files",
+        "total_files",
+        "matched_bytes",
+        "total_bytes",
+        "evidence_text",
+    ),
+    "backup_volume_results": (
+        "run_id",
+        "volume_id",
+        "status",
+        "health_status",
+        "coverage_eligible",
+        "total_files",
+        "total_bytes",
+        "coverage_files",
+        "coverage_bytes",
+        "likely_files",
+        "likely_bytes",
+        "possible_files",
+        "possible_bytes",
+        "ambiguous_files",
+        "ambiguous_bytes",
+        "excluded_files",
+        "excluded_bytes",
+        "single_files",
+        "single_bytes",
+        "likely_files_percent",
+        "likely_bytes_percent",
+        "latest_scan_status",
+        "latest_scan_errors",
+    ),
+    "backup_mirror_candidates": (
+        "run_id",
+        "source_volume_id",
+        "target_volume_id",
+        "source_coverage_percent",
+        "target_coverage_percent",
+        "matched_files",
+        "complete_structure",
+        "evidence_text",
+        "manual_mirror_link",
+    ),
+    "backup_analysis_invalidations": (
+        "id",
+        "volume_id",
+        "reason",
+        "created_at",
+    ),
+}
 
 ANALYSIS_SCHEMA_SQL: tuple[str, ...] = (
     """
@@ -303,42 +408,6 @@ class VolumeBackupSummary:
     is_stale: bool = False
     stale_reason: str = ""
 
-    @property
-    def strong_files(self) -> int:
-        return self.likely_files
-
-    @property
-    def strong_bytes(self) -> int:
-        return self.likely_bytes
-
-    @property
-    def strong_files_percent(self) -> float | None:
-        """Compatibility/display alias for conservative likely-file coverage."""
-        return self.likely_files_percent
-
-    @property
-    def file_coverage_percent(self) -> float | None:
-        """Percentage of files with likely metadata evidence elsewhere."""
-        return self.likely_files_percent
-
-    @property
-    def coverage_files_percent(self) -> float | None:
-        return self.likely_files_percent
-
-    @property
-    def byte_coverage_percent(self) -> float | None:
-        """Percentage of bytes represented by likely file matches."""
-        return self.likely_bytes_percent
-
-    @property
-    def strong_bytes_percent(self) -> float | None:
-        return self.likely_bytes_percent
-
-    @property
-    def coverage_bytes_percent(self) -> float | None:
-        return self.likely_bytes_percent
-
-
 @dataclass(frozen=True)
 class MirrorCandidate:
     source_volume_id: int
@@ -349,19 +418,6 @@ class MirrorCandidate:
     complete_structure: bool
     evidence_text: str
     manual_mirror_link: bool = False
-
-    @property
-    def complete(self) -> bool:
-        return self.complete_structure
-
-    @property
-    def is_complete(self) -> bool:
-        return self.complete_structure
-
-    @property
-    def exact(self) -> bool:
-        return self.complete_structure
-
 
 @dataclass(frozen=True)
 class ScanRecord:
@@ -524,6 +580,16 @@ def _is_copy_metadata_noise(name: str | None, relative_path: str | None) -> bool
     return bool(parts and parts[0].casefold() in IGNORED_SYSTEM_SCAN_ROOTS)
 
 
+def _add_pair_count(
+    pair_counts: dict[tuple[int, int], list[int]],
+    first: int,
+    second: int,
+    size_bytes: int,
+) -> None:
+    pair_counts[(first, second)][0] += 1
+    pair_counts[(first, second)][1] += size_bytes
+
+
 class BackupAnalysisEngine:
     """Compare records already stored in a catalogue; never access source paths."""
 
@@ -607,9 +673,6 @@ class BackupAnalysisEngine:
             stale_reason=reason,
             rules_version=int(row["rules_version"] or 0),
         )
-
-    def invalidate_volume(self, volume_id: int, reason: str = "Catalogue contents changed.") -> None:
-        self._invalidate(int(volume_id), reason)
 
     def invalidate_all(self, reason: str = "Catalogue contents changed.") -> None:
         self._invalidate(None, reason)
@@ -1073,10 +1136,6 @@ class BackupAnalysisEngine:
         target_batch: list[tuple[Any, ...]] = []
         processed = 0
 
-        def add_pair_count(first: int, second: int, size_bytes: int) -> None:
-            pair_counts[(first, second)][0] += 1
-            pair_counts[(first, second)][1] += size_bytes
-
         def flush(force: bool = False) -> None:
             if not force and (
                 len(result_batch) < self.options.batch_size
@@ -1122,12 +1181,14 @@ class BackupAnalysisEngine:
                 target_file_id = int(target_row["file_id"])
                 assignments[source_file_id].add(target)
                 assignments[target_file_id].add(source)
-                add_pair_count(
+                _add_pair_count(
+                    pair_counts,
                     source,
                     target,
                     int(source_row["size_bytes"] or 0),
                 )
-                add_pair_count(
+                _add_pair_count(
+                    pair_counts,
                     target,
                     source,
                     int(target_row["size_bytes"] or 0),
@@ -1368,10 +1429,6 @@ class BackupAnalysisEngine:
                 )
                 target_batch.clear()
 
-        def add_pair_count(first: int, second: int, size_bytes: int) -> None:
-            pair_counts[(first, second)][0] += 1
-            pair_counts[(first, second)][1] += size_bytes
-
         def pair_rows(
             rows: list[sqlite3.Row],
             *,
@@ -1491,8 +1548,8 @@ class BackupAnalysisEngine:
                             )
 
                     for _ in range(matched):
-                        add_pair_count(source, target, size_bytes)
-                        add_pair_count(target, source, size_bytes)
+                        _add_pair_count(pair_counts, source, target, size_bytes)
+                        _add_pair_count(pair_counts, target, source, size_bytes)
             return assignments, competing_files, hash_conflict_files
 
         def stage_rows(
