@@ -6053,6 +6053,10 @@ class MainWindow(QMainWindow):
             widget.setEnabled(is_open)
         for shortcut in self.browser_shortcuts:
             shortcut.setEnabled(is_open)
+        if hasattr(self, "volume_table"):
+            self.volume_table.setEnabled(is_open)
+        if hasattr(self, "tabs"):
+            self.tabs.setEnabled(is_open)
 
         if not is_open:
             self.stop_connected_volume_monitor()

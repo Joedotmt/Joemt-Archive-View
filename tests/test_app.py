@@ -67,6 +67,28 @@ def test_file_menu_exposes_backup_and_restore_with_correct_availability(monkeypa
     assert application is not None
 
 
+def test_opening_first_catalogue_reenables_workspace_after_restore(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        # Restoring from the welcome page finishes its busy state before the
+        # restored catalogue has been opened, so db is still None here.
+        window._set_catalogue_busy(True)
+        window._set_catalogue_busy(False)
+        assert not window.volume_table.isEnabled()
+        assert not window.tabs.isEnabled()
+
+        window._set_catalogue_open(True)
+
+        assert window.volume_table.isEnabled()
+        assert window.tabs.isEnabled()
+    finally:
+        window.close()
+    assert application is not None
+
+
 def test_catalogue_backup_worker_reports_progress_and_result(monkeypatch, tmp_path):
     source = tmp_path / "source.jvvv"
     target = tmp_path / "source.zip"
