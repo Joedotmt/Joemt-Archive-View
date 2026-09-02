@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 
 from jvvv.app import (
     BACKUP_METADATA_DISCLAIMER,
+    BackupStatusIconProvider,
     BackupEvidenceDialog,
     BrowserItem,
     BrowserTableModel,
     MainWindow,
+    ResponsiveStatusDelegate,
+    SearchResultsTableModel,
+    VolumeTableModel,
     backup_filter_matches,
     item_backup_display,
     volume_backup_display,
@@ -187,6 +192,70 @@ def test_browser_other_copy_column_has_header_and_row_explanations():
         model.index(0, 1),
         Qt.ItemDataRole.ToolTipRole,
     )
+
+
+def test_search_volume_status_uses_matching_dots_and_hides_text_when_narrow(
+    monkeypatch,
+):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    icons = SimpleNamespace(icon_for=lambda _item: None)
+    status_icons = BackupStatusIconProvider()
+    model = SearchResultsTableModel(icons, backup_icons=status_icons)
+    model.set_items(
+        [
+            SimpleNamespace(
+                name="connected.psd",
+                is_folder=False,
+                connected=True,
+            ),
+            SimpleNamespace(
+                name="offline.psd",
+                is_folder=False,
+                connected=False,
+            ),
+        ]
+    )
+
+    connected_index = model.index(0, 8)
+    offline_index = model.index(1, 8)
+    assert model.data(connected_index) == "Connected"
+    assert model.data(offline_index) == "Offline"
+    assert model.data(connected_index, Qt.ItemDataRole.DecorationRole).cacheKey() == (
+        status_icons.icon_for_state("strong").cacheKey()
+    )
+    assert model.data(offline_index, Qt.ItemDataRole.DecorationRole).cacheKey() == (
+        status_icons.icon_for_state("none").cacheKey()
+    )
+
+    volume_model = VolumeTableModel(backup_icons=status_icons)
+    volume_model.set_items(
+        [SimpleNamespace(drive_id="AID-002", connected=False)]
+    )
+    volume_status_index = volume_model.index(0, 7)
+    assert volume_model.data(volume_status_index) == "Offline"
+    assert volume_model.data(
+        volume_status_index,
+        Qt.ItemDataRole.DecorationRole,
+    ).cacheKey() == status_icons.icon_for_state("none").cacheKey()
+
+    delegate = ResponsiveStatusDelegate()
+    pixmap = QPixmap(32, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    option = QStyleOptionViewItem()
+    option.rect = pixmap.rect()
+    option.decorationSize = QSize(18, 18)
+    option.state = option.state | option.state.State_Enabled
+    painter = QPainter(pixmap)
+    delegate.paint(painter, option, connected_index)
+    painter.end()
+    dot_color = status_icons.COLORS["strong"]
+    assert any(
+        pixmap.toImage().pixelColor(x, y).name() == dot_color
+        for x in range(pixmap.width())
+        for y in range(pixmap.height())
+    )
+    assert app is not None
 
 
 def test_hash_verified_file_is_distinct_from_metadata_only_targets():

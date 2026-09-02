@@ -142,7 +142,9 @@ ROLE_RELATIVE_PATH = Qt.ItemDataRole.UserRole + 2
 ROLE_ITEM_TYPE = Qt.ItemDataRole.UserRole + 3
 ROLE_ITEM_ID = Qt.ItemDataRole.UserRole + 4
 ROLE_PERCENT_FULL = Qt.ItemDataRole.UserRole + 5
+VOLUME_CONNECTION_COLUMN = 7
 VOLUME_FULL_COLUMN = 18
+SEARCH_VOLUME_STATUS_COLUMN = 8
 LAST_CATALOGUE_PATH_SETTING = "catalogues/lastPath"
 SEARCH_INCLUDE_PATHS_SETTING = "search/includePaths"
 THEME_STYLE_SETTING = "appearance/themeStyle"
@@ -1054,7 +1056,10 @@ class BackupStatusIconProvider:
         self.cache: dict[str, QIcon] = {}
 
     def icon_for(self, display: BackupDisplay) -> QIcon:
-        state = display.state if display.state in self.COLORS else "unknown"
+        return self.icon_for_state(display.state)
+
+    def icon_for_state(self, state: str) -> QIcon:
+        state = state if state in self.COLORS else "unknown"
         if state in self.cache:
             return self.cache[state]
         pixmap = QPixmap(16, 16)
@@ -1068,6 +1073,23 @@ class BackupStatusIconProvider:
         icon = QIcon(pixmap)
         self.cache[state] = icon
         return icon
+
+
+def connection_status_column(
+    title: str,
+    icons: BackupStatusIconProvider,
+) -> TableColumn:
+    def status_text(item: Any) -> str:
+        return "Connected" if item.connected else "Offline"
+
+    return TableColumn(
+        title,
+        status_text,
+        decoration=lambda item: icons.icon_for_state(
+            "strong" if item.connected else "none"
+        ),
+        tooltip=status_text,
+    )
 
 
 @dataclass(frozen=True)
@@ -1231,7 +1253,7 @@ class VolumeTableModel(StandardTableModel):
                 TableColumn("Condition", lambda item: item.condition),
                 TableColumn("Description", lambda item: item.description or "-"),
                 TableColumn("Connector", lambda item: item.connector),
-                TableColumn("Connection", lambda item: "Connected" if item.connected else "Offline"),
+                connection_status_column("Connection", self.backup_icons),
                 TableColumn("Mirror", lambda item: "Yes" if item.is_mirror else "No", sort_key=lambda item: item.is_mirror),
                 TableColumn(
                     "Master Drive",
@@ -1353,7 +1375,7 @@ class SearchResultsTableModel(StandardTableModel):
                     alignment=Qt.AlignmentFlag.AlignRight,
                 ),
                 TableColumn("Modified", lambda item: display_db_time(item.modified_at), sort_key=lambda item: item.modified_at or ""),
-                TableColumn("Volume Status", lambda item: "Connected" if item.connected else "Offline"),
+                connection_status_column("Volume Status", self.backup_icons),
             ],
             parent,
         )
@@ -1387,6 +1409,23 @@ class SearchResultsTableModel(StandardTableModel):
 
     def group_key(self, item: SearchResultItem) -> int:
         return 0 if item.is_folder else 1
+
+
+class ResponsiveStatusDelegate(QStyledItemDelegate):
+    """Hide a status label when its column only has room for the indicator dot."""
+
+    def initStyleOption(self, option, index: QModelIndex) -> None:  # type: ignore[override]
+        super().initStyleOption(option, index)
+        width = option.rect.width()
+        full_width = (
+            option.decorationSize.width()
+            + option.fontMetrics.horizontalAdvance("Connected")
+            + 16
+        )
+        if 0 < width < full_width:
+            option.text = ""
+            option.displayAlignment = Qt.AlignmentFlag.AlignCenter
+            option.decorationAlignment = Qt.AlignmentFlag.AlignCenter
 
 
 class VolumeFullDelegate(QStyledItemDelegate):
@@ -3638,6 +3677,8 @@ class MainWindow(QMainWindow):
         self.backup_scan_records: dict[int, Any] = {}
         self.backup_analysis_state: Any = None
         self.volume_full_delegate = VolumeFullDelegate(self)
+        self.volume_connection_delegate = ResponsiveStatusDelegate(self)
+        self.search_connection_delegate = ResponsiveStatusDelegate(self)
         self.catalogue_actions: list[QAction] = []
         self.catalogue_widgets: list[QWidget] = []
         self.scan_blocked_actions: list[QAction] = []
@@ -4001,6 +4042,10 @@ class MainWindow(QMainWindow):
         self.volume_table.setModel(self.volume_model)
         self.configure_table_view(self.volume_table)
         self.volume_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.volume_table.setItemDelegateForColumn(
+            VOLUME_CONNECTION_COLUMN,
+            self.volume_connection_delegate,
+        )
         self.volume_table.setItemDelegateForColumn(VOLUME_FULL_COLUMN, self.volume_full_delegate)
         self.volume_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.volume_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -4414,6 +4459,10 @@ class MainWindow(QMainWindow):
         self.search_table.setObjectName("searchTable")
         self.search_table.setModel(self.search_model)
         self.configure_table_view(self.search_table)
+        self.search_table.setItemDelegateForColumn(
+            SEARCH_VOLUME_STATUS_COLUMN,
+            self.search_connection_delegate,
+        )
         self.search_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.search_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         QTimer.singleShot(
