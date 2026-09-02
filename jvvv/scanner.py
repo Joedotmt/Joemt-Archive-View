@@ -7,13 +7,25 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .database import Database, format_timestamp, utc_now
 from .media_metadata import (
     MediaInspectionCancelled,
     MediaMetadataExtractor,
+    MediaMetadata,
     media_kind_for_extension,
+)
+from .preview_cache import PreviewCancelled
+from .preview_service import (
+    MODE_SKIPPED_PREFLIGHT,
+    PreviewService,
+    PreviewStatistics,
+    disabled_statistics,
+    hash_unavailable_status_record,
+    preview_warning_message,
+    scan_outcome,
+    status_record_for,
 )
 from .utils import capture_volume_snapshot, resolve_volume_source_path, volume_identity_known
 
@@ -105,6 +117,21 @@ class ScanResult:
     hash_errors: int = 0
     media_files: int = 0
     media_metadata_collected: int = 0
+    preview: dict[str, Any] | None = None
+
+    @property
+    def preview_statistics(self) -> PreviewStatistics:
+        return PreviewStatistics.from_dict(self.preview)
+
+    @property
+    def outcome(self) -> str:
+        """``completed_with_warnings`` when indexing succeeded but previews failed.
+
+        The persisted scan status is unchanged (``completed``) because other
+        catalogue features key on it; the outcome is what the UI reports.
+        """
+
+        return scan_outcome(self.status, self.preview)
 
 
 class ScanCancelled(Exception):
@@ -140,6 +167,8 @@ class VolumeScanner:
         preview_callback: PreviewCallback | None = None,
         media_extractor: MediaMetadataExtractor | None = None,
         batch_size: int = 500,
+        preview_service: PreviewService | None = None,
+        preview_statistics: PreviewStatistics | None = None,
     ) -> None:
         self.db = db
         self.progress_callback = progress_callback
@@ -148,6 +177,16 @@ class VolumeScanner:
         self.preview_callback = preview_callback
         self.media_extractor = media_extractor or MediaMetadataExtractor()
         self.batch_size = batch_size
+        # Offline previews are opt-in.  ``preview_service`` is only supplied
+        # when previews are enabled and the scan-start preflight passed;
+        # ``preview_statistics`` records the reason when they were skipped.
+        self.preview_service = preview_service
+        if preview_service is not None:
+            self.preview_statistics = preview_service.statistics
+        elif preview_statistics is not None:
+            self.preview_statistics = preview_statistics
+        else:
+            self.preview_statistics = disabled_statistics()
         self.files_hashed = 0
         self.bytes_hashed = 0
         self.hash_errors = 0
@@ -198,6 +237,9 @@ class VolumeScanner:
         status = "completed"
         message: str | None = None
         changes: ScanChanges | None = None
+        volume_label = " - ".join(
+            str(part) for part in (volume["drive_id"], volume["name"]) if part
+        )
 
         if not root.exists():
             message = f"Source path is not connected: {root}"
@@ -390,6 +432,25 @@ class VolumeScanner:
                             self.media_files += 1
                             if media_metadata.status in {"complete", "partial"}:
                                 self.media_metadata_collected += 1
+                        if (
+                            media_kind in {"image", "video"}
+                            and self.preview_service is not None
+                        ):
+                            # Never before the final SHA-256 of a stable file
+                            # is known and the catalogue record is stored.
+                            self._ensure_file_preview(
+                                file_id=file_id,
+                                media_kind=media_kind,
+                                full_path=full_path,
+                                relative_path=rel_path,
+                                file_name=file_name,
+                                content_hash=content_hash,
+                                volume_id=volume_id,
+                                volume_label=volume_label,
+                                media_metadata=media_metadata,
+                                files_seen=files_seen,
+                                folders_seen=folders_seen,
+                            )
                         files_seen += 1
                         if files_seen % self.batch_size == 0:
                             self._emit_progress(files_seen, folders_seen, rel_path)
@@ -439,6 +500,8 @@ class VolumeScanner:
                 else:
                     self.db.refresh_volume_counts(volume_id)
 
+            if status == "completed" and message is None:
+                message = self._preview_report_message()
             summary = changes.as_dict() if changes is not None else None
             self.db.finish_scan(
                 scan_id,
@@ -453,6 +516,7 @@ class VolumeScanner:
                 hash_errors=self.hash_errors,
                 media_files=self.media_files,
                 media_metadata_collected=self.media_metadata_collected,
+                preview_summary=self._preview_summary(),
             )
             return self._result(status, files_seen, folders_seen, errors_count, message, changes)
         except ScanDiscarded as exc:
@@ -470,6 +534,7 @@ class VolumeScanner:
                 hash_errors=self.hash_errors,
                 media_files=self.media_files,
                 media_metadata_collected=self.media_metadata_collected,
+                preview_summary=self._preview_summary(),
             )
             return self._result("discarded", files_seen, folders_seen, errors_count, str(exc), changes)
         except ScanCancelled as exc:
@@ -487,6 +552,7 @@ class VolumeScanner:
                 hash_errors=self.hash_errors,
                 media_files=self.media_files,
                 media_metadata_collected=self.media_metadata_collected,
+                preview_summary=self._preview_summary(),
             )
             return self._result("cancelled", files_seen, folders_seen, errors_count, str(exc), changes)
         except Exception as exc:
@@ -504,8 +570,92 @@ class VolumeScanner:
                 hash_errors=self.hash_errors,
                 media_files=self.media_files,
                 media_metadata_collected=self.media_metadata_collected,
+                preview_summary=self._preview_summary(),
             )
             raise
+
+    def _ensure_file_preview(
+        self,
+        *,
+        file_id: int,
+        media_kind: str,
+        full_path: Path,
+        relative_path: str,
+        file_name: str,
+        content_hash: bytes | None,
+        volume_id: int,
+        volume_label: str,
+        media_metadata: MediaMetadata | None,
+        files_seen: int,
+        folders_seen: int,
+    ) -> None:
+        service = self.preview_service
+        if service is None:
+            return
+        if content_hash is None:
+            self.db.replace_file_preview_status(
+                file_id,
+                hash_unavailable_status_record(
+                    media_kind,
+                    service.cache.profile_id(media_kind),
+                ),
+            )
+            return
+        label = f"Creating {media_kind} preview · {relative_path}"
+        self._emit_progress(files_seen, folders_seen, label)
+        expected_duration_ms = (
+            media_metadata.duration_ms
+            if media_kind == "video" and media_metadata is not None
+            else None
+        )
+        try:
+            result = service.ensure_preview(
+                media_kind=media_kind,
+                source=full_path,
+                content_hash=content_hash,
+                relative_path=relative_path,
+                source_name=file_name,
+                volume_id=volume_id,
+                volume_label=volume_label,
+                cancel_callback=self._cancelled,
+                progress_callback=lambda text: self._emit_progress(
+                    files_seen,
+                    folders_seen,
+                    f"{label} · {text}",
+                ),
+                expected_duration_ms=expected_duration_ms,
+            )
+        except PreviewCancelled as exc:
+            raise ScanCancelled("Scan cancelled.") from exc
+        self.db.replace_file_preview_status(file_id, status_record_for(result, content_hash))
+
+    def _preview_summary(self) -> dict[str, Any]:
+        stats = self.preview_statistics
+        message = stats.message
+        if not message and stats.storage_unavailable_reason:
+            message = f"Preview storage became unavailable: {stats.storage_unavailable_reason}"
+        return {
+            "mode": stats.mode,
+            "image_generated": stats.image_generated,
+            "image_reused": stats.image_reused,
+            "image_failed": stats.image_failed,
+            "video_generated": stats.video_generated,
+            "video_reused": stats.video_reused,
+            "video_failed": stats.video_failed,
+            "storage_skipped": stats.storage_skipped,
+            "bytes_written": stats.bytes_written,
+            "message": message,
+        }
+
+    def _preview_report_message(self) -> str | None:
+        """Scan-report sentence for preview problems or a preflight skip."""
+
+        stats = self.preview_statistics
+        if stats.mode == MODE_SKIPPED_PREFLIGHT:
+            return stats.message or None
+        if stats.has_problems:
+            return preview_warning_message(stats) or None
+        return None
 
     def _result(
         self,
@@ -528,6 +678,7 @@ class VolumeScanner:
             hash_errors=self.hash_errors,
             media_files=self.media_files,
             media_metadata_collected=self.media_metadata_collected,
+            preview=self.preview_statistics.as_dict(),
         )
 
     def _hash_stable_file(

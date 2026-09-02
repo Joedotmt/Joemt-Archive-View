@@ -105,7 +105,41 @@ from .database import (
     sqlite_file_uri,
 )
 from .scanner import VolumeScanner
-from .media_metadata import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from .media_metadata import (
+    AUDIO_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    media_kind_for_extension,
+)
+from .preview_cache import PreviewEntry, PreviewFailure, PreviewStoreStatistics
+from .preview_config import (
+    BACKUP_POLICY_TEXT,
+    PREVIEW_SETTING_KEYS,
+    PreviewSettings,
+)
+from .preview_service import (
+    DB_STATUS_AVAILABLE,
+    DB_STATUS_FAILED,
+    DB_STATUS_MISSING,
+    DB_STATUS_UNSUPPORTED,
+    MODE_ENABLED,
+    MODE_SKIPPED_PREFLIGHT,
+    PreviewService,
+    PreviewStatistics,
+    PreviewValidationReport,
+    SCAN_OUTCOME_COMPLETED_WITH_WARNINGS,
+    inspect_preview_file,
+    preflight_preview_configuration,
+    skipped_preflight_statistics,
+)
+from .preview_ui import (
+    DeletePreviewsWorker,
+    OfflinePreviewSettingsWidget,
+    PreviewCacheDialog,
+    PreviewFailuresDialog,
+    PreviewStoreStatisticsWorker,
+    UnreferencedPreviewWorker,
+)
 from .theme import (
     ADOBE_THEME,
     DARK_MODE,
@@ -156,6 +190,121 @@ CATALOGUE_PROBE_TIMEOUT_MS = 8000
 CATALOGUE_PROBE_OK = 0
 CATALOGUE_PROBE_UNAVAILABLE = 2
 CATALOGUE_PROBE_INVALID = 3
+PREVIEW_PROGRESS_PREFIXES = ("Creating image preview", "Creating video preview")
+SCAN_PROGRESS_DETAIL_PREFIXES = (
+    "Hashing SHA-256",
+    "Reading media details",
+    *PREVIEW_PROGRESS_PREFIXES,
+)
+
+
+def load_preview_settings(settings: QSettings) -> PreviewSettings:
+    """Read the persisted offline-preview configuration (disabled by default)."""
+
+    values = {key: settings.value(key) for key in PREVIEW_SETTING_KEYS}
+    return PreviewSettings.from_mapping(values)
+
+
+def save_preview_settings(settings: QSettings, preview_settings: PreviewSettings) -> None:
+    for key, value in preview_settings.as_mapping().items():
+        settings.setValue(key, value)
+    settings.sync()
+
+
+def preview_open_label(media_kind: str) -> str:
+    return "Play Preview" if media_kind == "video" else "Open Preview"
+
+
+def preview_property_rows(
+    record: Any,
+    preview_settings: PreviewSettings | None,
+    media_kind: str,
+) -> list[tuple[str, str]]:
+    """Properties rows describing the offline preview for an image or video."""
+
+    if media_kind not in {"image", "video"}:
+        return []
+    record_field = lambda name, default=None: object_value(record, name, default)
+    rows: list[tuple[str, str]] = []
+    if preview_settings is None or preview_settings.root_path is None:
+        rows.append(
+            (
+                "Offline preview",
+                "Not configured — choose a preview storage directory in "
+                "Settings > Preferences to generate previews while scanning",
+            )
+        )
+        return rows
+
+    profile = preview_settings.profile_for(media_kind)
+    try:
+        current_profile_id = profile.profile_id
+    except Exception:  # pragma: no cover - settings are validated on load
+        current_profile_id = "invalid"
+    content_hash = record_field("content_hash")
+    info = inspect_preview_file(preview_settings, media_kind, content_hash)
+    stored_status = str(record_field("preview_status") or "").casefold()
+    stored_profile = str(record_field("preview_profile_id") or "")
+    stored_stage = str(record_field("preview_error_stage") or "")
+    stored_message = str(record_field("preview_error_message") or "").strip()
+    stored_hash = record_field("preview_source_hash")
+    stale_status = (
+        stored_status
+        and stored_hash is not None
+        and content_hash is not None
+        and bytes(stored_hash) != bytes(content_hash)
+    )
+
+    if content_hash is None:
+        summary = "Not available — no SHA-256 hash is recorded for this file, so no preview path can be derived"
+    elif info is not None and info.exists and info.valid:
+        summary = "Available"
+    elif info is not None and info.exists and not info.valid:
+        summary = f"Present but invalid — {info.message}"
+    elif stored_status == DB_STATUS_FAILED and not stale_status:
+        summary = "Preview generation failed during the last scan"
+        if stored_message:
+            summary += f": {stored_message}"
+        if stored_stage:
+            summary += f" (stage: {stored_stage})"
+    elif stored_status == DB_STATUS_AVAILABLE and not stale_status:
+        summary = (
+            "Missing — the last scan recorded a preview, but the file is no longer present "
+            "at the expected location"
+        )
+    elif stored_status == DB_STATUS_MISSING and not stale_status:
+        summary = "Not generated"
+        if stored_message:
+            summary += f" — {stored_message}"
+    elif stored_status == DB_STATUS_UNSUPPORTED and not stale_status:
+        summary = "Unsupported"
+        if stored_message:
+            summary += f" — {stored_message}"
+    elif not preview_settings.enabled:
+        summary = "Not generated — offline preview generation is disabled in Settings"
+    else:
+        summary = "Not generated — rescan this volume with offline previews enabled"
+    rows.append(("Offline preview", summary))
+    rows.append(("Preview profile", " · ".join(profile.describe())))
+    if info is not None and info.exists and info.valid:
+        if info.width and info.height:
+            rows.append(("Preview dimensions", f"{info.width:,} × {info.height:,}"))
+        if media_kind == "video" and info.duration_ms is not None:
+            rows.append(("Preview duration", display_duration_ms(info.duration_ms)))
+        rows.append(("Preview size", format_size(info.size_bytes)))
+    if info is not None:
+        rows.append(("Preview stored at", str(info.path)))
+    if stored_status:
+        recorded = str(record_field("preview_updated_at") or "")
+        note = f"{stored_status}"
+        if stored_profile and stored_profile != current_profile_id:
+            note += f" · recorded for profile {stored_profile}, current profile is {current_profile_id}"
+        if stale_status:
+            note += " · recorded for previous file content"
+        if recorded:
+            note += f" · {display_db_time(recorded)}"
+        rows.append(("Preview status recorded", note))
+    return rows
 
 
 def format_exception_diagnostics(exc: Exception) -> str:
@@ -2155,12 +2304,14 @@ class ItemPropertiesDialog(QDialog):
         name: str,
         subtitle: str,
         properties: list[tuple[str, str]],
+        actions: list[tuple[str, Callable[[], None]]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Properties - {name}")
         self.resize(760, 520)
         self.setMinimumSize(560, 380)
         self.copy_text = "\n".join(f"{label}: {value}" for label, value in properties)
+        self.action_buttons: list[QPushButton] = []
 
         icon_label = QLabel()
         icon_label.setPixmap(icon.pixmap(QSize(48, 48)))
@@ -2198,6 +2349,14 @@ class ItemPropertiesDialog(QDialog):
         self.details_edit.setPlainText(self.copy_text)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        # Extra actions (spec §20: [Open Preview] / [Play Preview] / [Reveal
+        # Preview]) launch external applications only; nothing is shown inline.
+        for label, callback in actions or ():
+            action_button = buttons.addButton(label, QDialogButtonBox.ButtonRole.ActionRole)
+            action_button.clicked.connect(
+                lambda checked=False, callback=callback: callback()
+            )
+            self.action_buttons.append(action_button)
         copy_button = buttons.addButton("Copy All", QDialogButtonBox.ButtonRole.ActionRole)
         copy_button.clicked.connect(self.copy_all)
         buttons.rejected.connect(self.reject)
@@ -2723,10 +2882,11 @@ class PreferencesDialog(QDialog):
         color_mode: str,
         accent_color: str,
         parent: QWidget | None = None,
+        preview_settings: PreviewSettings | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Preferences - {APP_NAME}")
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(520)
 
         search_group = QGroupBox("Search")
         self.include_paths_check = QCheckBox(
@@ -2780,6 +2940,13 @@ class PreferencesDialog(QDialog):
         self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
         self.color_mode_combo.currentIndexChanged.connect(self.emit_appearance_changed)
 
+        # Offline previews (spec §1).  The widget validates itself when the
+        # user enables previews and rolls the checkbox back on failure.
+        self.preview_widget = OfflinePreviewSettingsWidget(
+            preview_settings or PreviewSettings(),
+            parent=self,
+        )
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -2787,10 +2954,48 @@ class PreferencesDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(appearance_group)
+        content_layout.addWidget(search_group)
+        content_layout.addWidget(self.preview_widget)
+        content_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(content)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(appearance_group)
-        layout.addWidget(search_group)
+        layout.addWidget(scroll, 1)
         layout.addWidget(buttons)
+        self.resize(620, 760)
+
+    def preview_settings(self) -> PreviewSettings:
+        return self.preview_widget.settings()
+
+    def set_preview_settings(self, preview_settings: PreviewSettings) -> None:
+        self.preview_widget.set_settings(preview_settings)
+
+    def accept(self) -> None:  # type: ignore[override]
+        # Spec §35: an enabled configuration that changed since it was last
+        # proven to work must be re-validated before it becomes active.  On
+        # failure the widget reverts to the last known-good configuration and
+        # the dialog stays open so the user can see what was restored.
+        widget = getattr(self, "preview_widget", None)
+        if widget is not None:
+            _settings, report = widget.validate_for_save()
+            if report is not None and not report.passed:
+                QMessageBox.warning(
+                    self,
+                    "Offline Previews",
+                    "The changed offline-preview configuration did not pass validation, so "
+                    "the last known-good configuration was restored.\n\n"
+                    + report.failure_summary(heading="Validation failed."),
+                )
+                return
+        super().accept()
 
     def choose_accent_color(self) -> None:
         starting_color = self._accent_color
@@ -2930,7 +3135,25 @@ class HelpDialog(QDialog):
              "Choose <b>File &gt; Create Catalogue Backup</b> for a compact, lossless "
              "<code>.zip</code>. Choose <b>File &gt; Restore Catalogue from Backup</b> "
              "to validate it, rebuild omitted indexes and other derived data, and save "
-             "the result as a normal <code>.jvvv</code> file."),
+             "the result as a normal <code>.jvvv</code> file. "
+             "JVVV catalogue backups do not include offline preview files; to back up "
+             "previews, copy the configured preview directory separately with your "
+             "normal file-copy or backup software."),
+            ("7. Offline previews",
+             "Under <b>Settings &gt; Preferences &gt; Offline Previews</b> choose a "
+             "preview storage directory (any local, removable, or network location), "
+             "pick the image and video quality you want to spend storage on, and tick "
+             "<b>Generate offline previews while scanning</b>. JVVV immediately tests "
+             "the directory, the image encoder, and FFmpeg's H.264 (libx264) encoder; "
+             "if anything fails, the box turns itself back off and the exact problem is "
+             "shown. Previews are named by each file's SHA-256 and preview profile, so "
+             "duplicates, renamed files, and several catalogues sharing one directory "
+             "reuse the same preview. After a scan, JVVV reports every preview that "
+             "could not be created. Use <b>Open Preview</b> / <b>Play Preview</b> in "
+             "an item's context menu to open the preview in your operating system's "
+             "default image or video application — JVVV never displays or plays media "
+             "itself. <b>Catalogue &gt; Preview Cache</b> shows what the preview "
+             "directory holds and lists previews not referenced by the open catalogue."),
         ]
         section_html = "".join(
             f"<h2>{title}</h2><p>{body}</p>" for title, body in sections
@@ -3055,17 +3278,38 @@ class ScanWorker(QObject):
     progress = Signal(int, int, str)
     stats_progress = Signal(int, int, str, int, int)
     review_requested = Signal(dict)
+    log_message = Signal(str)
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, db_path: Path, volume_id: int) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        volume_id: int,
+        *,
+        preview_settings: PreviewSettings | None = None,
+        preview_skip_reason: str | None = None,
+    ) -> None:
         super().__init__()
         self.db_path = db_path
         self.volume_id = volume_id
+        # ``preview_settings`` is only set when previews are enabled AND the
+        # scan-start preflight passed; ``preview_skip_reason`` records the
+        # user's choice to scan without previews after a failed preflight.
+        self.preview_settings = preview_settings
+        self.preview_skip_reason = preview_skip_reason
         self.cancel_requested = False
         self._review_event = Event()
         self._apply_reviewed_changes = False
         self._io_canceller = _SynchronousIoCanceller()
+
+    def _build_preview_service(self) -> PreviewService | None:
+        if self.preview_settings is None:
+            return None
+        return PreviewService(
+            self.preview_settings,
+            log_callback=self.log_message.emit,
+        )
 
     @Slot()
     def run(self) -> None:
@@ -3073,6 +3317,9 @@ class ScanWorker(QObject):
         try:
             self._io_canceller.start()
             db = Database(self.db_path)
+            preview_statistics: PreviewStatistics | None = None
+            if self.preview_skip_reason is not None:
+                preview_statistics = skipped_preflight_statistics(self.preview_skip_reason)
             scanner = VolumeScanner(
                 db,
                 progress_callback=lambda files, folders, path: self.progress.emit(files, folders, path),
@@ -3085,11 +3332,14 @@ class ScanWorker(QObject):
                 ),
                 cancel_callback=lambda: self.cancel_requested,
                 preview_callback=self.request_review,
+                preview_service=self._build_preview_service(),
+                preview_statistics=preview_statistics,
             )
             result = scanner.scan(self.volume_id)
             self.finished.emit(
                 {
                     "status": result.status,
+                    "outcome": result.outcome,
                     "files_seen": result.files_seen,
                     "folders_seen": result.folders_seen,
                     "errors_count": result.errors_count,
@@ -3100,6 +3350,7 @@ class ScanWorker(QObject):
                     "hash_errors": result.hash_errors,
                     "media_files": result.media_files,
                     "media_metadata_collected": result.media_metadata_collected,
+                    "preview": result.preview or {},
                 }
             )
         except Exception:
@@ -3617,6 +3868,12 @@ class MainWindow(QMainWindow):
         self.accent_color = normalize_accent_color(
             self.settings.value(ACCENT_COLOR_SETTING, DEFAULT_ACCENT_COLOR)
         )
+        self.preview_settings: PreviewSettings = load_preview_settings(self.settings)
+        self.preview_cache_dialog: PreviewCacheDialog | None = None
+        self.preview_store_thread: QThread | None = None
+        self.preview_store_worker: QObject | None = None
+        self.preview_store_operation = ""
+        self.last_preview_statistics: PreviewStatistics | None = None
         application = QApplication.instance()
         if isinstance(application, QApplication):
             apply_application_theme(
@@ -3808,6 +4065,14 @@ class MainWindow(QMainWindow):
         self.catalogue_info_action = QAction("Catalogue Info\u2026", self)
         self.catalogue_info_action.triggered.connect(self.show_catalogue_info)
         self.catalogue_menu.addAction(self.catalogue_info_action)
+
+        self.preview_cache_action = QAction("Preview Cache\u2026", self)
+        self.preview_cache_action.setToolTip(
+            "Inspect the offline preview directory and list previews not referenced by "
+            "this catalogue"
+        )
+        self.preview_cache_action.triggered.connect(self.show_preview_cache)
+        self.catalogue_menu.addAction(self.preview_cache_action)
 
         self.view_menu = self.app_menu_bar.addMenu("&View")
         self.zoom_in_action = QAction("Zoom In", self)
@@ -4434,8 +4699,13 @@ class MainWindow(QMainWindow):
         self.search_button.setObjectName("searchButton")
         self.open_file_button = QPushButton("Open")
         self.reveal_file_button = QPushButton("Reveal")
+        self.open_preview_button = QPushButton("Open Preview")
         self.open_file_button.setEnabled(False)
         self.reveal_file_button.setEnabled(False)
+        self.open_preview_button.setEnabled(False)
+        self.open_preview_button.setToolTip(
+            "Open the offline preview in the operating system's default application"
+        )
         self.search_backup_filter_combo = QComboBox()
         self.search_backup_filter_combo.setObjectName("searchBackupFilter")
         for label, key in BACKUP_FILTER_OPTIONS:
@@ -4453,6 +4723,7 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.search_backup_filter_combo)
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.open_file_button)
+        search_row.addWidget(self.open_preview_button)
         search_row.addWidget(self.reveal_file_button)
 
         self.search_table = QTableView()
@@ -4543,6 +4814,7 @@ class MainWindow(QMainWindow):
         self.search_table.doubleClicked.connect(self.open_search_index)
         self.search_table.customContextMenuRequested.connect(self.show_search_context_menu)
         self.open_file_button.clicked.connect(self.open_selected_search_item)
+        self.open_preview_button.clicked.connect(self.open_selected_search_preview)
         self.reveal_file_button.clicked.connect(lambda: self.open_selected_real_item(reveal=True))
 
         self.refresh_action = QAction("Refresh", self)
@@ -4556,6 +4828,7 @@ class MainWindow(QMainWindow):
             self.new_volume_action,
             self.backup_evidence_action,
             self.catalogue_info_action,
+            self.preview_cache_action,
             self.refresh_action,
         ]
         self.catalogue_widgets = [
@@ -4634,6 +4907,14 @@ class MainWindow(QMainWindow):
                     accent_color,
                 )
             )
+        current_preview_settings = getattr(self, "preview_settings", None)
+        preview_widget = getattr(dialog, "preview_widget", None)
+        if preview_widget is not None and current_preview_settings is not None:
+            preview_widget.set_settings(current_preview_settings)
+            # Spec §2: a successful enable-validation is persisted immediately.
+            preview_widget.validated.connect(
+                lambda validated: MainWindow.persist_preview_settings(self, validated)
+            )
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             MainWindow.apply_appearance(self, *original_appearance)
@@ -4649,7 +4930,17 @@ class MainWindow(QMainWindow):
             or color_mode != self.color_mode
             or accent_color != self.accent_color
         )
+        preview_getter = getattr(dialog, "preview_settings", None)
+        new_preview_settings = preview_getter() if callable(preview_getter) else None
+        preview_changed = (
+            new_preview_settings is not None
+            and new_preview_settings != current_preview_settings
+        )
+        if preview_changed:
+            MainWindow.persist_preview_settings(self, new_preview_settings)
         if not search_changed and not appearance_changed:
+            if preview_changed:
+                self.statusBar().showMessage("Preferences saved.", 3000)
             return
 
         self.search_include_paths = include_paths
@@ -4680,6 +4971,118 @@ class MainWindow(QMainWindow):
         if self.search_include_paths:
             return "Search filename, extension, folder, or relative path"
         return "Search filename, extension, or folder"
+
+    def persist_preview_settings(self, preview_settings: PreviewSettings) -> None:
+        """Store a validated offline-preview configuration and apply it now."""
+
+        self.preview_settings = preview_settings
+        save_preview_settings(self.settings, preview_settings)
+        dialog = getattr(self, "preview_cache_dialog", None)
+        if dialog is not None:
+            dialog.set_settings(preview_settings)
+        refresh_search = getattr(self, "on_search_selection_changed", None)
+        if callable(refresh_search):
+            refresh_search()
+
+    # -- offline previews: opening -------------------------------------------
+    def catalogue_item_media_kind(self, target: CatalogueItemRef) -> str | None:
+        if target.is_folder:
+            return None
+        return media_kind_for_extension(PurePosixPath(target.relative_path).suffix)
+
+    def preview_info_for_target(self, target: CatalogueItemRef):
+        """Return (media_kind, PreviewFileInfo | None, file_row | None)."""
+
+        media_kind = self.catalogue_item_media_kind(target)
+        if media_kind not in {"image", "video"} or self.db is None:
+            return media_kind, None, None
+        file_row = self.db.get_file(target.item_id)
+        if file_row is None:
+            return media_kind, None, None
+        info = inspect_preview_file(self.preview_settings, media_kind, file_row["content_hash"])
+        return media_kind, info, file_row
+
+    def preview_unavailable_reason(self, media_kind: str, info, file_row) -> str:
+        if self.preview_settings.root_path is None:
+            return "No preview storage directory is configured in Settings > Preferences."
+        if file_row is not None and file_row["content_hash"] is None:
+            return "No SHA-256 hash is recorded for this file, so no preview path can be derived."
+        if info is None:
+            return "The offline preview location could not be determined."
+        if not info.exists:
+            status = self.db.get_file_preview_status(int(file_row["id"])) if self.db is not None and file_row is not None else None
+            if status is not None and str(status["status"]) == DB_STATUS_FAILED:
+                detail = str(status["error_message"] or "").strip()
+                return "Preview generation failed during the last scan" + (f": {detail}" if detail else ".")
+            if not self.preview_settings.enabled:
+                return (
+                    "No preview exists at the expected location and offline preview "
+                    "generation is disabled in Settings."
+                )
+            return "No preview exists at the expected location. Rescan the volume to generate it."
+        if not info.valid:
+            return f"The preview file exists but is not valid: {info.message}"
+        return ""
+
+    def open_preview_for_target(self, target: CatalogueItemRef, *, reveal: bool = False) -> None:
+        media_kind, info, file_row = self.preview_info_for_target(target)
+        if media_kind not in {"image", "video"}:
+            return
+        if info is None or not info.exists or not info.valid:
+            # Spec §11/§46: a file at the preview path that fails validation
+            # is corrupt and must never be launched as if it were valid.  Only
+            # a genuinely absent file is recorded as missing; a corrupt one is
+            # left in place for the next scan to detect and regenerate.
+            if info is None or not info.exists:
+                self._mark_preview_missing(file_row)
+            reason = self.preview_unavailable_reason(media_kind, info, file_row)
+            QMessageBox.information(
+                self,
+                "Preview Not Available",
+                f"The offline preview is not available.\n\n{reason}",
+            )
+            self.on_search_selection_changed()
+            return
+        try:
+            # External applications only (spec §19, §44, §45): the operating
+            # system's default image/video handler, or the file manager.
+            open_in_file_manager(info.path, reveal=reveal)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Preview Failed", str(exc))
+
+    def _mark_preview_missing(self, file_row) -> None:
+        """Spec §46: a stored 'available' status must not survive a vanished file."""
+
+        if self.db is None or file_row is None:
+            return
+        try:
+            status = self.db.get_file_preview_status(int(file_row["id"]))
+            if status is None or str(status["status"]) != DB_STATUS_AVAILABLE:
+                return
+            with self.db.transaction():
+                self.db.replace_file_preview_status(
+                    int(file_row["id"]),
+                    {
+                        "media_kind": status["media_kind"],
+                        "profile_id": status["profile_id"],
+                        "status": DB_STATUS_MISSING,
+                        "source_hash": status["source_hash"],
+                        "error_stage": "preview-missing",
+                        "error_message": (
+                            "The preview file recorded by the last scan is no longer present "
+                            "at the expected location."
+                        ),
+                    },
+                )
+        except Exception:
+            # Never let bookkeeping stop the user from seeing the message.
+            pass
+
+    def open_selected_search_preview(self) -> None:
+        item = self.selected_search_item()
+        if item is None or item.is_folder:
+            return
+        self.open_preview_for_target(self.catalogue_ref_for_search_item(item))
 
     def open_catalogue_location(self) -> None:
         if self.catalogue_path is None:
@@ -5155,7 +5558,7 @@ class MainWindow(QMainWindow):
             "The lossless catalogue backup was created successfully.\n\n"
             f"Original catalogue: {format_size(result.original_size)}\n"
             f"Backup ZIP: {format_size(result.backup_size)}\n"
-            f"{saving_text}\n\n{result.backup_path}",
+            f"{saving_text}\n\n{result.backup_path}\n\n{BACKUP_POLICY_TEXT}",
         )
         self.statusBar().showMessage("Catalogue backup created.", 5000)
 
@@ -5532,6 +5935,8 @@ class MainWindow(QMainWindow):
             return False
         if not self._stop_search_for_catalogue_close():
             return False
+        if not self._stop_preview_store_for_close():
+            return False
 
         db = self.db
         lock = self.catalogue_lock
@@ -5543,6 +5948,9 @@ class MainWindow(QMainWindow):
         if self.backup_evidence_dialog is not None:
             self.backup_evidence_dialog.close()
             self.backup_evidence_dialog = None
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.close()
+            self.preview_cache_dialog = None
         self._set_catalogue_open(False)
 
         try:
@@ -5786,9 +6194,18 @@ class MainWindow(QMainWindow):
             or self.catalogue_info_worker is not None
             or getattr(self, "catalogue_archive_worker", None) is not None
             or getattr(self, "backup_analysis_worker", None) is not None
+            or getattr(self, "preview_store_worker", None) is not None
         )
 
     def _show_catalogue_job_running_message(self) -> None:
+        if getattr(self, "preview_store_worker", None) is not None:
+            QMessageBox.information(
+                self,
+                "Preview Cache Busy",
+                "Wait for the preview cache operation to finish or cancel it in "
+                "Catalogue > Preview Cache.",
+            )
+            return
         if self.delete_worker is not None:
             QMessageBox.information(
                 self,
@@ -6291,21 +6708,42 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Scan Location Failed", str(exc))
             return
 
+        preview_plan = self.plan_scan_previews()
+        if preview_plan is None:
+            return
+        preview_settings, preview_skip_reason = preview_plan
+
         self.scan_progress.setRange(0, 0)
-        self.scan_progress.setFormat("Starting scan · SHA-256 hashing enabled...")
+        if preview_settings is not None:
+            self.scan_progress.setFormat(
+                "Starting scan · SHA-256 hashing enabled · offline previews enabled..."
+            )
+        else:
+            self.scan_progress.setFormat("Starting scan · SHA-256 hashing enabled...")
         self.scan_progress.setToolTip(
             "Scans read every regular file to record a full SHA-256 content hash. "
             "Media details are collected when supported."
+            + (
+                " Offline previews are generated or reused for images and videos."
+                if preview_settings is not None
+                else ""
+            )
         )
         self.statusBar().showMessage("Scanning and hashing file contents...")
         self.scan_cancel_requested = False
         self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
         self._set_scan_running_ui(True)
 
-        self.scan_worker = ScanWorker(self.db.path, volume["id"])
+        self.scan_worker = ScanWorker(
+            self.db.path,
+            volume["id"],
+            preview_settings=preview_settings,
+            preview_skip_reason=preview_skip_reason,
+        )
         self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.stats_progress.connect(self.on_scan_stats_progress)
         self.scan_worker.review_requested.connect(self.on_scan_review_requested)
+        self.scan_worker.log_message.connect(self.on_scan_log_message)
         self.scan_worker.finished.connect(self.on_scan_finished)
         self.scan_worker.failed.connect(self.on_scan_failed)
         self.scan_thread = _create_worker_thread(
@@ -6322,6 +6760,77 @@ class MainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "Choose Scan Location", initial_dir)
         return directory or None
 
+    def plan_scan_previews(self) -> tuple[PreviewSettings | None, str | None] | None:
+        """Scan-start preview preflight (spec §26, §27).
+
+        Returns ``(settings, None)`` to scan with previews, ``(None, None)`` when
+        previews are disabled, ``(None, reason)`` when the user chose to scan
+        without previews after a failed preflight, or ``None`` to cancel the scan.
+        """
+
+        while True:
+            settings = self.preview_settings
+            if not settings.enabled:
+                return None, None
+            report = self.run_preview_preflight(settings)
+            if report.passed:
+                return settings, None
+            choice = self.ask_preview_preflight_decision(report)
+            if choice == "settings":
+                self.show_preferences()
+                continue
+            if choice == "without":
+                failure = report.first_failure
+                reason = (
+                    f"{failure.label}: {failure.detail}"
+                    if failure is not None
+                    else "the preview configuration failed validation"
+                )
+                return None, reason
+            return None
+
+    def run_preview_preflight(self, settings: PreviewSettings) -> PreviewValidationReport:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return preflight_preview_configuration(settings)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def ask_preview_preflight_decision(self, report: PreviewValidationReport) -> str:
+        """Blocking decision dialog; returns 'settings', 'without', or 'cancel'."""
+
+        failure = report.first_failure
+        problem = "The preview configuration failed validation."
+        if failure is not None:
+            problem = f"{failure.label} failed."
+            if failure.detail:
+                problem += f"\n{failure.detail}"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Offline Preview Preflight Failed")
+        box.setText(
+            "Offline preview generation is enabled, but the configuration is not working."
+        )
+        box.setInformativeText(f"Problem:\n{problem}")
+        box.setDetailedText(report.report_text())
+        settings_button = box.addButton("Open Settings", QMessageBox.ButtonRole.ActionRole)
+        without_button = box.addButton("Scan Without Previews", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = box.addButton("Cancel Scan", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == settings_button:
+            return "settings"
+        if clicked == without_button:
+            return "without"
+        return "cancel"
+
+    @Slot(str)
+    def on_scan_log_message(self, message: str) -> None:
+        if hasattr(self, "scan_log"):
+            self.scan_log.appendPlainText(message)
+
     def cancel_scan(self) -> None:
         if self.scan_worker is None or self.scan_cancel_requested:
             return
@@ -6337,7 +6846,7 @@ class MainWindow(QMainWindow):
             return
         if self.scan_progress.maximum() != 0:
             self.scan_progress.setRange(0, 0)
-        if current_path.startswith(("Hashing SHA-256", "Reading media details")):
+        if current_path.startswith(SCAN_PROGRESS_DETAIL_PREFIXES):
             self.scan_progress.setFormat(
                 f"{current_path} · {files_seen:,} files catalogued"
             )
@@ -6467,19 +6976,99 @@ class MainWindow(QMainWindow):
         status = result.get("status", "completed")
         if status != "completed":
             self.post_scan_edit_volume_id = None
-        self.scan_progress.setFormat(status.title())
+        statistics = PreviewStatistics.from_dict(result.get("preview") or {})
+        self.last_preview_statistics = statistics
+        outcome = result.get("outcome") or status
+        preview_warning = outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+        # Spec §15: never a generic "completed" when previews failed.
+        self.scan_progress.setFormat(
+            "Completed with preview errors" if preview_warning else status.title()
+        )
         hash_errors = int(result.get("hash_errors", 0))
         access_errors = max(0, int(result.get("errors_count", 0)) - hash_errors)
+        preview_text = ""
+        if statistics.mode == MODE_ENABLED:
+            preview_text = (
+                f" Offline previews: {statistics.total_generated} generated, "
+                f"{statistics.total_reused} reused, {statistics.total_failed} failed"
+                + (
+                    f", {statistics.storage_skipped} skipped (storage unavailable)"
+                    if statistics.storage_skipped
+                    else ""
+                )
+                + "."
+            )
+        elif statistics.mode == MODE_SKIPPED_PREFLIGHT:
+            preview_text = " Offline previews skipped (preflight failed)."
         self.statusBar().showMessage(
-            f"Scan {status}: {result.get('files_seen', 0)} files, "
+            f"Scan {outcome.replace('_', ' ')}: {result.get('files_seen', 0)} files, "
             f"{result.get('files_hashed', 0)} SHA-256 hashes "
             f"({format_size(int(result.get('bytes_hashed', 0)))} read), "
             f"{result.get('media_metadata_collected', 0)}/"
             f"{result.get('media_files', 0)} media probes succeeded, "
-            f"{access_errors} incomplete/access issues, {hash_errors} hash unavailable.",
+            f"{access_errors} incomplete/access issues, {hash_errors} hash unavailable."
+            f"{preview_text}",
             8000,
         )
         self.refresh_after_catalogue_write()
+        self.report_preview_results(status, statistics)
+
+    def report_preview_results(self, status: str, statistics: PreviewStatistics) -> None:
+        """End-of-scan preview report (spec §15, §16, §17): never only in a log."""
+
+        if statistics.mode != MODE_ENABLED:
+            return
+        if status != "completed" and statistics.total_attempted == 0:
+            return
+        root = self.preview_settings.root_directory or None
+        summary = statistics.summary_text(root)
+        box = QMessageBox(self)
+        if statistics.has_problems:
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Scan Completed with Preview Errors")
+            headline = (
+                "Scan completed with preview errors."
+                if status == "completed"
+                else f"Scan {status} — some offline previews were not created."
+            )
+            headline += (
+                "\n\nCatalogue indexing succeeded, but some offline previews were not created."
+                if status == "completed"
+                else ""
+            )
+        else:
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Offline Preview Summary")
+            headline = (
+                "Scan completed. All offline previews were generated or reused."
+                if status == "completed"
+                else f"Scan {status}. Offline preview results so far:"
+            )
+        box.setText(headline)
+        box.setInformativeText(summary)
+        failures_button = None
+        if statistics.failures or statistics.storage_skipped:
+            failures_button = box.addButton(
+                "View Preview Failures",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+        close_button = box.addButton(QMessageBox.StandardButton.Close)
+        box.setDefaultButton(close_button)
+        box.setEscapeButton(close_button)
+        box.exec()
+        if failures_button is not None and box.clickedButton() == failures_button:
+            self.show_preview_failures(statistics)
+
+    def show_preview_failures(self, statistics: PreviewStatistics | None = None) -> None:
+        statistics = statistics or self.last_preview_statistics
+        if statistics is None:
+            return
+        dialog = PreviewFailuresDialog(
+            list(statistics.failures),
+            self,
+            storage_unavailable_reason=statistics.storage_unavailable_reason,
+        )
+        dialog.exec()
 
     @Slot(str)
     def on_scan_failed(self, details: str) -> None:
@@ -6884,6 +7473,37 @@ class MainWindow(QMainWindow):
             lambda checked=False, target=target: self.copy_catalogue_item_path(target)
         )
 
+        media_kind = (
+            None
+            if target.is_folder
+            else media_kind_for_extension(PurePosixPath(target.relative_path).suffix)
+        )
+        if media_kind in {"image", "video"}:
+            # Spec §19/§45/§46: external-only opening; enabled iff the preview
+            # file exists AND passes validation (a corrupt file is never
+            # treated as valid), with the reason shown as a tooltip otherwise.
+            _kind, info, file_row = self.preview_info_for_target(target)
+            available = info is not None and info.exists and info.valid
+            reason = "" if available else self.preview_unavailable_reason(media_kind, info, file_row)
+            preview_action = menu.addAction(preview_open_label(media_kind))
+            preview_action.setEnabled(available)
+            if reason:
+                preview_action.setToolTip(reason)
+                preview_action.setStatusTip(reason)
+            preview_action.triggered.connect(
+                lambda checked=False, target=target: self.open_preview_for_target(target)
+            )
+            reveal_preview_action = menu.addAction("Reveal Preview")
+            reveal_preview_action.setEnabled(available)
+            if reason:
+                reveal_preview_action.setToolTip(reason)
+            reveal_preview_action.triggered.connect(
+                lambda checked=False, target=target: self.open_preview_for_target(
+                    target,
+                    reveal=True,
+                )
+            )
+
         menu.addSeparator()
         properties_action = menu.addAction("Properties")
         properties_action.triggered.connect(
@@ -6972,8 +7592,37 @@ class MainWindow(QMainWindow):
             name,
             type_label,
             self.catalogue_item_property_rows(record),
+            actions=self.preview_property_actions(record),
         )
         dialog.exec()
+
+    def preview_property_actions(self, record) -> list[tuple[str, Callable[[], None]]]:
+        """[Open/Play Preview] and [Reveal Preview] for a file whose preview is usable."""
+
+        if record["item_type"] != "file":
+            return []
+        target = CatalogueItemRef(
+            item_type="file",
+            item_id=int(record["item_id"]),
+            volume_id=int(record["volume_id"]),
+            relative_path=record["relative_path"] or "",
+            missing=bool(record["missing"]),
+        )
+        media_kind, info, _file_row = self.preview_info_for_target(target)
+        if media_kind not in {"image", "video"} or info is None:
+            return []
+        if not (info.exists and info.valid):
+            return []
+        return [
+            (
+                preview_open_label(media_kind),
+                lambda target=target: self.open_preview_for_target(target),
+            ),
+            (
+                "Reveal Preview",
+                lambda target=target: self.open_preview_for_target(target, reveal=True),
+            ),
+        ]
 
     def browser_item_from_record(self, record, type_label: str) -> BrowserItem:
         return BrowserItem(
@@ -7099,6 +7748,15 @@ class MainWindow(QMainWindow):
                 if record_field("media_probed_at"):
                     properties.append(
                         ("Media details recorded", self._display_time(record_field("media_probed_at")))
+                    )
+                preview_kind = media_kind_for_extension(extension)
+                if preview_kind in {"image", "video"}:
+                    properties.extend(
+                        preview_property_rows(
+                            record,
+                            getattr(self, "preview_settings", None),
+                            preview_kind,
+                        )
                     )
         else:
             properties.extend(
@@ -7451,6 +8109,26 @@ class MainWindow(QMainWindow):
         real_available = item is not None and not item.missing and real_path is not None and real_path.exists()
         self.open_file_button.setEnabled(item is not None and (item.is_folder or real_available))
         self.reveal_file_button.setEnabled(real_available)
+        preview_button = getattr(self, "open_preview_button", None)
+        if preview_button is None:
+            return
+        preview_available = False
+        label = "Open Preview"
+        tooltip = "Open the offline preview in the operating system's default application"
+        if item is not None and not item.is_folder and getattr(self, "db", None) is not None:
+            target = self.catalogue_ref_for_search_item(item)
+            media_kind, info, file_row = self.preview_info_for_target(target)
+            if media_kind in {"image", "video"}:
+                label = preview_open_label(media_kind)
+                # Spec §46: an existing-but-corrupt preview is not available.
+                preview_available = info is not None and info.exists and info.valid
+                if not preview_available:
+                    tooltip = self.preview_unavailable_reason(media_kind, info, file_row)
+            else:
+                tooltip = "Offline previews are available for images and videos only."
+        preview_button.setText(label)
+        preview_button.setEnabled(preview_available)
+        preview_button.setToolTip(tooltip)
 
     def selected_search_item(self) -> SearchResultItem | None:
         return self.search_model.item_at(self.search_table.currentIndex())
@@ -7574,6 +8252,28 @@ class MainWindow(QMainWindow):
                     f"{format_size(row['bytes_after'])} "
                     f"({delta_prefix}{format_size(abs(size_delta))})"
                 )
+            preview_mode = str(row["preview_mode"] or "disabled")
+            if preview_mode == MODE_ENABLED:
+                storage_skipped = int(row["previews_storage_skipped"] or 0)
+                lines.append(
+                    "  Offline previews: images "
+                    f"{int(row['image_previews_generated'] or 0):,} generated, "
+                    f"{int(row['image_previews_reused'] or 0):,} reused, "
+                    f"{int(row['image_previews_failed'] or 0):,} failed; videos "
+                    f"{int(row['video_previews_generated'] or 0):,} generated, "
+                    f"{int(row['video_previews_reused'] or 0):,} reused, "
+                    f"{int(row['video_previews_failed'] or 0):,} failed; "
+                    f"{format_size(int(row['preview_bytes_written'] or 0))} written"
+                    + (
+                        f"; {storage_skipped:,} not attempted (preview storage unavailable)"
+                        if storage_skipped
+                        else ""
+                    )
+                )
+            elif preview_mode == MODE_SKIPPED_PREFLIGHT:
+                lines.append("  Offline previews: skipped because the preflight check failed")
+            if row["preview_message"]:
+                lines.append(f"  {row['preview_message']}")
             if row["message"]:
                 lines.append(f"  {row['message']}")
         if errors:
@@ -7581,7 +8281,214 @@ class MainWindow(QMainWindow):
             lines.append("Recent errors:")
             for row in errors:
                 lines.append(f"{self._display_time(row['created_at'])} - {row['path']}: {row['message']}")
+        preview_failures = self.db.list_preview_failures(volume_id, limit=500)
+        if preview_failures:
+            lines.append("")
+            lines.append(
+                f"Offline preview failures recorded for indexed files ({len(preview_failures):,}):"
+            )
+            for row in preview_failures:
+                stage = f" [{row['error_stage']}]" if row["error_stage"] else ""
+                lines.append(
+                    f"{self._display_time(row['updated_at'])} - {row['relative_path']}"
+                    f"{stage}: {row['error_message']}"
+                )
         self.scan_log.setPlainText("\n".join(lines))
+
+    # -- offline previews: cache manager (spec §22) --------------------------
+    def show_preview_cache(self) -> None:
+        if self.db is None:
+            return
+        if self.preview_cache_dialog is None:
+            dialog = PreviewCacheDialog(self.preview_settings, self)
+            dialog.scan_requested.connect(self.start_preview_store_scan)
+            dialog.unreferenced_requested.connect(self.start_unreferenced_preview_scan)
+            dialog.delete_requested.connect(self.start_delete_previews)
+            dialog.open_folder_requested.connect(self.open_preview_folder)
+            dialog.cancel_requested.connect(self.cancel_preview_store_operation)
+            self.preview_cache_dialog = dialog
+        else:
+            self.preview_cache_dialog.set_settings(self.preview_settings)
+        self.preview_cache_dialog.show()
+        self.preview_cache_dialog.raise_()
+        self.preview_cache_dialog.activateWindow()
+
+    def open_preview_folder(self) -> None:
+        root = self.preview_settings.root_path
+        if root is None:
+            QMessageBox.information(
+                self,
+                "Preview Cache",
+                "Choose a preview storage directory in Settings > Preferences first.",
+            )
+            return
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            open_in_file_manager(root, reveal=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Preview Folder Failed", str(exc))
+
+    def _preview_store_ready(self) -> bool:
+        if self.preview_settings.root_path is None:
+            QMessageBox.information(
+                self,
+                "Preview Cache",
+                "Choose a preview storage directory in Settings > Preferences first.",
+            )
+            return False
+        if self._catalogue_job_running():
+            self._show_catalogue_job_running_message()
+            return False
+        return True
+
+    def _start_preview_store_worker(self, worker: QObject, operation: str, message: str) -> None:
+        self.preview_store_worker = worker
+        self.preview_store_operation = operation
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_busy(True, message)
+        worker.progress.connect(self.on_preview_store_progress)
+        worker.failed.connect(self.on_preview_store_failed)
+        self.preview_store_thread = _create_worker_thread(
+            self,
+            worker,
+            (worker.finished, worker.failed),
+            self.clear_preview_store_worker,
+        )
+        self.statusBar().showMessage(message)
+        self.preview_store_thread.start()
+
+    def start_preview_store_scan(self) -> None:
+        if not self._preview_store_ready():
+            return
+        worker = PreviewStoreStatisticsWorker(self.preview_settings)
+        worker.finished.connect(self.on_preview_store_statistics)
+        self._start_preview_store_worker(worker, "scan", "Scanning the preview store…")
+
+    def start_unreferenced_preview_scan(self) -> None:
+        if not self._preview_store_ready() or self.db is None:
+            return
+        worker = UnreferencedPreviewWorker(self.preview_settings, self.db.path)
+        worker.finished.connect(self.on_unreferenced_previews)
+        self._start_preview_store_worker(
+            worker,
+            "unreferenced",
+            "Comparing the preview store with this catalogue's SHA-256 hashes…",
+        )
+
+    def start_delete_previews(self, paths: list) -> None:
+        if not paths or not self._preview_store_ready():
+            return
+        worker = DeletePreviewsWorker(self.preview_settings, [str(path) for path in paths])
+        worker.finished.connect(self.on_previews_deleted)
+        self._start_preview_store_worker(worker, "delete", "Deleting selected previews…")
+
+    def cancel_preview_store_operation(self) -> None:
+        worker = self.preview_store_worker
+        if worker is not None and hasattr(worker, "cancel"):
+            worker.cancel()
+            if self.preview_cache_dialog is not None:
+                self.preview_cache_dialog.set_busy(True, "Cancelling…")
+
+    @Slot(int, str)
+    def on_preview_store_progress(self, count: int, message: str) -> None:
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_progress(count, message)
+
+    @Slot(object, object)
+    def on_preview_store_statistics(self, statistics: object, free_bytes: object) -> None:
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_store_statistics(
+                statistics if isinstance(statistics, PreviewStoreStatistics) else None,
+                int(free_bytes) if free_bytes is not None else None,
+            )
+        self.statusBar().showMessage("Preview store scanned.", 4000)
+
+    @Slot(list, int)
+    def on_unreferenced_previews(self, entries: list, total_found: int) -> None:
+        worker = getattr(self, "preview_store_worker", None)
+        cancelled = bool(
+            worker is not None
+            and hasattr(worker, "is_cancelled")
+            and worker.is_cancelled()
+        )
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_unreferenced(
+                [entry for entry in entries if isinstance(entry, PreviewEntry)],
+                int(total_found),
+                partial=cancelled,
+            )
+        if cancelled:
+            self.statusBar().showMessage(
+                "Unreferenced-preview comparison cancelled; the list is incomplete.",
+                6000,
+            )
+        else:
+            self.statusBar().showMessage(
+                f"{int(total_found):,} previews are not referenced by this catalogue.",
+                6000,
+            )
+
+    @Slot(int, list, list)
+    def on_previews_deleted(self, deleted_count: int, deleted_paths: list, errors: list) -> None:
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.remove_entries([str(path) for path in deleted_paths])
+            self.preview_cache_dialog.set_busy(
+                False,
+                f"{int(deleted_count):,} previews deleted"
+                + (f"; {len(errors):,} could not be deleted." if errors else "."),
+            )
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Some Previews Were Not Deleted",
+                f"{int(deleted_count):,} previews were deleted. "
+                f"{len(errors):,} could not be deleted:\n\n" + "\n".join(str(e) for e in errors[:20])
+                + ("\n…" if len(errors) > 20 else ""),
+            )
+        self.statusBar().showMessage(f"{int(deleted_count):,} previews deleted.", 5000)
+
+    @Slot(str)
+    def on_preview_store_failed(self, details: str) -> None:
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_busy(False, "The preview cache operation failed.")
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setWindowTitle("Preview Cache Operation Failed")
+        dialog.setText("The preview cache operation could not be completed.")
+        dialog.setDetailedText(details)
+        dialog.exec()
+
+    @Slot()
+    def clear_preview_store_worker(self) -> None:
+        self.preview_store_worker = None
+        self.preview_store_thread = None
+        self.preview_store_operation = ""
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_busy(False)
+
+    def _stop_preview_store_for_close(self) -> bool:
+        worker = getattr(self, "preview_store_worker", None)
+        thread = getattr(self, "preview_store_thread", None)
+        if worker is None or thread is None or not thread.isRunning():
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Preview Cache Busy",
+            "A preview cache operation is still running. Cancel it before closing?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        if hasattr(worker, "cancel"):
+            worker.cancel()
+        if _wait_for_worker_thread(lambda: self.preview_store_thread):
+            return True
+        QMessageBox.information(
+            self,
+            "Preview Cache Cancelling",
+            "Cancellation has been requested. Close the catalogue after the operation stops.",
+        )
+        return False
 
     def _display_time(self, value: str | None) -> str:
         return display_db_time(value)

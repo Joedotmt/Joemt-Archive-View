@@ -55,7 +55,8 @@ def test_database_initializes_schema(tmp_path):
             "backup_volume_results",
             "backup_mirror_candidates",
         } <= tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert "file_preview_status" in tables
         assert {"files_fts", "folders_fts"} <= tables
         folder_indexes = {
             row["name"]
@@ -1014,5 +1015,242 @@ def test_file_media_metadata_api_replaces_and_clears_one_to_one_record(tmp_path)
         with db.transaction():
             db.replace_file_media_metadata(file_id, None)
         assert db.get_file_media_metadata(file_id) is None
+    finally:
+        db.close()
+
+
+def _catalogue_with_media_files(db, tmp_path):
+    """Create one volume with an image, a video, and a text file; return their IDs."""
+
+    scanned_at = "2026-09-01T12:00:00.000000+0000"
+    volume_id = db.create_volume("Archive", str(tmp_path))
+    ids = {}
+    with db.transaction():
+        folder_id = db.ensure_folder(
+            volume_id=volume_id,
+            parent_id=None,
+            name="Archive",
+            relative_path="",
+            scanned_at=scanned_at,
+        )
+        for name, extension, digest in (
+            ("photo.jpg", "jpg", bytes([1]) * 32),
+            ("clip.mp4", "mp4", bytes([2]) * 32),
+            ("notes.txt", "txt", bytes([3]) * 32),
+            ("unhashed.png", "png", None),
+        ):
+            ids[name] = db.upsert_file(
+                volume_id=volume_id,
+                folder_id=folder_id,
+                name=name,
+                relative_path=name,
+                extension=extension,
+                size_bytes=10,
+                modified_at=None,
+                scanned_at=scanned_at,
+                content_hash=digest,
+                content_hash_algorithm="sha256" if digest is not None else None,
+            )
+    return volume_id, ids
+
+
+def test_file_preview_status_api_stores_validates_and_clears_records(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id, ids = _catalogue_with_media_files(db, tmp_path)
+        digest = bytes([1]) * 32
+        with db.transaction():
+            db.replace_file_preview_status(
+                ids["photo.jpg"],
+                {
+                    "media_kind": "image",
+                    "profile_id": "jpeg-max1600-q82",
+                    "status": "available",
+                    "source_hash": digest,
+                    "preview_size": 2**40 + 5,
+                    "preview_width": 1600,
+                    "preview_height": 1067,
+                    "generated_at": "2026-09-01T12:00:01.000000+0000",
+                },
+            )
+            db.replace_file_preview_status(
+                ids["clip.mp4"],
+                {
+                    "media_kind": "video",
+                    "profile_id": "h264-1fps-240p-crf35-veryfast",
+                    "status": "failed",
+                    "source_hash": bytes([2]) * 32,
+                    "error_stage": "ffmpeg-exit",
+                    "error_message": "FFmpeg exited with code 1.",
+                },
+            )
+
+        photo = db.get_file_preview_status(ids["photo.jpg"])
+        assert photo["status"] == "available"
+        assert photo["media_kind"] == "image"
+        assert photo["profile_id"] == "jpeg-max1600-q82"
+        assert bytes(photo["source_hash"]) == digest
+        assert photo["preview_size"] == 2**40 + 5  # 64-bit byte counts survive
+        assert (photo["preview_width"], photo["preview_height"]) == (1600, 1067)
+        assert photo["error_message"] == ""
+        assert photo["updated_at"]
+
+        clip = db.get_file_preview_status(ids["clip.mp4"])
+        assert clip["status"] == "failed"
+        assert clip["error_stage"] == "ffmpeg-exit"
+        assert clip["preview_size"] is None
+
+        assert db.count_preview_statuses(volume_id) == {"available": 1, "failed": 1}
+        assert db.count_preview_statuses() == {"available": 1, "failed": 1}
+
+        failures = db.list_preview_failures(volume_id)
+        assert [row["relative_path"] for row in failures] == ["clip.mp4"]
+        assert failures[0]["error_message"] == "FFmpeg exited with code 1."
+        assert bytes(failures[0]["content_hash"]) == bytes([2]) * 32
+        assert db.list_preview_failures(volume_id, limit=0) == []
+
+        properties = db.get_item_properties("file", ids["clip.mp4"])
+        assert properties["preview_status"] == "failed"
+        assert properties["preview_error_stage"] == "ffmpeg-exit"
+        assert properties["preview_profile_id"] == "h264-1fps-240p-crf35-veryfast"
+        assert db.get_item_properties("file", ids["notes.txt"])["preview_status"] is None
+
+        # Replacing overwrites the single row per file; None removes it.
+        with db.transaction():
+            db.replace_file_preview_status(
+                ids["clip.mp4"],
+                {
+                    "media_kind": "video",
+                    "profile_id": "h264-1fps-240p-crf35-veryfast",
+                    "status": "available",
+                    "preview_size": 10,
+                },
+            )
+        assert db.get_file_preview_status(ids["clip.mp4"])["status"] == "available"
+        assert db.list_preview_failures(volume_id) == []
+        with db.transaction():
+            db.replace_file_preview_status(ids["clip.mp4"], None)
+        assert db.get_file_preview_status(ids["clip.mp4"]) is None
+
+        # Invalid values are rejected before anything is stored.
+        for bad in (
+            {"media_kind": "image", "profile_id": "p", "status": "sometimes"},
+            {"media_kind": "audio", "profile_id": "p", "status": "available"},
+            {"media_kind": "image", "profile_id": "", "status": "available"},
+            {"media_kind": "image", "profile_id": "p", "status": "available", "source_hash": b"short"},
+        ):
+            with pytest.raises(ValueError):
+                db.replace_file_preview_status(ids["photo.jpg"], bad)
+        assert db.get_file_preview_status(ids["photo.jpg"]) is None
+    finally:
+        db.close()
+
+
+def test_file_preview_status_rows_follow_their_file(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id, ids = _catalogue_with_media_files(db, tmp_path)
+        with db.transaction():
+            db.replace_file_preview_status(
+                ids["photo.jpg"],
+                {"media_kind": "image", "profile_id": "p", "status": "missing"},
+            )
+        db.delete_volume(volume_id)
+        assert count_rows(db, "file_preview_status") == 0
+    finally:
+        db.close()
+
+
+def test_content_hash_lookup_reports_only_requested_extensions(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        _catalogue_with_media_files(db, tmp_path)
+        inserted = db.prepare_content_hash_lookup({".JPG", "png", ""})
+        assert inserted == 1  # the PNG has no hash; the JPG is matched case-insensitively
+        assert db.content_hash_referenced(bytes([1]) * 32)
+        assert not db.content_hash_referenced(bytes([2]) * 32)  # mp4 was not requested
+        assert not db.content_hash_referenced(bytes([3]) * 32)
+
+        assert db.prepare_content_hash_lookup(["mp4", "txt"]) == 2
+        assert db.content_hash_referenced(bytes([2]) * 32)
+        assert not db.content_hash_referenced(bytes([1]) * 32)
+
+        assert db.prepare_content_hash_lookup([]) == 0
+        assert not db.content_hash_referenced(bytes([2]) * 32)
+        db.drop_content_hash_lookup()
+        db.drop_content_hash_lookup()  # idempotent
+    finally:
+        db.close()
+
+
+def test_content_hash_lookup_works_on_a_read_only_connection(tmp_path):
+    path = tmp_path / "catalogue.sqlite3"
+    writer = Database(path)
+    try:
+        _catalogue_with_media_files(writer, tmp_path)
+    finally:
+        writer.close()
+
+    reader = Database(path, initialize=False, create=False, read_only=True)
+    try:
+        # The Preview Cache manager opens the catalogue read-only; the lookup
+        # lives in a TEMP table, which query_only would otherwise refuse.
+        assert reader.prepare_content_hash_lookup(["jpg", "mp4"]) == 2
+        assert reader.content_hash_referenced(bytes([1]) * 32)
+        assert reader.content_hash_referenced(bytes([2]) * 32)
+        assert not reader.content_hash_referenced(bytes([3]) * 32)
+        reader.drop_content_hash_lookup()
+        # The connection is still read-only for the main database afterwards.
+        assert reader.connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            reader.connection.execute("DELETE FROM files")
+    finally:
+        reader.close()
+
+
+def test_finish_scan_persists_preview_summary_and_rejects_unknown_modes(tmp_path):
+    db = Database(tmp_path / "catalogue.sqlite3")
+    try:
+        volume_id = db.create_volume("Archive", str(tmp_path))
+        scan_id = db.start_scan(volume_id)
+        db.finish_scan(
+            scan_id,
+            "completed",
+            3,
+            1,
+            0,
+            "Catalogue indexing succeeded, but 1 offline preview was not created.",
+            preview_summary={
+                "mode": "enabled",
+                "image_generated": 2,
+                "image_reused": 1,
+                "image_failed": 1,
+                "video_generated": 0,
+                "video_reused": 4,
+                "video_failed": 0,
+                "storage_skipped": 7,
+                "bytes_written": 2**41,
+                "message": "Preview storage became unavailable: disk full",
+            },
+        )
+        row = db.list_scan_history(volume_id)[0]
+        assert row["preview_mode"] == "enabled"
+        assert row["image_previews_generated"] == 2
+        assert row["image_previews_reused"] == 1
+        assert row["image_previews_failed"] == 1
+        assert row["video_previews_reused"] == 4
+        assert row["previews_storage_skipped"] == 7
+        assert row["preview_bytes_written"] == 2**41
+        assert row["preview_message"].startswith("Preview storage became unavailable")
+
+        default_scan = db.start_scan(volume_id)
+        db.finish_scan(default_scan, "completed", 0, 0, 0)
+        default_row = db.list_scan_history(volume_id)[0]
+        assert default_row["preview_mode"] == "disabled"
+        assert default_row["preview_bytes_written"] == 0
+
+        rejected_scan = db.start_scan(volume_id)
+        with pytest.raises(ValueError):
+            db.finish_scan(rejected_scan, "completed", 0, 0, 0, preview_summary={"mode": "maybe"})
     finally:
         db.close()

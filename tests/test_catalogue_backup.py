@@ -115,6 +115,21 @@ SOURCE_TABLES = {
         "message",
         "probed_at",
     ),
+    "file_preview_status": (
+        "file_id",
+        "media_kind",
+        "profile_id",
+        "status",
+        "source_hash",
+        "preview_size",
+        "preview_width",
+        "preview_height",
+        "preview_duration_ms",
+        "generated_at",
+        "error_stage",
+        "error_message",
+        "updated_at",
+    ),
     "scan_history": (
         "id",
         "volume_id",
@@ -137,6 +152,16 @@ SOURCE_TABLES = {
         "hash_errors",
         "media_files",
         "media_metadata_collected",
+        "preview_mode",
+        "image_previews_generated",
+        "image_previews_reused",
+        "image_previews_failed",
+        "video_previews_generated",
+        "video_previews_reused",
+        "video_previews_failed",
+        "previews_storage_skipped",
+        "preview_bytes_written",
+        "preview_message",
     ),
     "scan_errors": (
         "id",
@@ -153,6 +178,7 @@ PRIMARY_KEYS = {
     "folders": "id",
     "files": "id",
     "file_media_metadata": "file_id",
+    "file_preview_status": "file_id",
     "scan_history": "id",
     "scan_errors": "id",
 }
@@ -171,6 +197,7 @@ EXPECTED_ROW_COUNTS = {
     "folders": 4,
     "files": 4,
     "file_media_metadata": 2,
+    "file_preview_status": 2,
     "scan_history": 2,
     "scan_errors": 2,
 }
@@ -324,18 +351,37 @@ def _create_representative_catalogue(path: Path) -> Path:
             )
             connection.executemany(
                 """
+                INSERT INTO file_preview_status (
+                    file_id, media_kind, profile_id, status, source_hash,
+                    preview_size, preview_width, preview_height,
+                    preview_duration_ms, generated_at, error_stage,
+                    error_message, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (1001, "video", "h264-1fps-240p-crf35-veryfast", "available", SHARED_HASH, 2**33 + 7, 426, 240, 12_345, "2026-08-20T09:59:00.000000+0000", None, "", "2026-08-20T09:59:00.000000+0000"),
+                    (2001, "video", "h264-1fps-240p-crf35-veryfast", "failed", SHARED_HASH, None, None, None, None, None, "ffmpeg-exit", "FFmpeg exited with code 1. — Invalid data found when processing input Ω", "2026-08-22T01:00:30.000000+0000"),
+                ],
+            )
+            connection.executemany(
+                """
                 INSERT INTO scan_history (
                     id, volume_id, started_at, finished_at, status,
                     files_seen, folders_seen, errors_count, message,
                     files_added, files_removed, files_changed, folders_added,
                     folders_removed, bytes_before, bytes_after, files_hashed,
                     bytes_hashed, hash_errors, media_files,
-                    media_metadata_collected
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    media_metadata_collected, preview_mode,
+                    image_previews_generated, image_previews_reused,
+                    image_previews_failed, video_previews_generated,
+                    video_previews_reused, video_previews_failed,
+                    previews_storage_skipped, preview_bytes_written,
+                    preview_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (301, 7, "2026-08-20T09:00:00.000000+0000", "2026-08-20T10:00:00.000000+0000", "completed", 3, 3, 1, "Completed with one unreadable path", 2, 1, 1, 2, 1, 444, 434, 2, 202, 1, 1, 1),
-                    (305, 12, "2026-08-22T01:00:00.000000+0000", None, "cancelled", 1, 1, 1, None, None, None, None, None, None, None, None, 1, 101, 0, 1, 1),
+                    (301, 7, "2026-08-20T09:00:00.000000+0000", "2026-08-20T10:00:00.000000+0000", "completed", 3, 3, 1, "Completed with one unreadable path", 2, 1, 1, 2, 1, 444, 434, 2, 202, 1, 1, 1, "enabled", 5, 6, 1, 2, 3, 1, 4, 2**40 + 9, "Preview storage became unavailable: disk full Ω"),
+                    (305, 12, "2026-08-22T01:00:00.000000+0000", None, "cancelled", 1, 1, 1, None, None, None, None, None, None, None, None, 1, 101, 0, 1, 1, "disabled", 0, 0, 0, 0, 0, 0, 0, 0, ""),
                 ],
             )
             connection.executemany(

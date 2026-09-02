@@ -6,8 +6,10 @@ so their contents can be browsed and searched later, even while the original
 drive is disconnected.
 
 The MVP focuses on reliable scanning, offline browsing, volume statistics, and
-fast search. It does not generate thumbnails, previews, or use any server/cloud
-component.
+fast search. Optional offline previews (JPEG images and silent H.264 MP4 video
+proxies) can be generated while scanning into a preview directory you choose;
+they are opened with your operating system's default applications, never inside
+JVVV. There is no server or cloud component.
 
 ## Features
 
@@ -44,6 +46,11 @@ component.
 - Keep expected protected Windows metadata warnings (such as
   `System Volume Information`) visible in the scan report without treating
   them as missing user content.
+- Optionally generate offline previews while scanning: JPEG previews for images
+  and silent H.264 MP4 proxies for videos, stored under a user-chosen directory
+  and named by each file's SHA-256 and preview profile so duplicates, renamed
+  files, and several catalogues sharing one directory reuse a single preview.
+  Every preview that could not be created is reported at the end of the scan.
 
 ## Installation
 
@@ -79,6 +86,12 @@ such as ordinary indexes, FTS search structures, canonical folder aggregates,
 volume counts, and current Backup Evidence results. Identical saved hash blobs
 are deduplicated. Noncanonical aggregate values and stale/old-rule evidence are
 retained as lossless exceptions rather than silently changed.
+
+JVVV catalogue backups do not include offline preview files. The per-file
+preview status recorded in the catalogue is backed up, but the preview
+directory itself may be many terabytes; to back up previews, copy the
+configured preview directory separately with your normal file-copy or backup
+software.
 
 Use **File > Restore Catalogue from Backup…** to validate the manifest,
 component inventory, SHA-256 checksum, SQLite integrity, schema, row counts, and
@@ -143,6 +156,78 @@ the update. Cancelling the confirmation leaves the existing catalogue intact.
 If a result belongs to a connected volume, use the result buttons to open the
 real file or reveal it in the operating system file manager.
 
+## Offline previews
+
+Offline previews are disabled by default. To enable them, open **Settings >
+Preferences > Offline Previews**, choose a preview storage directory (a local
+disk, removable disk, mapped network drive, or UNC path; it does not need to sit
+beside the `.jvvv` file), optionally point JVVV at a specific `ffmpeg`
+executable if it is not on `PATH`, pick the image and video quality you want to
+spend storage on, and tick **Generate offline previews while scanning**.
+
+Ticking the box immediately proves the configuration works: JVVV writes and
+removes a test file in the preview directory, encodes a tiny test image with the
+Qt JPEG writer, starts FFmpeg, checks its version and its H.264 `libx264`
+encoder, and encodes a tiny test video into the preview directory. If any step
+fails, the box turns itself back off and a dialog states exactly what failed.
+**Test Preview Configuration** runs the same checks without changing the
+setting and reports the directory, free space, FFmpeg path and version, encoder
+availability, both test encodes, and an overall PASS or FAIL. Changing the
+directory or quality settings while previews are enabled re-validates the new
+configuration before it becomes active; on failure the last known-good
+configuration is restored and explained.
+
+Preview quality is yours to choose within these ranges: image maximum
+dimension 320–8192 px and JPEG quality 40–100; video 0.1–10 frames per second,
+maximum height 120–2160 px, CRF 18–45, and the `ultrafast` … `slow` x264
+presets. Each combination is a *preview profile* whose ID appears in Settings
+(for example `jpeg-max1600-q82` and `h264-1fps-240p-crf35-veryfast`). Previews
+live under `<preview directory>/images/<image profile>/<hh>/<sha256>.jpg` and
+`<preview directory>/videos/<video profile>/<hh>/<sha256>.mp4`, where `hh` is
+the first two hex characters of the file's SHA-256. Changing settings creates a
+new profile directory; nothing from an older profile is deleted or converted
+automatically, and changing the preview directory does not move existing
+previews.
+
+During a scan, previews are generated only after a file's SHA-256 has been
+recorded and the file has passed the stability checks. An existing preview with
+the same SHA-256 and profile is validated and reused; a corrupt one is
+regenerated. Output is always written to a temporary file in the target
+directory, validated (JPEG decode, or an MP4 structure check for a video
+stream and duration), and only then renamed into place. Cancelling a scan stops
+any running FFmpeg process and removes temporary files. Video proxies are
+silent, use `yuv420p`, keep the original duration and aspect ratio, respect
+rotation metadata, are never upscaled, and are written with `+faststart`.
+
+Before every scan with previews enabled, JVVV re-checks the preview directory,
+FFmpeg, and the image backend. If that preflight fails you can open Settings,
+scan without previews just once (the scan report records why), or cancel. At
+the end of a scan with previews enabled, an **Offline Preview Summary** shows
+generated, reused, and failed counts for images and videos, the preview
+directory, and the space written by the scan. If anything failed, the scan is
+reported as **completed with preview errors** and **View Preview Failures**
+lists every failed item with its stage and technical detail. If the preview
+disk fills up or the directory becomes unavailable, generation stops for the
+rest of that scan, catalogue indexing continues, and the report distinguishes
+direct failures from previews that were not attempted. Preview failures never
+affect the catalogue records, scan health, or copy-evidence analysis.
+
+In the catalogue and search views, an image or video's context menu offers
+**Open Preview** / **Play Preview** and **Reveal Preview** whenever the preview
+file exists, even while the original volume is offline; the search tab also has
+an **Open Preview** button. Both use the operating system's default image or
+video application — JVVV never contains an embedded viewer or player.
+Properties show whether a preview is available, its profile, dimensions,
+duration, size, and location, or why the last scan could not create it.
+
+**Catalogue > Preview Cache…** shows the preview directory, its free space, the
+current profiles, and (after **Scan Preview Store**) how many image and video
+previews it holds and how much space they use. **Show Unreferenced Previews**
+lists files under the current profiles whose SHA-256 is not referenced by the
+open catalogue. Because other catalogues may share the same directory, nothing
+is deleted automatically: select the entries you want to remove and confirm
+**Delete Selected Unreferenced Previews**.
+
 ## Tests
 
 ```bash
@@ -152,7 +237,11 @@ pytest
 The automated tests cover database initialization and current-schema validation, volume
 operations, streaming hashes, media inspection, scan cancellation/change review
 and rollback, hash-first backup evidence, semantic backup/restore integrity and
-atomicity, offline browsing, and search.
+atomicity, offline browsing, search, and the offline preview system (profile
+IDs, preview-root validation, image and video generation, atomic output,
+cancellation, failure reporting, scanner integration, and the Settings UI).
+Tests that need a real FFmpeg are skipped unless `ffmpeg` is on `PATH` or the
+`JVVV_TEST_FFMPEG` environment variable points at an executable.
 
 ## Packaging With PyInstaller
 

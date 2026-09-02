@@ -184,6 +184,21 @@ AUTHORITATIVE_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "message",
         "probed_at",
     ),
+    "file_preview_status": (
+        "file_id",
+        "media_kind",
+        "profile_id",
+        "status",
+        "source_hash",
+        "preview_size",
+        "preview_width",
+        "preview_height",
+        "preview_duration_ms",
+        "generated_at",
+        "error_stage",
+        "error_message",
+        "updated_at",
+    ),
     "scan_history": (
         "id",
         "volume_id",
@@ -206,6 +221,16 @@ AUTHORITATIVE_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "hash_errors",
         "media_files",
         "media_metadata_collected",
+        "preview_mode",
+        "image_previews_generated",
+        "image_previews_reused",
+        "image_previews_failed",
+        "video_previews_generated",
+        "video_previews_reused",
+        "video_previews_failed",
+        "previews_storage_skipped",
+        "preview_bytes_written",
+        "preview_message",
     ),
     "scan_errors": (
         "id",
@@ -239,6 +264,16 @@ SOURCE_TABLES = (
     "folders",
     "files",
     "file_media_metadata",
+    "file_preview_status",
+    "scan_history",
+    "scan_errors",
+)
+
+# Tables copied verbatim after files/hashes have been restored; the order
+# respects foreign keys.
+SECONDARY_SOURCE_TABLES = (
+    "file_media_metadata",
+    "file_preview_status",
     "scan_history",
     "scan_errors",
 )
@@ -289,6 +324,7 @@ TABLE_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "volume_register": ("volume_id",),
     "folders": ("id",),
     "file_media_metadata": ("file_id",),
+    "file_preview_status": ("file_id",),
     "scan_history": ("id",),
     "scan_errors": ("id",),
     "backup_analysis_runs": ("id",),
@@ -321,6 +357,7 @@ KNOWN_INDEXES = {
     "idx_backup_folder_matches_item",
     "idx_backup_folder_results_item",
     "idx_backup_volume_results_volume",
+    "idx_file_preview_status_status",
     "idx_files_extension",
     "idx_files_folder",
     "idx_files_identity",
@@ -432,6 +469,23 @@ PAYLOAD_SCHEMA_SQL = (
     )
     """,
     """
+    CREATE TABLE file_preview_status (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id),
+        media_kind TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_hash BLOB,
+        preview_size INTEGER,
+        preview_width INTEGER,
+        preview_height INTEGER,
+        preview_duration_ms INTEGER,
+        generated_at TEXT,
+        error_stage TEXT,
+        error_message TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE scan_history (
         id INTEGER PRIMARY KEY,
         volume_id INTEGER NOT NULL REFERENCES volumes(id),
@@ -453,7 +507,17 @@ PAYLOAD_SCHEMA_SQL = (
         bytes_hashed INTEGER NOT NULL,
         hash_errors INTEGER NOT NULL,
         media_files INTEGER NOT NULL,
-        media_metadata_collected INTEGER NOT NULL
+        media_metadata_collected INTEGER NOT NULL,
+        preview_mode TEXT NOT NULL,
+        image_previews_generated INTEGER NOT NULL,
+        image_previews_reused INTEGER NOT NULL,
+        image_previews_failed INTEGER NOT NULL,
+        video_previews_generated INTEGER NOT NULL,
+        video_previews_reused INTEGER NOT NULL,
+        video_previews_failed INTEGER NOT NULL,
+        previews_storage_skipped INTEGER NOT NULL,
+        preview_bytes_written INTEGER NOT NULL,
+        preview_message TEXT NOT NULL
     )
     """,
     """
@@ -1111,12 +1175,7 @@ def _create_payload(
             "Saving file records…",
         )
 
-        for table in (
-            "volume_register",
-            "file_media_metadata",
-            "scan_history",
-            "scan_errors",
-        ):
+        for table in ("volume_register", *SECONDARY_SOURCE_TABLES):
             columns = AUTHORITATIVE_TABLE_COLUMNS[table]
             column_sql = _quoted_columns(columns)
             order_column = columns[0]
@@ -2379,10 +2438,7 @@ def _copy_payload_to_catalogue(
             )
             _emit(progress_callback, "restore_source", 4, len(SOURCE_TABLES), "Restoring file records and hashes…")
 
-            for offset, table in enumerate(
-                ("file_media_metadata", "scan_history", "scan_errors"),
-                start=5,
-            ):
+            for offset, table in enumerate(SECONDARY_SOURCE_TABLES, start=5):
                 columns = AUTHORITATIVE_TABLE_COLUMNS[table]
                 conn.execute(
                     f'INSERT INTO "{table}" ({_quoted_columns(columns)}) '
@@ -2826,9 +2882,7 @@ def _validate_restored_semantics(
             "volumes",
             "volume_register",
             "folders",
-            "file_media_metadata",
-            "scan_history",
-            "scan_errors",
+            *SECONDARY_SOURCE_TABLES,
         ):
             columns = AUTHORITATIVE_TABLE_COLUMNS[table]
             if _table_has_keyed_difference(

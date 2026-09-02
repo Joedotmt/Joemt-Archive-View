@@ -8,14 +8,14 @@ import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from .backup_analysis import ANALYSIS_SCHEMA_SQL, ANALYSIS_TABLE_COLUMNS
 from .folder_statistics import calculate_folder_statistics
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 CATALOGUE_EXTENSION = ".jvvv"
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
@@ -39,11 +39,14 @@ REQUIRED_TABLES = set(ANALYSIS_TABLE_COLUMNS) | {
     "folders",
     "files",
     "file_media_metadata",
+    "file_preview_status",
     "files_fts",
     "folders_fts",
     "scan_history",
     "scan_errors",
 }
+PREVIEW_STATUS_VALUES = frozenset({"available", "failed", "missing", "unsupported"})
+PREVIEW_SCAN_MODES = frozenset({"disabled", "enabled", "skipped-preflight"})
 REQUIRED_COLUMNS = {
     **{table: set(columns) for table, columns in ANALYSIS_TABLE_COLUMNS.items()},
     "volumes": {
@@ -131,6 +134,21 @@ REQUIRED_COLUMNS = {
         "message",
         "probed_at",
     },
+    "file_preview_status": {
+        "file_id",
+        "media_kind",
+        "profile_id",
+        "status",
+        "source_hash",
+        "preview_size",
+        "preview_width",
+        "preview_height",
+        "preview_duration_ms",
+        "generated_at",
+        "error_stage",
+        "error_message",
+        "updated_at",
+    },
     "scan_history": {
         "id",
         "volume_id",
@@ -153,6 +171,16 @@ REQUIRED_COLUMNS = {
         "hash_errors",
         "media_files",
         "media_metadata_collected",
+        "preview_mode",
+        "image_previews_generated",
+        "image_previews_reused",
+        "image_previews_failed",
+        "video_previews_generated",
+        "video_previews_reused",
+        "video_previews_failed",
+        "previews_storage_skipped",
+        "preview_bytes_written",
+        "preview_message",
     },
     "scan_errors": {
         "id",
@@ -266,7 +294,34 @@ CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
         bytes_hashed INTEGER NOT NULL DEFAULT 0,
         hash_errors INTEGER NOT NULL DEFAULT 0,
         media_files INTEGER NOT NULL DEFAULT 0,
-        media_metadata_collected INTEGER NOT NULL DEFAULT 0
+        media_metadata_collected INTEGER NOT NULL DEFAULT 0,
+        preview_mode TEXT NOT NULL DEFAULT 'disabled',
+        image_previews_generated INTEGER NOT NULL DEFAULT 0,
+        image_previews_reused INTEGER NOT NULL DEFAULT 0,
+        image_previews_failed INTEGER NOT NULL DEFAULT 0,
+        video_previews_generated INTEGER NOT NULL DEFAULT 0,
+        video_previews_reused INTEGER NOT NULL DEFAULT 0,
+        video_previews_failed INTEGER NOT NULL DEFAULT 0,
+        previews_storage_skipped INTEGER NOT NULL DEFAULT 0,
+        preview_bytes_written INTEGER NOT NULL DEFAULT 0,
+        preview_message TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE file_preview_status (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        media_kind TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_hash BLOB,
+        preview_size INTEGER,
+        preview_width INTEGER,
+        preview_height INTEGER,
+        preview_duration_ms INTEGER,
+        generated_at TEXT,
+        error_stage TEXT,
+        error_message TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
     )
     """,
     """
@@ -313,6 +368,7 @@ CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
     "CREATE INDEX idx_scan_history_volume ON scan_history(volume_id)",
     "CREATE INDEX idx_scan_errors_scan ON scan_errors(scan_id)",
     "CREATE INDEX idx_scan_errors_volume ON scan_errors(volume_id)",
+    "CREATE INDEX idx_file_preview_status_status ON file_preview_status(status)",
     "CREATE INDEX idx_volume_register_status ON volume_register(status COLLATE NOCASE)",
     "CREATE INDEX idx_volume_register_condition ON volume_register(condition COLLATE NOCASE)",
     "CREATE INDEX idx_volume_register_connector ON volume_register(connector COLLATE NOCASE)",
@@ -1349,8 +1405,13 @@ class Database:
         hash_errors: int = 0,
         media_files: int = 0,
         media_metadata_collected: int = 0,
+        preview_summary: dict[str, Any] | None = None,
     ) -> None:
         summary = changes or {}
+        previews = preview_summary or {}
+        preview_mode = str(previews.get("mode") or "disabled")
+        if preview_mode not in PREVIEW_SCAN_MODES:
+            raise ValueError(f"Unsupported preview scan mode: {preview_mode}")
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -1372,7 +1433,17 @@ class Database:
                     bytes_hashed = ?,
                     hash_errors = ?,
                     media_files = ?,
-                    media_metadata_collected = ?
+                    media_metadata_collected = ?,
+                    preview_mode = ?,
+                    image_previews_generated = ?,
+                    image_previews_reused = ?,
+                    image_previews_failed = ?,
+                    video_previews_generated = ?,
+                    video_previews_reused = ?,
+                    video_previews_failed = ?,
+                    previews_storage_skipped = ?,
+                    preview_bytes_written = ?,
+                    preview_message = ?
                 WHERE id = ?
                 """,
                 (
@@ -1394,6 +1465,16 @@ class Database:
                     int(hash_errors),
                     int(media_files),
                     int(media_metadata_collected),
+                    preview_mode,
+                    int(previews.get("image_generated") or 0),
+                    int(previews.get("image_reused") or 0),
+                    int(previews.get("image_failed") or 0),
+                    int(previews.get("video_generated") or 0),
+                    int(previews.get("video_reused") or 0),
+                    int(previews.get("video_failed") or 0),
+                    int(previews.get("storage_skipped") or 0),
+                    int(previews.get("bytes_written") or 0),
+                    str(previews.get("message") or ""),
                     scan_id,
                 ),
             )
@@ -1608,6 +1689,197 @@ class Database:
             "SELECT * FROM file_media_metadata WHERE file_id = ?",
             (int(file_id),),
         ).fetchone()
+
+    def replace_file_preview_status(
+        self,
+        file_id: int,
+        status: dict[str, Any] | None,
+    ) -> None:
+        """Store the latest offline-preview outcome for one file.
+
+        ``status`` uses the keys ``media_kind``, ``profile_id``, ``status``
+        (``available``/``failed``/``missing``/``unsupported``), ``source_hash``,
+        ``preview_size``, ``preview_width``, ``preview_height``,
+        ``preview_duration_ms``, ``generated_at``, ``error_stage`` and
+        ``error_message``.  Passing ``None`` removes any stored status.  The
+        preview file location is never stored: it is derived from the current
+        preview root, the profile ID, and the file's SHA-256.
+        """
+
+        self.connection.execute(
+            "DELETE FROM file_preview_status WHERE file_id = ?",
+            (int(file_id),),
+        )
+        if status is None:
+            return
+        status_value = str(status.get("status") or "").strip().casefold()
+        if status_value not in PREVIEW_STATUS_VALUES:
+            raise ValueError(f"Unsupported preview status: {status_value!r}")
+        media_kind = str(status.get("media_kind") or "").strip().casefold()
+        if media_kind not in {"image", "video"}:
+            raise ValueError(f"Unsupported preview media kind: {media_kind!r}")
+        profile_id = str(status.get("profile_id") or "").strip()
+        if not profile_id:
+            raise ValueError("A preview profile ID is required.")
+        source_hash = status.get("source_hash")
+        if source_hash is not None:
+            source_hash = bytes(source_hash)
+            if len(source_hash) != 32:
+                raise ValueError("A preview source hash must be a 32-byte SHA-256 digest.")
+        self.connection.execute(
+            """
+            INSERT INTO file_preview_status (
+                file_id, media_kind, profile_id, status, source_hash,
+                preview_size, preview_width, preview_height, preview_duration_ms,
+                generated_at, error_stage, error_message, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(file_id),
+                media_kind,
+                profile_id,
+                status_value,
+                source_hash,
+                status.get("preview_size"),
+                status.get("preview_width"),
+                status.get("preview_height"),
+                status.get("preview_duration_ms"),
+                status.get("generated_at"),
+                status.get("error_stage"),
+                str(status.get("error_message") or ""),
+                status.get("updated_at") or utc_now(),
+            ),
+        )
+
+    def get_file_preview_status(self, file_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM file_preview_status WHERE file_id = ?",
+            (int(file_id),),
+        ).fetchone()
+
+    def list_preview_failures(
+        self,
+        volume_id: int,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return indexed files whose last recorded preview attempt failed."""
+
+        params: list[object] = [int(volume_id)]
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            params.append(max(int(limit), 0))
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT
+                    f.id AS file_id,
+                    f.name,
+                    f.relative_path,
+                    f.content_hash,
+                    p.media_kind,
+                    p.profile_id,
+                    p.status,
+                    p.error_stage,
+                    p.error_message,
+                    p.updated_at
+                FROM file_preview_status p
+                JOIN files f ON f.id = p.file_id
+                WHERE f.volume_id = ? AND f.missing = 0 AND p.status = 'failed'
+                ORDER BY f.relative_path COLLATE NOCASE
+                {limit_clause}
+                """,
+                params,
+            )
+        )
+
+    def count_preview_statuses(self, volume_id: int | None = None) -> dict[str, int]:
+        """Return ``{status: count}`` for stored preview outcomes."""
+
+        if volume_id is None:
+            rows = self.connection.execute(
+                "SELECT status, COUNT(*) AS total FROM file_preview_status GROUP BY status"
+            )
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT p.status, COUNT(*) AS total
+                FROM file_preview_status p
+                JOIN files f ON f.id = p.file_id
+                WHERE f.volume_id = ? AND f.missing = 0
+                GROUP BY p.status
+                """,
+                (int(volume_id),),
+            )
+        return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def prepare_content_hash_lookup(self, extensions: Iterable[str]) -> int:
+        """Build a connection-local index of SHA-256 digests for some extensions.
+
+        Used by the preview cache manager to decide whether a preview file on
+        disk is referenced by this catalogue.  The lookup lives in a temporary
+        table so multi-million-row catalogues never need to be loaded into
+        Python memory; call :meth:`drop_content_hash_lookup` when done.
+        """
+
+        normalized = sorted(
+            {str(extension or "").strip().casefold().lstrip(".") for extension in extensions}
+            - {""}
+        )
+        # ``PRAGMA query_only`` (set for read-only connections) also refuses
+        # connection-local TEMP tables.  The lookup never touches the main
+        # database, and a ``mode=ro`` URI connection still rejects any write to
+        # it, so temporarily allowing temp-schema statements is safe.
+        with self._temporary_schema_writes():
+            self.connection.execute("DROP TABLE IF EXISTS temp.preview_referenced_hashes")
+            self.connection.execute(
+                """
+                CREATE TEMP TABLE preview_referenced_hashes (
+                    digest BLOB PRIMARY KEY
+                ) WITHOUT ROWID
+                """
+            )
+            if not normalized:
+                return 0
+            placeholders = ",".join("?" for _ in normalized)
+            cursor = self.connection.execute(
+                f"""
+                INSERT OR IGNORE INTO preview_referenced_hashes (digest)
+                SELECT content_hash
+                FROM files
+                WHERE content_hash IS NOT NULL
+                  AND content_hash_algorithm = 'sha256'
+                  AND lower(extension) IN ({placeholders})
+                """,
+                normalized,
+            )
+            return int(
+                cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
+            )
+
+    def content_hash_referenced(self, digest: bytes) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM temp.preview_referenced_hashes WHERE digest = ? LIMIT 1",
+            (bytes(digest),),
+        ).fetchone()
+        return row is not None
+
+    def drop_content_hash_lookup(self) -> None:
+        with self._temporary_schema_writes():
+            self.connection.execute("DROP TABLE IF EXISTS temp.preview_referenced_hashes")
+
+    @contextmanager
+    def _temporary_schema_writes(self) -> Iterator[None]:
+        """Allow TEMP-table statements on a read-only connection, then restore."""
+
+        if not self.read_only:
+            yield
+            return
+        self.connection.execute("PRAGMA query_only = OFF")
+        try:
+            yield
+        finally:
+            self.connection.execute("PRAGMA query_only = ON")
 
     def prepare_scan_comparison(self, volume_id: int) -> None:
         """Take a connection-local snapshot used only while reviewing one scan."""
@@ -2034,6 +2306,18 @@ class Database:
                     media.bit_rate AS media_bit_rate,
                     media.message AS media_message,
                     media.probed_at AS media_probed_at,
+                    preview.media_kind AS preview_media_kind,
+                    preview.profile_id AS preview_profile_id,
+                    preview.status AS preview_status,
+                    preview.source_hash AS preview_source_hash,
+                    preview.preview_size,
+                    preview.preview_width,
+                    preview.preview_height,
+                    preview.preview_duration_ms,
+                    preview.generated_at AS preview_generated_at,
+                    preview.error_stage AS preview_error_stage,
+                    preview.error_message AS preview_error_message,
+                    preview.updated_at AS preview_updated_at,
                     v.name AS volume_name,
                     v.source_path,
                     parent.id AS parent_folder_id,
@@ -2048,6 +2332,7 @@ class Database:
                 JOIN volumes v ON v.id = f.volume_id
                 LEFT JOIN folders parent ON parent.id = f.folder_id
                 LEFT JOIN file_media_metadata media ON media.file_id = f.id
+                LEFT JOIN file_preview_status preview ON preview.file_id = f.id
                 WHERE f.id = ?
                 """,
                 (item_id,),
