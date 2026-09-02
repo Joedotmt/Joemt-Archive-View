@@ -508,9 +508,10 @@ def make_preferences_window(**extra):
 
 
 def scan_result(statistics: PreviewStatistics, status: str = "completed") -> dict:
+    """Mirror VolumeScanner: a completed scan with preview failures is completed_with_warnings."""
+
     return {
-        "status": status,
-        "outcome": scan_outcome(status, statistics),
+        "status": scan_outcome(status, statistics) if status == "completed" else status,
         "files_seen": 5,
         "folders_seen": 2,
         "errors_count": 0,
@@ -946,6 +947,10 @@ def test_context_menu_disables_preview_actions_and_explains_when_the_preview_is_
     assert open_action.tooltip == GENERIC_MISSING_REASON
     assert open_action.status_tip == GENERIC_MISSING_REASON
     assert reveal_action.tooltip == GENERIC_MISSING_REASON
+    # Spec §19 "explain why": Fusion never shows tooltips on disabled menu
+    # items, so the reason is also a visible (disabled) menu line.
+    note = menu.action(f"Preview not available: {GENERIC_MISSING_REASON}")
+    assert not note.enabled
 
 
 def test_context_menu_disables_preview_actions_for_a_corrupt_preview_file(
@@ -1732,19 +1737,25 @@ def test_search_selection_without_a_preview_button_still_updates_the_other_butto
 def test_scan_progress_relays_preview_phases_and_encode_percentages():
     progress = FakeProgress()
     progress.setRange(0, 10)
-    window = SimpleNamespace(scan_cancel_requested=False, scan_progress=progress)
+    status_bar = FakeStatusBar()
+    window = SimpleNamespace(
+        scan_cancel_requested=False, scan_progress=progress, statusBar=lambda: status_bar
+    )
     message = "Creating video preview · Holiday-2008.mov · 42% of preview encode"
 
     MainWindow.on_scan_progress(window, 1284, 37, message)
 
     assert progress.maximum() == 0
     assert progress.format() == f"{message} · 1,284 files catalogued"
+    # A busy QProgressBar paints no text, so the phase must reach the status bar (spec §30/§31).
+    assert status_bar.messages[-1] == (f"{message} · 1,284 files catalogued", 0)
 
     MainWindow.on_scan_progress(window, 1285, 37, "Creating image preview · IMG_0001.jpg")
     assert progress.format() == "Creating image preview · IMG_0001.jpg · 1,285 files catalogued"
 
     MainWindow.on_scan_progress(window, 1286, 37, "E:/Photos")
     assert progress.format() == "Scanning... 1,286 files, 37 folders - E:/Photos"
+    assert status_bar.messages[-1][0] == "Scanning... 1,286 files, 37 folders - E:/Photos"
 
     window.scan_cancel_requested = True
     MainWindow.on_scan_progress(window, 1287, 37, "Creating video preview · x")
@@ -2057,8 +2068,7 @@ def test_preflight_decision_dialog_explains_the_problem_and_maps_its_buttons(app
 # ---------------------------------------------------------------------------
 def fake_scan_result(preview: dict) -> SimpleNamespace:
     return SimpleNamespace(
-        status="completed",
-        outcome=scan_outcome("completed", preview),
+        status=scan_outcome("completed", preview),
         files_seen=3,
         folders_seen=1,
         errors_count=0,
@@ -2112,8 +2122,8 @@ def test_scan_worker_passes_skipped_preflight_statistics_to_the_scanner(monkeypa
     assert "user chose to continue" in statistics.message
     assert len(finished) == 1
     assert finished[0]["preview"] == preview
-    assert finished[0]["outcome"] == "completed"
     assert finished[0]["status"] == "completed"
+    assert "outcome" not in finished[0]
     assert finished[0]["changes"] == {}
 
 
@@ -2156,7 +2166,7 @@ def test_scan_worker_builds_a_preview_service_when_previews_are_enabled(monkeypa
     # The service's log lines reach the scan log through the worker signal.
     built[0].kwargs["log_callback"]("Offline preview failed (image-decode) for Photos/photo000.tif")
     assert logs == ["Offline preview failed (image-decode) for Photos/photo000.tif"]
-    assert finished[0]["outcome"] == "completed_with_warnings"
+    assert finished[0]["status"] == "completed_with_warnings"
     assert finished[0]["preview"]["failures"][0]["relative_path"] == failure.relative_path
     assert PreviewStatistics.from_dict(finished[0]["preview"]).failures == [failure]
 
@@ -2303,6 +2313,7 @@ def test_show_preview_cache_builds_one_dialog_and_wires_its_requests(monkeypatch
                 "scan_requested",
                 "unreferenced_requested",
                 "delete_requested",
+                "delete_temporaries_requested",
                 "open_folder_requested",
                 "cancel_requested",
             ):
@@ -2331,6 +2342,7 @@ def test_show_preview_cache_builds_one_dialog_and_wires_its_requests(monkeypatch
         start_preview_store_scan=lambda: calls.append("scan"),
         start_unreferenced_preview_scan=lambda: calls.append("unreferenced"),
         start_delete_previews=lambda paths: calls.append(("delete", paths)),
+        start_delete_temporaries=lambda: calls.append("temporaries"),
         open_preview_folder=lambda: calls.append("open"),
         cancel_preview_store_operation=lambda: calls.append("cancel"),
     )
@@ -2347,12 +2359,14 @@ def test_show_preview_cache_builds_one_dialog_and_wires_its_requests(monkeypatch
     dialog.scan_requested.emit()
     dialog.unreferenced_requested.emit()
     dialog.delete_requested.emit(["E:/JVVV Previews/images/x/ab/abc.jpg"])
+    dialog.delete_temporaries_requested.emit()
     dialog.open_folder_requested.emit()
     dialog.cancel_requested.emit()
     assert calls == [
         "scan",
         "unreferenced",
         ("delete", ["E:/JVVV Previews/images/x/ab/abc.jpg"]),
+        "temporaries",
         "open",
         "cancel",
     ]
@@ -2592,3 +2606,167 @@ def test_unreferenced_results_after_a_cancelled_comparison_are_marked_partial():
     MainWindow.on_unreferenced_previews(window, [], 3)
     assert received[-1] == ([], 3, False)
     assert messages[-1].startswith("3 previews")
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups (spec §15 root in summary, §19 bookkeeping, §22 stale lists)
+# ---------------------------------------------------------------------------
+
+
+def test_context_menu_has_no_explanation_line_when_the_preview_is_usable(monkeypatch, catalogue, tmp_path):
+    monkeypatch.setattr("jvvv.app.QMenu", FakeMenu)
+    settings = enabled_settings(tmp_path)
+    digest = digest_for("usable")
+    file_id = catalogue.add_file("Photos/usable.jpg", digest)
+    write_image_preview(settings, digest)
+    window, _opened = make_menu_window(catalogue, settings)
+
+    menu = MainWindow.build_catalogue_item_context_menu(window, catalogue.target(file_id, "Photos/usable.jpg"))
+
+    assert not any(text and text.startswith("Preview not available") for text in menu.texts())
+
+
+def test_open_preview_without_a_configured_root_does_not_rewrite_the_status(monkeypatch, catalogue, tmp_path):
+    settings = PreviewSettings(enabled=False, root_directory="")
+    digest = digest_for("unrooted")
+    file_id = catalogue.add_file("Photos/unrooted.jpg", digest)
+    catalogue.set_status(
+        file_id,
+        media_kind="image",
+        profile_id=settings.image.profile_id,
+        status="available",
+        source_hash=digest,
+        preview_size=4321,
+        preview_width=640,
+        preview_height=480,
+        generated_at=utc_now(),
+    )
+    infos = []
+    monkeypatch.setattr(
+        QMessageBox, "information", lambda parent, title, text, *args: infos.append((title, text))
+    )
+    monkeypatch.setattr(
+        "jvvv.app.open_in_file_manager", lambda *args, **kwargs: pytest.fail("must not open")
+    )
+    window, _refreshed = make_open_window(catalogue, settings)
+
+    MainWindow.open_preview_for_target(window, catalogue.target(file_id, "Photos/unrooted.jpg"))
+
+    assert len(infos) == 1 and infos[0][0] == "Preview Not Available"
+    row = catalogue.db.get_file_preview_status(file_id)
+    assert row["status"] == "available", "nothing was checked, so nothing may be marked missing"
+
+
+def test_refresh_after_catalogue_write_invalidates_a_displayed_unreferenced_list():
+    class FakeCacheDialog:
+        def __init__(self) -> None:
+            self.invalidated = 0
+
+        def invalidate_unreferenced(self) -> None:
+            self.invalidated += 1
+
+    dialog = FakeCacheDialog()
+    window = SimpleNamespace(
+        db=object(),
+        refresh_volumes=lambda: None,
+        perform_search=lambda: None,
+        backup_evidence_dialog=None,
+        preview_cache_dialog=dialog,
+    )
+
+    MainWindow.refresh_after_catalogue_write(window)
+    assert dialog.invalidated == 1
+
+    window.preview_cache_dialog = None
+    MainWindow.refresh_after_catalogue_write(window)  # no dialog open: nothing to do
+
+
+def test_scan_summary_names_the_root_the_scan_wrote_to_not_the_current_setting(
+    main_window, monkeypatch, tmp_path
+):
+    window = main_window
+    window.preview_settings = enabled_settings(tmp_path)  # root: tmp_path / "previews"
+    monkeypatch.setattr(MainWindow, "refresh_after_catalogue_write", lambda self: None)
+    scan_root = str(tmp_path / "root-used-by-the-scan")
+    statistics = PreviewStatistics(
+        mode=MODE_ENABLED, image_generated=3, bytes_written=1000, root=scan_root
+    )
+    boxes = MessageBoxCapture(monkeypatch, click_text="Close")
+
+    window.on_scan_finished(scan_result(statistics))
+
+    assert len(boxes.boxes) == 1
+    summary = boxes.boxes[0].informativeText()
+    assert scan_root in summary
+    assert str(tmp_path / "previews") not in summary
+
+
+def test_mark_preview_missing_reports_a_failed_catalogue_update(catalogue, monkeypatch, tmp_path):
+    settings = enabled_settings(tmp_path)
+    digest = digest_for("stuck")
+    file_id = catalogue.add_file("Photos/stuck.jpg", digest)
+    catalogue.set_status(
+        file_id,
+        media_kind="image",
+        profile_id=settings.image.profile_id,
+        status="available",
+        source_hash=digest,
+        preview_size=1,
+        preview_width=1,
+        preview_height=1,
+        generated_at=utc_now(),
+    )
+
+    def failing_replace(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(catalogue.db, "replace_file_preview_status", failing_replace)
+    status_bar = FakeStatusBar()
+    window = SimpleNamespace(db=catalogue.db, statusBar=lambda: status_bar)
+
+    MainWindow._mark_preview_missing(window, {"id": file_id})
+
+    assert status_bar.messages, "a failed bookkeeping write must be visible"
+    message, _timeout = status_bar.messages[-1]
+    assert "could not be updated" in message and "database is locked" in message
+
+
+def test_start_delete_temporaries_runs_the_worker_and_reports_the_outcome(tmp_path):
+    from jvvv.preview_ui import DeleteTemporariesWorker
+
+    settings = enabled_settings(tmp_path)
+    started: list[tuple[object, str, str]] = []
+
+    class FakeCacheDialog:
+        def __init__(self) -> None:
+            self.reports: list[tuple[int, int, list]] = []
+
+        def set_temporaries_deleted(self, deleted, kept, errors):
+            self.reports.append((deleted, kept, errors))
+
+    dialog = FakeCacheDialog()
+    status_bar = FakeStatusBar()
+    window = SimpleNamespace(
+        _preview_store_ready=lambda: True,
+        preview_settings=settings,
+        _start_preview_store_worker=lambda worker, operation, message: started.append((worker, operation, message)),
+        preview_cache_dialog=dialog,
+        statusBar=lambda: status_bar,
+    )
+    bind(window, "on_temporaries_deleted")
+
+    MainWindow.start_delete_temporaries(window)
+
+    assert len(started) == 1
+    worker, operation, message = started[0]
+    assert isinstance(worker, DeleteTemporariesWorker)
+    assert operation == "temporaries" and "temporary" in message
+
+    MainWindow.on_temporaries_deleted(window, 4, 1, [])
+
+    assert dialog.reports == [(4, 1, [])]
+    assert status_bar.messages[-1][0] == "4 temporary preview files deleted."
+
+    window._preview_store_ready = lambda: False
+    MainWindow.start_delete_temporaries(window)
+    assert len(started) == 1, "nothing starts while another store operation or scan is running"

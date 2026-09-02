@@ -92,6 +92,7 @@ from .catalogue_backup import (
 from .database import (
     ARCHIVE_STATUSES,
     CATALOGUE_EXTENSION,
+    COMPLETED_SCAN_STATUSES,
     CONNECTOR_OPTIONS,
     CatalogueInUseError,
     Database,
@@ -134,6 +135,7 @@ from .preview_service import (
 )
 from .preview_ui import (
     DeletePreviewsWorker,
+    DeleteTemporariesWorker,
     OfflinePreviewSettingsWidget,
     PreviewCacheDialog,
     PreviewFailuresDialog,
@@ -903,7 +905,8 @@ def volume_backup_display(
         0,
         latest_errors - latest_ignored_errors - latest_hash_errors,
     )
-    if indexed_file_count == 0 and latest_status == "completed" and actionable_latest_errors > 0:
+    latest_completed = latest_status in COMPLETED_SCAN_STATUSES
+    if indexed_file_count == 0 and latest_completed and actionable_latest_errors > 0:
         return BackupDisplay(
             "unknown",
             "Check scan",
@@ -911,7 +914,7 @@ def volume_backup_display(
             f"treated as a confirmed empty drive.\n\n{BACKUP_METADATA_DISCLAIMER}",
             2,
         )
-    if indexed_file_count == 0 and latest_status == "completed":
+    if indexed_file_count == 0 and latest_completed:
         return BackupDisplay(
             "unknown",
             "N/A · empty",
@@ -2800,6 +2803,11 @@ class BackupEvidenceDialog(QDialog):
             attempted_at = object_value(scan, "latest_attempt_at")
             applied_at = object_value(scan, "last_applied_at")
             applied = applied_at is not None
+            # completed_with_warnings means indexing succeeded but some offline
+            # previews were not created; for catalogue health it is "completed".
+            preview_warnings = status == "completed_with_warnings"
+            if preview_warnings:
+                status = "completed"
             if (
                 status == "completed"
                 and access_errors
@@ -2856,6 +2864,9 @@ class BackupEvidenceDialog(QDialog):
             else:
                 outcome = "Not scanned" if status in {"", "not_scanned", "none"} else status.title()
                 meaning = "No applied scan data" if not applied else "See scan log"
+            if preview_warnings:
+                outcome += " · preview errors"
+                meaning += "; some offline previews were not created (see the scan log)"
             rows.append(
                 [
                     volume_references.get(volume_id, f"Volume {volume_id}"),
@@ -3339,7 +3350,6 @@ class ScanWorker(QObject):
             self.finished.emit(
                 {
                     "status": result.status,
-                    "outcome": result.outcome,
                     "files_seen": result.files_seen,
                     "folders_seen": result.folders_seen,
                     "errors_count": result.errors_count,
@@ -5033,7 +5043,9 @@ class MainWindow(QMainWindow):
             # is corrupt and must never be launched as if it were valid.  Only
             # a genuinely absent file is recorded as missing; a corrupt one is
             # left in place for the next scan to detect and regenerate.
-            if info is None or not info.exists:
+            if info is not None and not info.exists:
+                # ``info is None`` means no preview root is configured, so
+                # nothing is known about the file; leave the status untouched.
                 self._mark_preview_missing(file_row)
             reason = self.preview_unavailable_reason(media_kind, info, file_row)
             QMessageBox.information(
@@ -5074,9 +5086,12 @@ class MainWindow(QMainWindow):
                         ),
                     },
                 )
-        except Exception:
-            # Never let bookkeeping stop the user from seeing the message.
-            pass
+        except Exception as exc:
+            # Never let bookkeeping stop the user from seeing the message,
+            # but never hide that the catalogue could not be updated either.
+            self.statusBar().showMessage(
+                f"The preview status could not be updated in the catalogue: {exc}", 10000
+            )
 
     def open_selected_search_preview(self) -> None:
         item = self.selected_search_item()
@@ -6847,13 +6862,14 @@ class MainWindow(QMainWindow):
         if self.scan_progress.maximum() != 0:
             self.scan_progress.setRange(0, 0)
         if current_path.startswith(SCAN_PROGRESS_DETAIL_PREFIXES):
-            self.scan_progress.setFormat(
-                f"{current_path} · {files_seen:,} files catalogued"
-            )
+            text = f"{current_path} · {files_seen:,} files catalogued"
         else:
-            self.scan_progress.setFormat(
-                f"Scanning... {files_seen:,} files, {folders_seen:,} folders - {current_path}"
-            )
+            text = f"Scanning... {files_seen:,} files, {folders_seen:,} folders - {current_path}"
+        self.scan_progress.setFormat(text)
+        # A busy (indeterminate) QProgressBar never paints its format text, so
+        # the phase ("Creating video preview · file · 42% of preview encode")
+        # must also be shown somewhere visible (spec §30, §31).
+        self.statusBar().showMessage(text)
 
     @Slot(dict)
     def on_scan_review_requested(self, changes: dict) -> None:
@@ -6974,12 +6990,12 @@ class MainWindow(QMainWindow):
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(1)
         status = result.get("status", "completed")
-        if status != "completed":
+        indexed = status in COMPLETED_SCAN_STATUSES
+        if not indexed:
             self.post_scan_edit_volume_id = None
         statistics = PreviewStatistics.from_dict(result.get("preview") or {})
         self.last_preview_statistics = statistics
-        outcome = result.get("outcome") or status
-        preview_warning = outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+        preview_warning = status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
         # Spec §15: never a generic "completed" when previews failed.
         self.scan_progress.setFormat(
             "Completed with preview errors" if preview_warning else status.title()
@@ -7001,7 +7017,7 @@ class MainWindow(QMainWindow):
         elif statistics.mode == MODE_SKIPPED_PREFLIGHT:
             preview_text = " Offline previews skipped (preflight failed)."
         self.statusBar().showMessage(
-            f"Scan {outcome.replace('_', ' ')}: {result.get('files_seen', 0)} files, "
+            f"Scan {status.replace('_', ' ')}: {result.get('files_seen', 0)} files, "
             f"{result.get('files_hashed', 0)} SHA-256 hashes "
             f"({format_size(int(result.get('bytes_hashed', 0)))} read), "
             f"{result.get('media_metadata_collected', 0)}/"
@@ -7018,9 +7034,11 @@ class MainWindow(QMainWindow):
 
         if statistics.mode != MODE_ENABLED:
             return
-        if status != "completed" and statistics.total_attempted == 0:
+        indexed = status in COMPLETED_SCAN_STATUSES
+        if not indexed and statistics.total_attempted == 0:
             return
-        root = self.preview_settings.root_directory or None
+        # The root the scan actually wrote to, not whatever Settings holds now.
+        root = statistics.root or self.preview_settings.root_directory or None
         summary = statistics.summary_text(root)
         box = QMessageBox(self)
         if statistics.has_problems:
@@ -7028,12 +7046,12 @@ class MainWindow(QMainWindow):
             box.setWindowTitle("Scan Completed with Preview Errors")
             headline = (
                 "Scan completed with preview errors."
-                if status == "completed"
+                if indexed
                 else f"Scan {status} — some offline previews were not created."
             )
             headline += (
                 "\n\nCatalogue indexing succeeded, but some offline previews were not created."
-                if status == "completed"
+                if indexed
                 else ""
             )
         else:
@@ -7041,7 +7059,7 @@ class MainWindow(QMainWindow):
             box.setWindowTitle("Offline Preview Summary")
             headline = (
                 "Scan completed. All offline previews were generated or reused."
-                if status == "completed"
+                if indexed
                 else f"Scan {status}. Offline preview results so far:"
             )
         box.setText(headline)
@@ -7132,6 +7150,11 @@ class MainWindow(QMainWindow):
         self.perform_search()
         if getattr(self, "backup_evidence_dialog", None) is not None:
             self.refresh_backup_evidence_dialog()
+        cache_dialog = getattr(self, "preview_cache_dialog", None)
+        if cache_dialog is not None:
+            # The catalogue's hashes changed, so a displayed "not referenced by
+            # this catalogue" list may now be wrong (spec §22).
+            cache_dialog.invalidate_unreferenced()
 
     def select_volume(self, volume_id: int) -> bool:
         for row, item in enumerate(self.volume_model.items):
@@ -7503,6 +7526,11 @@ class MainWindow(QMainWindow):
                     reveal=True,
                 )
             )
+            if reason:
+                # Disabled menu items never show tooltips under the Fusion
+                # style, so the reason is stated as its own menu line (§19).
+                note_action = menu.addAction(f"Preview not available: {reason}")
+                note_action.setEnabled(False)
 
         menu.addSeparator()
         properties_action = menu.addAction("Properties")
@@ -7697,6 +7725,7 @@ class MainWindow(QMainWindow):
                 media_source = str(record_field("media_source") or "")
                 source_label = {
                     "ffprobe": "ffprobe",
+                    "pillow": "image reader (Pillow, pillow-heif, rawpy)",
                     "qt-image": "Qt image header reader",
                     "python-wave": "built-in WAV reader",
                     "ffprobe + python-wave": "ffprobe and built-in WAV reader",
@@ -8304,6 +8333,7 @@ class MainWindow(QMainWindow):
             dialog.scan_requested.connect(self.start_preview_store_scan)
             dialog.unreferenced_requested.connect(self.start_unreferenced_preview_scan)
             dialog.delete_requested.connect(self.start_delete_previews)
+            dialog.delete_temporaries_requested.connect(self.start_delete_temporaries)
             dialog.open_folder_requested.connect(self.open_preview_folder)
             dialog.cancel_requested.connect(self.cancel_preview_store_operation)
             self.preview_cache_dialog = dialog
@@ -8381,6 +8411,29 @@ class MainWindow(QMainWindow):
         worker = DeletePreviewsWorker(self.preview_settings, [str(path) for path in paths])
         worker.finished.connect(self.on_previews_deleted)
         self._start_preview_store_worker(worker, "delete", "Deleting selected previews…")
+
+    def start_delete_temporaries(self) -> None:
+        if not self._preview_store_ready():
+            return
+        worker = DeleteTemporariesWorker(self.preview_settings)
+        worker.finished.connect(self.on_temporaries_deleted)
+        self._start_preview_store_worker(
+            worker, "temporaries", "Deleting leftover temporary preview files…"
+        )
+
+    @Slot(int, int, list)
+    def on_temporaries_deleted(self, deleted: int, kept: int, errors: list) -> None:
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_temporaries_deleted(int(deleted), int(kept), list(errors))
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Some Temporary Files Were Not Deleted",
+                f"{int(deleted):,} temporary files were deleted. "
+                f"{len(errors):,} could not be deleted:\n\n" + "\n".join(str(e) for e in errors[:20])
+                + ("\n…" if len(errors) > 20 else ""),
+            )
+        self.statusBar().showMessage(f"{int(deleted):,} temporary preview files deleted.", 5000)
 
     def cancel_preview_store_operation(self) -> None:
         worker = self.preview_store_worker

@@ -622,8 +622,9 @@ def _validate_catalogue_schema(connection: sqlite3.Connection) -> None:
         )
     if version != SCHEMA_VERSION:
         raise CatalogueBackupError(
-            f"The catalogue uses the retired schema version {version}. This JVVV build "
-            f"only backs up the current schema version {SCHEMA_VERSION}."
+            f"The catalogue uses schema version {version}. This JVVV build only backs up "
+            f"the current schema version {SCHEMA_VERSION}; open the catalogue in JVVV once "
+            "to upgrade it, then create the backup."
         )
 
     tables = {

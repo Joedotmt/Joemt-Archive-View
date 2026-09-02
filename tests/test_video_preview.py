@@ -1425,3 +1425,126 @@ def test_real_generate_undecodable_source_is_a_visible_ffmpeg_exit(real_ffmpeg, 
     assert info.value.detail
     assert files_under(cache.root) == []
     assert not destination.exists()
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups (spec §32 hash-time snapshot, §41 rotation metadata, §8 yuv420p)
+# ---------------------------------------------------------------------------
+
+
+def test_generate_refuses_a_source_that_changed_since_it_was_hashed(monkeypatch, cache, source):
+    fake = successful_ffmpeg(monkeypatch)
+    hashed_stat = os.lstat(source)
+    with open(source, "ab") as handle:
+        handle.write(b"\x00" * 16)
+    later = time.time() + 5
+    os.utime(source, (later, later))
+
+    with pytest.raises(PreviewError) as info:
+        VideoPreviewGenerator(cache, FAKE_FFMPEG, poll_interval_seconds=0.01).generate(
+            source, destination_for(cache, source), source_stat=hashed_stat
+        )
+
+    assert info.value.stage == STAGE_SOURCE_CHANGED
+    assert info.value.message == "The source file changed between hashing and preview generation."
+    assert fake.calls == [], "FFmpeg must not start for a source that no longer matches its hash"
+    assert files_under(cache.root) == []
+
+
+def test_generate_accepts_a_matching_hash_time_snapshot(monkeypatch, cache, source):
+    successful_ffmpeg(monkeypatch)
+    destination = destination_for(cache, source)
+
+    result = VideoPreviewGenerator(cache, FAKE_FFMPEG, poll_interval_seconds=0.01).generate(
+        source, destination, source_stat=os.lstat(source)
+    )
+
+    assert result.status == PREVIEW_GENERATED
+    assert destination.is_file()
+
+
+def test_real_generate_respects_display_rotation_metadata(real_ffmpeg, tmp_path):
+    from preview_fixtures import write_source_mp4
+
+    profile = VideoPreviewProfile(fps=2, max_height=120, crf=35, preset="veryfast")
+    cache = PreviewCache(tmp_path / "previews", ImagePreviewProfile(), profile)
+    landscape = write_source_mp4(tmp_path / "source" / "landscape.mp4")
+    rotated = tmp_path / "source" / "rotated.mp4"
+    # Same 320x180 frames, but the container says "display rotated by 90°" -
+    # exactly what phones record.  FFmpeg applies that matrix when decoding.
+    subprocess.run(
+        [
+            real_ffmpeg, "-y", "-nostdin", "-loglevel", "error",
+            "-display_rotation", "90", "-i", str(landscape), "-c", "copy", str(rotated),
+        ],
+        check=True,
+        timeout=120,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    destination = destination_for(cache, rotated)
+
+    result = VideoPreviewGenerator(cache, real_ffmpeg).generate(rotated, destination)
+
+    validation = validate_video_preview(destination)
+    assert result.ok and validation.valid, validation.message
+    assert validation.width < validation.height, "a 90° display rotation must produce a portrait preview"
+    assert validation.height <= 120
+    assert abs(validation.width - 180 * validation.height / 320) <= 2
+    assert temporaries_under(cache.root) == []
+
+
+def test_real_generate_writes_8bit_420_h264(real_ffmpeg, tmp_path):
+    from preview_fixtures import write_source_mp4
+
+    profile = VideoPreviewProfile(fps=2, max_height=120, crf=35, preset="veryfast")
+    cache = PreviewCache(tmp_path / "previews", ImagePreviewProfile(), profile)
+    source = write_source_mp4(tmp_path / "source" / "landscape.mp4")
+    destination = destination_for(cache, source)
+
+    VideoPreviewGenerator(cache, real_ffmpeg).generate(source, destination)
+
+    data = destination.read_bytes()
+    avcc = data.find(b"avcC")
+    assert avcc > 0, "the H.264 sample entry must carry an avcC configuration"
+    profile_idc = data[avcc + 5]  # avcC: configurationVersion, then AVCProfileIndication
+    assert profile_idc in {66, 77, 100}, (
+        f"yuv420p 8-bit H.264 uses the Baseline/Main/High profiles, got profile_idc {profile_idc}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups: a fast-start preview cut inside mdat must never validate (spec §11, §46)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_rejects_a_preview_truncated_inside_mdat(tmp_path):
+    data = tiny_mp4_bytes()
+    mdat_offset, mdat_size, header = find_box(data, [b"mdat"])
+    assert mdat_offset + mdat_size == len(data), "the fixture is fast-start: mdat is last"
+    cut = tmp_path / "cut.mp4"
+    cut.write_bytes(data[: mdat_offset + header + mdat_size // 2])
+
+    validation = validate_video_preview(cut)
+
+    assert validation.valid is False
+    assert "truncated" in validation.message.casefold()
+    assert "mdat" in validation.message
+
+
+def test_validate_rejects_a_preview_with_no_media_data_at_all(tmp_path):
+    data = tiny_mp4_bytes()
+    mdat_offset, _mdat_size, _header = find_box(data, [b"mdat"])
+    for name, payload in (
+        ("no-mdat.mp4", data[:mdat_offset]),
+        ("mdat-header-only.mp4", data[: mdat_offset + 4]),
+        ("empty-mdat.mp4", data[:mdat_offset] + struct.pack(">I4s", 8, b"mdat")),
+    ):
+        path = tmp_path / name
+        path.write_bytes(payload)
+
+        validation = validate_video_preview(path)
+
+        assert validation.valid is False, name
+        assert "mdat" in validation.message or "truncated" in validation.message.casefold(), name

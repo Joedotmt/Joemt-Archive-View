@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import BinaryIO, Callable, Iterator
 
 from jvvv.preview_cache import (
+    ensure_source_snapshot,
     PREVIEW_GENERATED,
     STAGE_DISK_FULL,
     STAGE_FFMPEG_ENCODE,
@@ -541,8 +542,20 @@ def _parse_trak(handle: BinaryIO, trak: Mp4Box) -> Mp4Track:
     )
 
 
+def _has_media_data(boxes: list[Mp4Box]) -> bool:
+    """True once a complete, non-empty ``mdat`` box has been read."""
+
+    return any(box.type == "mdat" and box.size > box.header_size for box in boxes)
+
+
 def _walk_top_level(handle: BinaryIO, size: int) -> list[Mp4Box]:
-    """Return the top-level boxes, tolerating garbage after a complete ``moov``."""
+    """Return the top-level boxes.
+
+    Garbage is tolerated only *after* both the movie header and a complete
+    ``mdat`` have been read.  Before that, an unreadable or oversized box means
+    the file is truncated - a fast-start preview cut anywhere inside ``mdat``
+    still has a perfect ``moov``, and must never validate (spec §11, §46).
+    """
 
     boxes: list[Mp4Box] = []
     offset = 0
@@ -550,8 +563,8 @@ def _walk_top_level(handle: BinaryIO, size: int) -> list[Mp4Box]:
         try:
             box = _read_box_header(handle, offset, size)
         except Mp4ParseError as exc:
-            if any(found.type == "moov" for found in boxes):
-                break  # trailing garbage after a complete movie header
+            if any(found.type == "moov" for found in boxes) and _has_media_data(boxes):
+                break  # trailing garbage after a complete movie
             if not boxes:
                 raise Mp4ParseError(
                     f"the file is not an MP4 container ({exc})"
@@ -579,6 +592,8 @@ def inspect_mp4(path: Path) -> Mp4Structure:
         moov = next((box for box in boxes if box.type == "moov"), None)
         if moov is None:
             raise Mp4ParseError("the MP4 file has no 'moov' box")
+        if not _has_media_data(boxes):
+            raise Mp4ParseError("the MP4 file has no media data ('mdat') box, so it is truncated")
         timescale = 0
         duration: int | None = None
         found_mvhd = False
@@ -811,16 +826,20 @@ class VideoPreviewGenerator:
         cancel_callback: CancelCallback | None = None,
         progress_callback: ProgressCallback | None = None,
         expected_duration_ms: int | None = None,
+        source_stat: os.stat_result | None = None,
     ) -> PreviewResult:
         """Encode ``source`` into ``destination`` atomically.
 
-        Raises ``PreviewCancelled`` when ``cancel_callback`` returns true and
-        ``PreviewError`` for every failure; the temporary file is always
-        removed on failure and the process is always stopped.
+        ``source_stat`` is the snapshot taken when the file's SHA-256 was
+        computed; the source must still match it before FFmpeg starts (spec
+        §32).  Raises ``PreviewCancelled`` when ``cancel_callback`` returns
+        true and ``PreviewError`` for every failure; the temporary file is
+        always removed on failure and the process is always stopped.
         """
 
         _raise_if_cancelled(cancel_callback)
         before = _lstat_source(source)
+        ensure_source_snapshot(source, before, source_stat)
         self.cache.ensure_parent(destination)
         temp_path = self.cache.temporary_path(destination)
         try:

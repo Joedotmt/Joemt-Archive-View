@@ -1,38 +1,52 @@
+"""Image previews on the Pillow + pillow-heif + rawpy backend (spec §7, §12, §32, §39)."""
+
 from __future__ import annotations
 
 import hashlib
+import io
+import os
 import pathlib
-import random
 import struct
 import sys
 import threading
+import time
 import zlib
 
+import numpy as np
 import pytest
-from PySide6.QtGui import QBrush, QColor, QImage, QImageReader, QImageWriter, QLinearGradient, QPainter
+from PIL import Image, features
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from preview_fixtures import (  # noqa: E402
+    build_dng,
+    jpeg_bytes,
     make_test_image,
+    write_dng,
+    write_heic,
     write_jpeg_with_exif_orientation,
     write_test_image,
 )
 
 from jvvv import image_preview  # noqa: E402
 from jvvv.image_preview import (  # noqa: E402
-    ALLOCATION_LIMIT_ENVIRONMENT_VARIABLE,
-    IMAGE_ALLOCATION_LIMIT_MB,
     IMAGE_BACKEND_NAME,
     IMAGE_TEST_SIZE,
-    QT_DEFAULT_IMAGE_ALLOCATION_LIMIT_MB,
+    MAX_SOURCE_PIXELS,
+    SOURCE_PILLOW,
+    SOURCE_RAW_DEMOSAIC,
+    SOURCE_RAW_EMBEDDED,
     TRANSPARENCY_BACKGROUND,
+    ImageOpenError,
     ImagePreviewGenerator,
     ImagePreviewValidation,
     compute_target_size,
     image_backend_available,
+    open_image,
+    read_image_dimensions,
     validate_image_preview,
 )
 from jvvv.image_preview import test_image_backend as run_image_backend_test  # noqa: E402
+from jvvv.media_metadata import HEIF_EXTENSIONS, IMAGE_EXTENSIONS, RAW_EXTENSIONS  # noqa: E402
 from jvvv.preview_cache import (  # noqa: E402
     PREVIEW_GENERATED,
     STAGE_CONFIGURATION,
@@ -77,118 +91,48 @@ def files_under(root: pathlib.Path) -> list[pathlib.Path]:
     return [path for path in root.rglob("*") if path.is_file()]
 
 
-def read_jpeg(path: pathlib.Path) -> QImage:
-    reader = QImageReader(str(path))
-    assert bytes(reader.format()) == b"jpeg"
-    image = reader.read()
-    assert not image.isNull(), reader.errorString()
-    return image
+def read_jpeg(path: pathlib.Path) -> Image.Image:
+    with Image.open(path) as image:
+        assert image.format == "JPEG"
+        return image.convert("RGB")
+
+
+def pixel(image: Image.Image, x: int, y: int) -> tuple[int, int, int]:
+    value = image.getpixel((x, y))
+    return tuple(int(channel) for channel in value[:3])  # type: ignore[index]
+
+
+def colour_distance(colour: tuple[int, int, int], expected: tuple[int, int, int]) -> int:
+    return max(abs(a - b) for a, b in zip(colour, expected))
+
+
+GREY = (0x80, 0x80, 0x80)
+assert TRANSPARENCY_BACKGROUND == "#808080"
 
 
 def write_transparent_png(path: pathlib.Path, width: int, height: int) -> pathlib.Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = QImage(width, height, QImage.Format.Format_ARGB32)
-    image.fill(QColor(0, 0, 0, 0))
-    assert image.save(str(path), "PNG")
+    Image.new("RGBA", (width, height), (0, 0, 0, 0)).save(path, "PNG")
     return path
 
 
 def write_noisy_png(path: pathlib.Path, width: int, height: int, seed: int = 7) -> pathlib.Path:
-    """A gradient with random blocks: JPEG size depends strongly on quality."""
+    """Random noise: JPEG size depends strongly on quality."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = QImage(width, height, QImage.Format.Format_RGB32)
-    painter = QPainter(image)
-    gradient = QLinearGradient(0.0, 0.0, float(width), float(height))
-    gradient.setColorAt(0.0, QColor("#ee3046"))
-    gradient.setColorAt(0.5, QColor("#3366cc"))
-    gradient.setColorAt(1.0, QColor("#ffffff"))
-    painter.fillRect(0, 0, width, height, QBrush(gradient))
-    generator = random.Random(seed)
-    for _ in range(4000):
-        painter.fillRect(
-            generator.randrange(width),
-            generator.randrange(height),
-            generator.randrange(1, 12),
-            generator.randrange(1, 12),
-            QColor(generator.randrange(256), generator.randrange(256), generator.randrange(256)),
-        )
-    painter.end()
-    assert image.save(str(path), "PNG")
+    rng = np.random.default_rng(seed)
+    pixels = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+    Image.fromarray(pixels, "RGB").save(path, "PNG")
     return path
-
-
-def _lzw_pack(codes: list[int], width: int = 3) -> bytes:
-    bits = 0
-    pending = 0
-    out = bytearray()
-    for code in codes:
-        bits |= code << pending
-        pending += width
-        while pending >= 8:
-            out.append(bits & 0xFF)
-            bits >>= 8
-            pending -= 8
-    if pending:
-        out.append(bits & 0xFF)
-    return bytes(out)
-
-
-def _gif_sub_blocks(data: bytes) -> bytes:
-    out = bytearray()
-    for offset in range(0, len(data), 255):
-        chunk = data[offset : offset + 255]
-        out.append(len(chunk))
-        out += chunk
-    out.append(0)
-    return bytes(out)
-
-
-def _gif_frame(width: int, height: int, colour_index: int) -> bytes:
-    # LZW with a 2-bit minimum code size: CLEAR (4) before every pixel keeps all
-    # codes 3 bits wide; END (5) finishes the stream.
-    codes: list[int] = []
-    for _ in range(width * height):
-        codes += [4, colour_index]
-    codes.append(5)
-    graphic_control = b"\x21\xf9\x04\x00" + struct.pack("<H", 10) + b"\x00\x00"
-    descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, width, height) + b"\x00"
-    return graphic_control + descriptor + b"\x02" + _gif_sub_blocks(_lzw_pack(codes))
 
 
 def write_animated_gif(path: pathlib.Path, width: int, height: int) -> pathlib.Path:
     """Two-frame GIF: frame 1 is solid red, frame 2 is solid blue."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = b"GIF89a" + struct.pack("<HH", width, height) + b"\x91\x00\x00"
-    palette = bytes([0, 0, 0, 220, 30, 30, 30, 30, 220, 255, 255, 255])
-    loop = b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00"
-    path.write_bytes(
-        header + palette + loop + _gif_frame(width, height, 1) + _gif_frame(width, height, 2) + b"\x3b"
-    )
-    return path
-
-
-def colour_distance(colour: QColor, expected: QColor) -> int:
-    return max(
-        abs(colour.red() - expected.red()),
-        abs(colour.green() - expected.green()),
-        abs(colour.blue() - expected.blue()),
-    )
-
-
-MIB = 1024 * 1024
-
-
-def write_deep_tiff(path: pathlib.Path, width: int, height: int) -> pathlib.Path:
-    """A 16-bit-per-channel RGBA TIFF (like a scanner produces), LZW compressed."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image = QImage(width, height, QImage.Format.Format_RGBA64)
-    image.fill(QColor(30, 60, 200, 255))
-    writer = QImageWriter(str(path), b"tiff")
-    writer.setCompression(1)  # LZW keeps the fixture small; the decode is still full size
-    assert writer.write(image), writer.errorString()
+    red = Image.new("RGB", (width, height), (220, 30, 30))
+    blue = Image.new("RGB", (width, height), (30, 30, 220))
+    red.save(path, "GIF", save_all=True, append_images=[blue], duration=100, loop=0)
     return path
 
 
@@ -196,26 +140,13 @@ def write_png_claiming_size(path: pathlib.Path, width: int, height: int) -> path
     """A tiny PNG whose IHDR header claims ``width`` x ``height`` pixels."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    small = QImage(8, 8, QImage.Format.Format_ARGB32)
-    small.fill(QColor(1, 2, 3, 255))
-    assert small.save(str(path), "PNG")
+    Image.new("RGBA", (8, 8), (1, 2, 3, 255)).save(path, "PNG")
     data = bytearray(path.read_bytes())
     assert data[12:16] == b"IHDR"
     struct.pack_into(">II", data, 16, width, height)
     struct.pack_into(">I", data, 29, zlib.crc32(bytes(data[12:29])) & 0xFFFFFFFF)
     path.write_bytes(bytes(data))
     return path
-
-
-@pytest.fixture
-def qt_default_allocation_limit():
-    """Start from Qt's stock 256 MB limit so the module must raise it itself."""
-
-    original = QImageReader.allocationLimit()
-    QImageReader.setAllocationLimit(QT_DEFAULT_IMAGE_ALLOCATION_LIMIT_MB)
-    assert QImageReader.allocationLimit() == QT_DEFAULT_IMAGE_ALLOCATION_LIMIT_MB
-    yield QT_DEFAULT_IMAGE_ALLOCATION_LIMIT_MB
-    QImageReader.setAllocationLimit(original)
 
 
 @pytest.fixture
@@ -229,7 +160,7 @@ def generator(cache: PreviewCache) -> ImagePreviewGenerator:
 
 
 # ---------------------------------------------------------------------------
-# Backend availability
+# Backend availability (spec §2C: all dependencies must be present)
 # ---------------------------------------------------------------------------
 
 
@@ -237,32 +168,79 @@ def test_image_backend_is_available_and_describes_formats():
     available, message = image_backend_available()
 
     assert available is True
-    assert IMAGE_BACKEND_NAME in message
-    assert "jpeg" in message.casefold()
-    assert "png" in message.casefold()
+    assert message.startswith(IMAGE_BACKEND_NAME)
+    assert "Pillow" in message and "pillow-heif" in message and "rawpy" in message
+    assert "HEIC" in message
+    for extension in ("dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"):
+        assert extension in message
 
 
-def test_backend_unavailable_when_qt_cannot_write_jpeg(monkeypatch):
-    monkeypatch.setattr(image_preview.QImageWriter, "supportedImageFormats", staticmethod(lambda: [b"png"]))
+def test_backend_unavailable_without_rawpy(monkeypatch):
+    monkeypatch.setattr(image_preview, "rawpy", None)
+    monkeypatch.setattr(image_preview, "RAW_ERROR", "ModuleNotFoundError: No module named 'rawpy'")
 
     available, message = image_backend_available()
 
     assert available is False
-    assert "JPEG writing" in message
-    assert IMAGE_BACKEND_NAME in message
+    assert "rawpy" in message and "No module named 'rawpy'" in message
+    assert "pip install -r requirements.txt" in message
+
+
+def test_backend_unavailable_without_pillow_heif(monkeypatch):
+    monkeypatch.setattr(image_preview, "pillow_heif", None)
+    monkeypatch.setattr(image_preview, "HEIF_ERROR", "")
+
+    available, message = image_backend_available()
+
+    assert available is False
+    assert "pillow-heif (HEIC/HEIF) is not installed" in message
+
+
+def test_backend_unavailable_without_a_hevc_decoder(monkeypatch):
+    class NoDecoders:
+        __version__ = "1.0"
+
+        @staticmethod
+        def libheif_info():
+            return {"libheif": "1.23.2", "decoders": {}, "encoders": {}}
+
+    monkeypatch.setattr(image_preview, "pillow_heif", NoDecoders)
+
+    available, message = image_backend_available()
+
+    assert available is False
+    assert "no HEVC decoder" in message
+
+
+def test_backend_unavailable_without_jpeg_support(monkeypatch):
+    monkeypatch.setattr(features, "check", lambda feature: feature != "jpg")
+
+    available, message = image_backend_available()
+
+    assert available is False
+    assert "JPEG" in message
+
+
+def test_extension_sets_cover_raw_and_heif_and_exclude_generic_raw():
+    for extension in ("dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef", "srw", "x3f", "3fr", "iiq"):
+        assert extension in RAW_EXTENSIONS
+    assert "raw" not in RAW_EXTENSIONS  # ambiguous: many unrelated tools use .raw
+    assert HEIF_EXTENSIONS == {"heic", "heif", "hif"}
+    assert RAW_EXTENSIONS <= IMAGE_EXTENSIONS and HEIF_EXTENSIONS <= IMAGE_EXTENSIONS
+    assert {"jpg", "png", "tif", "webp"} <= IMAGE_EXTENSIONS
 
 
 def test_generator_exposes_backend_and_profile(cache):
     generator = ImagePreviewGenerator(cache)
 
     assert generator.backend_name == IMAGE_BACKEND_NAME
-    assert generator.profile is cache.image_profile
-    assert generator.profile_id == "jpeg-max1600-q82"
     assert generator.media_kind == "image"
+    assert generator.profile_id == "jpeg-max1600-q82"
+    assert generator.profile == cache.image_profile
 
 
 # ---------------------------------------------------------------------------
-# compute_target_size
+# Target size arithmetic (spec §7)
 # ---------------------------------------------------------------------------
 
 
@@ -273,12 +251,10 @@ def test_generator_exposes_backend_and_profile(cache):
         (4000, 6000, 1600, (1067, 1600)),
         (1200, 800, 1600, (1200, 800)),
         (1600, 1600, 1600, (1600, 1600)),
-        (3000, 2000, 800, (800, 533)),
-        (2000, 3000, 800, (533, 800)),
-        (200, 100, 1600, (200, 100)),
-        (1, 1, 320, (1, 1)),
-        (100000, 1, 1600, (1600, 1)),
-        (1, 100000, 1600, (1, 1600)),
+        (1601, 1, 1600, (1600, 1)),
+        (1, 1601, 1600, (1, 1600)),
+        (10000, 10, 1600, (1600, 2)),
+        (3200, 2000, 1600, (1600, 1000)),
     ],
 )
 def test_compute_target_size_examples(width, height, maximum, expected):
@@ -286,156 +262,202 @@ def test_compute_target_size_examples(width, height, maximum, expected):
 
 
 def test_compute_target_size_never_exceeds_maximum_or_upscales():
-    for width in (1, 17, 319, 320, 321, 1600, 1601, 4096, 8192, 12000):
-        for height in (1, 9, 320, 1067, 1600, 9000):
-            result_width, result_height = compute_target_size(width, height, 1600)
-            assert max(result_width, result_height) <= 1600
-            assert result_width >= 1 and result_height >= 1
-            assert result_width <= width and result_height <= height
-            if max(width, height) <= 1600:
-                assert (result_width, result_height) == (width, height)
+    for width in (1, 7, 640, 1599, 1600, 1601, 9000):
+        for height in (1, 9, 480, 1600, 2400):
+            target_w, target_h = compute_target_size(width, height, 1600)
+            assert max(target_w, target_h) <= 1600
+            assert target_w <= width and target_h <= height
+            assert target_w >= 1 and target_h >= 1
 
 
-@pytest.mark.parametrize(("width", "height", "maximum"), [(0, 100, 1600), (100, -1, 1600), (100, 100, 0)])
+@pytest.mark.parametrize(("width", "height", "maximum"), [(0, 10, 100), (10, 0, 100), (10, 10, 0), (-1, 5, 100)])
 def test_compute_target_size_rejects_non_positive_values(width, height, maximum):
     with pytest.raises(ValueError):
         compute_target_size(width, height, maximum)
 
 
 # ---------------------------------------------------------------------------
-# Successful generation
+# Standard formats through Pillow
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("fmt", ["jpeg", "png", "tiff", "webp", "bmp"])
+@pytest.mark.parametrize(
+    "fmt",
+    [
+        "png",
+        "jpeg",
+        "bmp",
+        "gif",
+        "tiff",
+        pytest.param(
+            "webp",
+            marks=pytest.mark.skipif(not features.check("webp"), reason="Pillow built without WebP"),
+        ),
+    ],
+)
 def test_source_formats_produce_a_valid_jpeg_preview(tmp_path, cache, generator, fmt):
     source = write_test_image(tmp_path / "src" / f"photo.{fmt}", 320, 200, fmt)
     destination = destination_for(cache, source)
-    assert destination.parent.parent.parent == cache.root / "images"
-    assert destination.parent.parent.name == "jpeg-max1600-q82"
-    assert destination.suffix == ".jpg"
 
     result = generator.generate(source, destination)
 
     assert result.status == PREVIEW_GENERATED
-    assert result.ok is True
     assert result.media_kind == "image"
     assert result.profile_id == "jpeg-max1600-q82"
     assert result.path == destination
     assert (result.width, result.height) == (320, 200)
-    assert destination.is_file()
-    assert result.size_bytes == destination.stat().st_size > 0
-    assert result.bytes_written == result.size_bytes
-    assert destination.read_bytes()[:2] == b"\xff\xd8"
+    assert result.detail == SOURCE_PILLOW
+    assert result.bytes_written == result.size_bytes == destination.stat().st_size > 0
     validation = validate_image_preview(destination)
-    assert validation.valid is True
-    assert (validation.width, validation.height) == (320, 200)
+    assert validation.valid and (validation.width, validation.height) == (320, 200)
+    preview = read_jpeg(destination)
+    assert colour_distance(pixel(preview, 40, 40), (0x33, 0x66, 0xCC)) <= 8
+    assert colour_distance(pixel(preview, 280, 180), (0xCC, 0x33, 0x33)) <= 8
     assert temporary_files(cache.root) == []
-    assert files_under(cache.root) == [destination]
+
+
+def test_ico_source_is_supported(tmp_path, cache, generator):
+    source = write_test_image(tmp_path / "src" / "icon.ico", 64, 64, "ico")
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.status == PREVIEW_GENERATED
+    assert (result.width, result.height) == (64, 64)
+
+
+def test_16bit_greyscale_tiff_is_scaled_to_8_bits(tmp_path, cache, generator):
+    source = tmp_path / "src" / "scan16.tif"
+    source.parent.mkdir(parents=True)
+    Image.fromarray(np.full((40, 60), 65535 // 2, dtype=np.uint16)).save(source, "TIFF")
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.status == PREVIEW_GENERATED
+    assert (result.width, result.height) == (60, 40)
+    assert colour_distance(pixel(read_jpeg(result.path), 30, 20), (127, 127, 127)) <= 6
 
 
 def test_animated_gif_uses_its_first_frame(tmp_path, cache, generator):
-    source = write_animated_gif(tmp_path / "src" / "anim.gif", 32, 32)
-    reader = QImageReader(str(source))
-    assert reader.imageCount() == 2, "fixture GIF should be animated"
-    destination = destination_for(cache, source)
+    source = write_animated_gif(tmp_path / "src" / "loop.gif", 40, 30)
 
-    result = generator.generate(source, destination)
+    result = generator.generate(source, destination_for(cache, source))
 
-    assert result.status == PREVIEW_GENERATED
-    assert (result.width, result.height) == (32, 32)
-    preview = read_jpeg(destination)
-    sampled = preview.pixelColor(16, 16)
-    assert colour_distance(sampled, QColor(220, 30, 30)) < 24, sampled.name()
-    assert colour_distance(sampled, QColor(30, 30, 220)) > 100
+    assert (result.width, result.height) == (40, 30)
+    assert colour_distance(pixel(read_jpeg(result.path), 20, 15), (220, 30, 30)) <= 12
 
 
-@pytest.mark.parametrize("orientation", [6, 8])
+@pytest.mark.parametrize("orientation", [5, 6, 7, 8])
 def test_exif_orientation_rotates_landscape_source_to_portrait(tmp_path, cache, generator, orientation):
-    source = write_jpeg_with_exif_orientation(tmp_path / "src" / "rotated.jpg", 200, 100, orientation)
-    destination = destination_for(cache, source)
+    source = write_jpeg_with_exif_orientation(tmp_path / "src" / f"o{orientation}.jpg", 200, 100, orientation)
 
-    result = generator.generate(source, destination)
+    result = generator.generate(source, destination_for(cache, source))
 
     assert (result.width, result.height) == (100, 200)
-    assert read_jpeg(destination).size().toTuple() == (100, 200)
-    assert temporary_files(cache.root) == []
+    with Image.open(result.path) as preview:
+        assert preview.size == (100, 200)
+        assert preview.getexif().get(0x0112) is None, "the preview must not carry an orientation tag"
 
 
-@pytest.mark.parametrize("orientation", [1, 3])
+@pytest.mark.parametrize("orientation", [1, 2, 3, 4])
 def test_exif_orientation_without_rotation_keeps_landscape(tmp_path, cache, generator, orientation):
-    source = write_jpeg_with_exif_orientation(tmp_path / "src" / "flat.jpg", 200, 100, orientation)
+    source = write_jpeg_with_exif_orientation(tmp_path / "src" / f"o{orientation}.jpg", 200, 100, orientation)
 
     result = generator.generate(source, destination_for(cache, source))
 
     assert (result.width, result.height) == (200, 100)
 
 
-def test_exif_orientation_is_applied_after_downscaling(tmp_path):
-    cache = make_cache(tmp_path, max_dimension=800)
-    source = write_jpeg_with_exif_orientation(tmp_path / "src" / "big-rotated.jpg", 3000, 2000, 6)
+def test_exif_orientation_is_applied_before_the_maximum_dimension(tmp_path):
+    cache = make_cache(tmp_path, max_dimension=400)
+    source = write_jpeg_with_exif_orientation(tmp_path / "src" / "tall.jpg", 1600, 800, 6)
 
     result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
 
-    assert (result.width, result.height) == (533, 800)
-    assert result.profile_id == "jpeg-max800-q82"
+    assert (result.width, result.height) == (200, 400)
+
+
+def test_exif_orientation_6_puts_the_top_left_corner_top_right(tmp_path, cache, generator):
+    # The source's top-left quarter is blue; rotating 90° clockwise moves it to the top-right.
+    source = write_jpeg_with_exif_orientation(tmp_path / "src" / "rot.jpg", 200, 100, 6)
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    preview = read_jpeg(result.path)
+    assert preview.size == (100, 200)
+    assert colour_distance(pixel(preview, 75, 25), (0x33, 0x66, 0xCC)) <= 10
+    assert colour_distance(pixel(preview, 25, 175), (0xCC, 0x33, 0x33)) <= 10
 
 
 def test_fully_transparent_png_is_flattened_onto_neutral_grey(tmp_path, cache, generator):
-    source = write_transparent_png(tmp_path / "src" / "clear.png", 64, 64)
-    destination = destination_for(cache, source)
+    source = write_transparent_png(tmp_path / "src" / "clear.png", 64, 48)
 
-    result = generator.generate(source, destination)
+    result = generator.generate(source, destination_for(cache, source))
 
-    assert (result.width, result.height) == (64, 64)
-    preview = read_jpeg(destination)
-    assert not preview.hasAlphaChannel()
-    expected = QColor(TRANSPARENCY_BACKGROUND)
-    for x, y in ((0, 0), (32, 32), (63, 63), (10, 50)):
-        assert preview.pixelColor(x, y).name() == expected.name()
+    preview = read_jpeg(result.path)
+    for point in ((0, 0), (32, 24), (63, 47)):
+        assert colour_distance(pixel(preview, *point), GREY) <= 3
 
 
 def test_partially_transparent_png_keeps_colour_and_greys_transparent_area(tmp_path, cache, generator):
-    source = write_test_image(tmp_path / "src" / "half.png", 200, 200, "png", alpha=True)
-    assert QImageReader(str(source)).read().hasAlphaChannel()
-    destination = destination_for(cache, source)
+    source = write_test_image(tmp_path / "src" / "half.png", 120, 80, "png", alpha=True)
+    with Image.open(source) as check:
+        assert check.mode == "RGBA"
 
-    generator.generate(source, destination)
+    result = generator.generate(source, destination_for(cache, source))
 
-    preview = read_jpeg(destination)
-    grey = QColor(TRANSPARENCY_BACKGROUND)
-    transparent_sample = preview.pixelColor(150, 50)  # top-right quadrant was transparent
-    painted_sample = preview.pixelColor(50, 50)  # top-left quadrant is #3366cc
-    assert colour_distance(transparent_sample, grey) <= 3
-    assert colour_distance(painted_sample, QColor("#3366cc")) <= 12
-    assert colour_distance(painted_sample, grey) > 40
+    preview = read_jpeg(result.path)
+    assert colour_distance(pixel(preview, 20, 20), (0x33, 0x66, 0xCC)) <= 8  # opaque quarter kept
+    assert colour_distance(pixel(preview, 100, 20), GREY) <= 4  # transparent quarter -> grey
+
+
+def test_palette_png_with_transparency_is_flattened(tmp_path, cache, generator):
+    source = tmp_path / "src" / "palette.png"
+    source.parent.mkdir(parents=True)
+    make_test_image(60, 40, alpha=True).quantize(colors=8).save(source, "PNG")
+    with Image.open(source) as check:
+        assert check.mode == "P" and "transparency" in check.info
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    preview = read_jpeg(result.path)
+    assert colour_distance(pixel(preview, 50, 10), GREY) <= 6
 
 
 def test_large_landscape_image_is_downscaled_preserving_aspect(tmp_path):
     cache = make_cache(tmp_path, max_dimension=800)
-    source = write_test_image(tmp_path / "src" / "large.png", 3000, 2000, "png")
+    source = write_test_image(tmp_path / "src" / "wide.png", 3200, 2000, "png")
 
     result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
 
-    assert (result.width, result.height) == (800, 533)
-    assert read_jpeg(result.path).size().toTuple() == (800, 533)
+    assert (result.width, result.height) == (800, 500)
 
 
 def test_large_portrait_image_is_downscaled_preserving_aspect(tmp_path):
     cache = make_cache(tmp_path, max_dimension=800)
-    source = write_test_image(tmp_path / "src" / "tall.jpg", 2000, 3000, "jpeg")
+    source = write_test_image(tmp_path / "src" / "tall.png", 2000, 3200, "png")
 
     result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
 
-    assert (result.width, result.height) == (533, 800)
+    assert (result.width, result.height) == (500, 800)
+
+
+def test_large_jpeg_uses_dct_scaling_but_is_never_smaller_than_the_target(tmp_path):
+    cache = make_cache(tmp_path, max_dimension=1600)
+    source = write_test_image(tmp_path / "src" / "big.jpg", 6000, 4000, "jpeg")
+
+    result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
+
+    assert (result.width, result.height) == (1600, 1067)
+    preview = read_jpeg(result.path)
+    assert colour_distance(pixel(preview, 200, 200), (0x33, 0x66, 0xCC)) <= 10
 
 
 def test_small_image_is_not_upscaled(tmp_path, cache, generator):
-    source = write_test_image(tmp_path / "src" / "small.png", 200, 100, "png")
+    source = write_test_image(tmp_path / "src" / "small.png", 120, 90, "png")
 
     result = generator.generate(source, destination_for(cache, source))
 
-    assert (result.width, result.height) == (200, 100)
+    assert (result.width, result.height) == (120, 90)
 
 
 def test_configured_maximum_dimension_is_honoured(tmp_path):
@@ -445,203 +467,117 @@ def test_configured_maximum_dimension_is_honoured(tmp_path):
     result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
 
     assert (result.width, result.height) == (320, 240)
-    assert "jpeg-max320-q82" in str(result.path)
-
-
-def test_fallback_scaling_when_reader_ignores_scaled_size(tmp_path, monkeypatch):
-    cache = make_cache(tmp_path, max_dimension=800)
-    source = write_test_image(tmp_path / "src" / "large.png", 3000, 2000, "png")
-    monkeypatch.setattr(image_preview.QImageReader, "setScaledSize", lambda self, size: None)
-
-    result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
-
-    assert (result.width, result.height) == (800, 533)
+    assert result.profile_id == "jpeg-max320-q82"
 
 
 def test_configured_jpeg_quality_changes_output_size(tmp_path):
-    source = write_noisy_png(tmp_path / "src" / "noisy.png", 1200, 800)
-    low_cache = make_cache(tmp_path / "low", jpeg_quality=40)
-    high_cache = make_cache(tmp_path / "high", jpeg_quality=100)
+    source = write_noisy_png(tmp_path / "src" / "noise.png", 400, 300)
+    sizes = {}
+    for quality in (45, 95):
+        cache = make_cache(tmp_path / str(quality), jpeg_quality=quality)
+        result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
+        sizes[quality] = result.size_bytes
+        assert result.profile_id == f"jpeg-max1600-q{quality}"
 
-    low = ImagePreviewGenerator(low_cache).generate(source, destination_for(low_cache, source))
-    high = ImagePreviewGenerator(high_cache).generate(source, destination_for(high_cache, source))
-
-    assert low.profile_id == "jpeg-max1600-q40"
-    assert high.profile_id == "jpeg-max1600-q100"
-    assert (low.width, low.height) == (high.width, high.height) == (1200, 800)
-    assert 0 < low.size_bytes < high.size_bytes
-    assert high.size_bytes > low.size_bytes * 2
+    assert sizes[95] > sizes[45] * 1.5
 
 
-def test_source_metadata_is_not_copied_into_the_preview(tmp_path, cache, generator):
-    source = tmp_path / "src" / "tagged.png"
+def test_source_metadata_is_not_copied_but_icc_profile_is(tmp_path, cache, generator):
+    source = tmp_path / "src" / "tagged.jpg"
     source.parent.mkdir(parents=True)
-    image = make_test_image(120, 90)
-    image.setText("Description", "JVVV-SECRET-CAMERA-NOTE")
-    writer = QImageWriter(str(source), b"png")
-    assert writer.write(image)
-    assert b"JVVV-SECRET-CAMERA-NOTE" in source.read_bytes(), "PNG fixture should carry the text chunk"
+    exif = Image.Exif()
+    exif[0x010F] = "JVVV Camera Co."  # Make
+    exif[0x9003] = "2024:01:02 03:04:05"  # DateTimeOriginal (in the EXIF IFD)
+    fake_icc = b"ICC_PROFILE_TEST" * 8
+    make_test_image(200, 150).save(
+        source,
+        "JPEG",
+        quality=90,
+        exif=exif.tobytes(),
+        icc_profile=fake_icc,
+        comment=b"do not copy this comment",
+    )
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    with Image.open(result.path) as preview:
+        assert dict(preview.getexif()) == {}
+        assert "comment" not in preview.info
+        assert "xmp" not in preview.info
+        assert preview.info.get("icc_profile") == fake_icc
+    assert b"JVVV Camera Co." not in result.path.read_bytes()
+
+
+def test_generating_the_same_source_twice_is_deterministic(tmp_path, cache, generator):
+    source = write_test_image(tmp_path / "src" / "twice.png", 300, 200, "png")
     destination = destination_for(cache, source)
 
-    generator.generate(source, destination)
+    first = generator.generate(source, destination)
+    first_bytes = destination.read_bytes()
+    second = generator.generate(source, destination)
 
-    assert b"JVVV-SECRET-CAMERA-NOTE" not in destination.read_bytes()
-    assert QImageReader(str(destination)).read().textKeys() == []
-
-
-def test_generate_works_in_a_worker_thread_without_qapplication(tmp_path, cache, generator):
-    source = write_test_image(tmp_path / "src" / "threaded.jpg", 300, 200, "jpeg")
-    destination = destination_for(cache, source)
-    outcome: dict[str, object] = {}
-
-    def work() -> None:
-        try:
-            outcome["result"] = generator.generate(source, destination)
-        except BaseException as exc:  # pragma: no cover - reported via assertion
-            outcome["error"] = exc
-
-    thread = threading.Thread(target=work)
-    thread.start()
-    thread.join(timeout=30)
-
-    assert not thread.is_alive()
-    assert "error" not in outcome, outcome.get("error")
-    result = outcome["result"]
-    assert result.status == PREVIEW_GENERATED
-    assert (result.width, result.height) == (300, 200)
-
-
-# ---------------------------------------------------------------------------
-# Large sources and Qt's decoder allocation limit
-# ---------------------------------------------------------------------------
-
-
-def test_module_limit_is_bounded_and_large_enough_for_the_biggest_profile():
-    # A 9000x9000 JPEG scaled to the 8192 px profile is decoded at full size by
-    # libjpeg (it only downscales by 2/4/8), so that intermediate must fit.
-    assert IMAGE_ALLOCATION_LIMIT_MB > QT_DEFAULT_IMAGE_ALLOCATION_LIMIT_MB
-    assert IMAGE_ALLOCATION_LIMIT_MB * MIB > 9000 * 9000 * 4
-    # Bounded: an absurd header must still be refused without touching memory.
-    assert IMAGE_ALLOCATION_LIMIT_MB * MIB < 60000 * 60000 * 4
-
-
-def test_png_above_qt_default_allocation_limit_is_decoded(tmp_path, cache, generator, qt_default_allocation_limit):
-    source = write_test_image(tmp_path / "src" / "huge.png", 9000, 8000, "png")
-    assert 9000 * 8000 * 4 > qt_default_allocation_limit * MIB, "fixture must exceed Qt's default"
-    destination = destination_for(cache, source)
-
-    result = generator.generate(source, destination)
-
-    assert result.status == PREVIEW_GENERATED
-    assert (result.width, result.height) == (1600, 1422)
-    assert validate_image_preview(destination).valid
-    assert QImageReader.allocationLimit() == IMAGE_ALLOCATION_LIMIT_MB
-    assert temporary_files(cache.root) == []
+    assert first.status == second.status == PREVIEW_GENERATED
+    assert (first.width, first.height) == (second.width, second.height) == (300, 200)
+    assert destination.read_bytes() == first_bytes
     assert files_under(cache.root) == [destination]
 
 
-def test_16bit_tiff_scan_above_qt_default_allocation_limit_is_decoded(tmp_path, cache, generator, qt_default_allocation_limit):
-    source = write_deep_tiff(tmp_path / "src" / "scan.tiff", 6000, 6000)
-    reader = QImageReader(str(source))
-    assert reader.imageFormat() == QImage.Format.Format_RGBA64
-    assert 6000 * 6000 * 8 > qt_default_allocation_limit * MIB
+def test_generate_works_in_a_worker_thread(tmp_path, cache, generator):
+    source = write_test_image(tmp_path / "src" / "threaded.png", 300, 200, "png")
     destination = destination_for(cache, source)
+    outcome: dict[str, object] = {}
 
-    result = generator.generate(source, destination)
+    def worker() -> None:
+        try:
+            outcome["result"] = generator.generate(source, destination)
+        except BaseException as exc:  # pragma: no cover - reported through the assertion
+            outcome["error"] = exc
 
-    assert result.status == PREVIEW_GENERATED
-    assert (result.width, result.height) == (1600, 1600)
-    assert colour_distance(read_jpeg(destination).pixelColor(800, 800), QColor(30, 60, 200)) <= 6
-    assert temporary_files(cache.root) == []
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=60)
 
-
-def test_maximum_profile_dimension_decodes_a_larger_jpeg_source(tmp_path, qt_default_allocation_limit):
-    cache = make_cache(tmp_path, max_dimension=8192)
-    source = write_test_image(tmp_path / "src" / "9k.jpg", 9000, 9000, "jpeg")
-    destination = destination_for(cache, source)
-
-    result = ImagePreviewGenerator(cache).generate(source, destination)
-
-    assert result.status == PREVIEW_GENERATED
-    assert result.profile_id == "jpeg-max8192-q82"
-    assert (result.width, result.height) == (8192, 8192)
-    validation = validate_image_preview(destination)
-    assert validation.valid and (validation.width, validation.height) == (8192, 8192)
-    assert temporary_files(cache.root) == []
-
-
-def test_validate_reads_a_preview_larger_than_qt_default_allocation_limit(tmp_path, qt_default_allocation_limit):
-    path = write_test_image(tmp_path / "big-preview.jpg", 8200, 8200, "jpeg")
-    assert 8200 * 8200 * 4 > qt_default_allocation_limit * MIB
-
-    validation = validate_image_preview(path)
-
-    assert validation.valid is True
-    assert (validation.width, validation.height) == (8200, 8200)
-
-
-def test_header_claiming_absurd_size_fails_honestly_as_too_large(tmp_path, cache, generator, qt_default_allocation_limit):
-    source = write_png_claiming_size(tmp_path / "src" / "gigantic.png", 60000, 60000)
-    assert QImageReader(str(source)).size().toTuple() == (60000, 60000)
-    destination = destination_for(cache, source)
-
-    with pytest.raises(PreviewError) as info:
-        generator.generate(source, destination)
-
-    error = info.value
-    assert error.stage == STAGE_IMAGE_DECODE
-    assert error.message == "The image is too large to decode."
-    assert "60000x60000" in error.detail
-    assert "14.4 GB" in error.detail
-    assert f"{ALLOCATION_LIMIT_ENVIRONMENT_VARIABLE}={IMAGE_ALLOCATION_LIMIT_MB}" in error.detail
-    assert "Unable to read image data" in error.detail  # Qt's own text is kept too
-    assert QImageReader.allocationLimit() == IMAGE_ALLOCATION_LIMIT_MB, "the limit must stay bounded"
-    assert not destination.exists()
-    assert temporary_files(cache.root) == []
-
-
-def test_corrupt_file_with_readable_header_is_still_reported_as_undecodable(tmp_path, cache, generator):
-    # Header well under the limit but no pixel data: not a size problem.
-    source = write_png_claiming_size(tmp_path / "src" / "truncated.png", 640, 480)
-    destination = destination_for(cache, source)
-
-    with pytest.raises(PreviewError) as info:
-        generator.generate(source, destination)
-
-    assert info.value.stage == STAGE_IMAGE_DECODE
-    assert info.value.message == "Image decoder could not read the file."
-    assert "640x480" in info.value.detail
-    assert "too large" not in str(info.value).casefold()
-    assert temporary_files(cache.root) == []
-
-
-def test_explicit_qt_environment_override_is_respected(tmp_path, cache, generator, monkeypatch, qt_default_allocation_limit):
-    monkeypatch.setenv(ALLOCATION_LIMIT_ENVIRONMENT_VARIABLE, "64")
-    QImageReader.setAllocationLimit(64)  # what Qt does at start-up when the variable is set
-    small = write_test_image(tmp_path / "src" / "fits.png", 320, 200, "png")
-    over = write_png_claiming_size(tmp_path / "src" / "over.png", 6000, 6000)  # 144 MB > 64 MB
-
-    result = generator.generate(small, destination_for(cache, small))
-    with pytest.raises(PreviewError) as info:
-        generator.generate(over, destination_for(cache, over))
-
-    assert result.status == PREVIEW_GENERATED
-    assert QImageReader.allocationLimit() == 64, "an operator override must not be replaced"
-    assert info.value.message == "The image is too large to decode."
-    assert f"{ALLOCATION_LIMIT_ENVIRONMENT_VARIABLE}=64" in info.value.detail
-    assert temporary_files(cache.root) == []
-
-
-def test_backend_message_reports_the_effective_allocation_limit(qt_default_allocation_limit):
-    available, message = image_backend_available()
-
-    assert available is True
-    assert f"{ALLOCATION_LIMIT_ENVIRONMENT_VARIABLE}={IMAGE_ALLOCATION_LIMIT_MB}" in message
-    assert QImageReader.allocationLimit() == IMAGE_ALLOCATION_LIMIT_MB
+    assert not thread.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome["result"].status == PREVIEW_GENERATED  # type: ignore[union-attr]
+    assert validate_image_preview(destination).valid
 
 
 # ---------------------------------------------------------------------------
-# Atomic output
+# Decode limits and hostile headers (spec §32)
+# ---------------------------------------------------------------------------
+
+
+def test_decode_limit_is_explicit_and_large_enough_for_real_photos():
+    assert Image.MAX_IMAGE_PIXELS is None, "Pillow's own bomb guard is replaced by the explicit budget"
+    assert 200_000_000 <= MAX_SOURCE_PIXELS <= 2_000_000_000
+
+
+def test_header_claiming_absurd_size_fails_honestly(tmp_path, cache, generator):
+    source = write_png_claiming_size(tmp_path / "src" / "huge.png", 60000, 60000)
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert "60000x60000" in info.value.detail and "megapixel" in info.value.detail
+    assert temporary_files(cache.root) == []
+    assert files_under(cache.root) == []
+
+
+def test_corrupt_file_with_readable_header_is_still_reported_as_undecodable(tmp_path, cache, generator):
+    source = write_png_claiming_size(tmp_path / "src" / "lying.png", 4000, 3000)
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert info.value.message == "Image decoder could not read the file."
+    assert files_under(cache.root) == []
+
+
+# ---------------------------------------------------------------------------
+# Atomic output (spec §10)
 # ---------------------------------------------------------------------------
 
 
@@ -680,23 +616,6 @@ def test_preview_is_written_to_a_temporary_name_and_published_atomically(tmp_pat
     assert [path.name for path in destination.parent.iterdir()] == [destination.name]
 
 
-def test_generating_twice_to_the_same_destination_replaces_it_atomically(tmp_path, cache, generator):
-    source = write_test_image(tmp_path / "src" / "twice.png", 300, 200, "png")
-    destination = destination_for(cache, source)
-
-    first = generator.generate(source, destination)
-    first_bytes = destination.read_bytes()
-    second = generator.generate(source, destination)
-
-    assert first.status == second.status == PREVIEW_GENERATED
-    assert (first.width, first.height) == (second.width, second.height) == (300, 200)
-    assert second.path == first.path == destination
-    assert destination.read_bytes() == first_bytes  # deterministic output
-    assert validate_image_preview(destination).valid
-    assert temporary_files(cache.root) == []
-    assert files_under(cache.root) == [destination]
-
-
 def test_publish_failure_propagates_and_leaves_no_temporary(tmp_path, cache, generator, monkeypatch):
     source = write_test_image(tmp_path / "src" / "publish.png", 120, 80, "png")
     destination = destination_for(cache, source)
@@ -716,7 +635,7 @@ def test_publish_failure_propagates_and_leaves_no_temporary(tmp_path, cache, gen
 
 
 # ---------------------------------------------------------------------------
-# validate_image_preview
+# validate_image_preview (spec §11)
 # ---------------------------------------------------------------------------
 
 
@@ -737,88 +656,68 @@ def test_validate_rejects_zero_byte_file(tmp_path):
 
     assert validation.valid is False
     assert validation.size_bytes == 0
-    assert (validation.width, validation.height) == (None, None)
-    assert "empty" in validation.message.casefold()
+    assert validation.message == "The preview file is empty."
 
 
 def test_validate_rejects_garbage(tmp_path):
     path = tmp_path / "garbage.jpg"
-    path.write_bytes(b"this is definitely not a jpeg file" * 20)
+    path.write_bytes(b"definitely not a jpeg" * 10)
 
     validation = validate_image_preview(path)
 
     assert validation.valid is False
-    assert validation.size_bytes == path.stat().st_size
-    assert "not a jpeg" in validation.message.casefold()
+    assert "not a JPEG" in validation.message
 
 
 def test_validate_rejects_truncated_jpeg(tmp_path):
-    path = write_test_image(tmp_path / "full.jpg", 400, 300, "jpeg")
-    data = path.read_bytes()
-    start_of_scan = data.find(b"\xff\xda")
-    assert start_of_scan > 0
+    complete = write_test_image(tmp_path / "complete.jpg", 400, 300, "jpeg")
     truncated = tmp_path / "truncated.jpg"
-    truncated.write_bytes(data[:start_of_scan])
-    assert bytes(QImageReader(str(truncated)).format()) == b"jpeg"
+    data = complete.read_bytes()
+    truncated.write_bytes(data[: len(data) // 3])
 
     validation = validate_image_preview(truncated)
 
     assert validation.valid is False
-    assert validation.size_bytes == start_of_scan
-    assert "decoder could not read" in validation.message.casefold()
+    assert "decoder could not read" in validation.message
+    assert validation.size_bytes == truncated.stat().st_size
 
 
 def test_validate_rejects_png_renamed_as_jpg(tmp_path):
-    path = write_test_image(tmp_path / "really-a-png.jpg", 40, 30, "png")
+    path = write_test_image(tmp_path / "actually.png", 40, 30, "png")
+    renamed = tmp_path / "renamed.jpg"
+    path.rename(renamed)
 
-    validation = validate_image_preview(path)
+    validation = validate_image_preview(renamed)
 
     assert validation.valid is False
-    assert "png" in validation.message.casefold()
+    assert validation.message == "The preview is not a JPEG file (detected format: png)."
 
 
 def test_validate_rejects_missing_file_and_directory(tmp_path):
     missing = validate_image_preview(tmp_path / "missing.jpg")
-    directory = validate_image_preview(tmp_path)
+    assert missing.valid is False and "could not be read" in missing.message
 
-    assert missing.valid is False
-    assert "could not be read" in missing.message.casefold()
-    assert directory.valid is False
-    assert "regular file" in directory.message.casefold()
+    directory = tmp_path / "dir.jpg"
+    directory.mkdir()
+    assert validate_image_preview(directory).valid is False
 
 
 def test_validate_never_raises_for_odd_paths(tmp_path):
-    assert validate_image_preview(tmp_path / "nested" / "deeper" / "x.jpg").valid is False
-    assert validate_image_preview(pathlib.Path("")).valid is False
+    for odd in (tmp_path / "with space.jpg", tmp_path / "ünïcödé.jpg", tmp_path / ("x" * 200 + ".jpg")):
+        validation = validate_image_preview(odd)
+        assert validation.valid is False
+        assert validation.message
 
 
 # ---------------------------------------------------------------------------
-# Failures
+# Failures (spec §12, §30)
 # ---------------------------------------------------------------------------
 
 
 def test_corrupt_source_fails_at_image_decode_without_temporaries(tmp_path, cache, generator):
     source = tmp_path / "src" / "broken.jpg"
     source.parent.mkdir(parents=True)
-    source.write_bytes(b"\xff\xd8 not really a jpeg" + b"\x00" * 200)
-    destination = destination_for(cache, source)
-
-    with pytest.raises(PreviewError) as info:
-        generator.generate(source, destination)
-
-    error = info.value
-    assert error.stage == STAGE_IMAGE_DECODE
-    assert error.message == "Image decoder could not read the file."
-    assert error.detail
-    assert "Image decoder could not read the file." in str(error)
-    assert not destination.exists()
-    assert temporary_files(cache.root) == []
-
-
-def test_unsupported_heic_fails_visibly_at_image_decode(tmp_path, cache, generator):
-    source = tmp_path / "src" / "IMG_0001.heic"
-    source.parent.mkdir(parents=True)
-    source.write_bytes(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 256)
+    source.write_bytes(b"\xff\xd8\xff" + b"\x00" * 500)
     destination = destination_for(cache, source)
 
     with pytest.raises(PreviewError) as info:
@@ -826,37 +725,54 @@ def test_unsupported_heic_fails_visibly_at_image_decode(tmp_path, cache, generat
 
     assert info.value.stage == STAGE_IMAGE_DECODE
     assert info.value.message == "Image decoder could not read the file."
+    assert info.value.detail
     assert not destination.exists()
     assert temporary_files(cache.root) == []
 
 
+def test_unknown_format_fails_visibly_at_image_decode(tmp_path, cache, generator):
+    source = tmp_path / "src" / "mystery.jpg"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"not an image at all" * 20)
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert "identify" in info.value.detail
+    assert files_under(cache.root) == []
+
+
 def test_missing_source_fails_at_image_decode(tmp_path, cache, generator):
-    source = tmp_path / "src" / "gone.png"
-    destination = cache.preview_path("image", hashlib.sha256(b"gone").digest())
+    source = tmp_path / "src" / "missing.png"
+    destination = cache.preview_path("image", b"\x11" * 32)
 
     with pytest.raises(PreviewError) as info:
         generator.generate(source, destination)
 
     assert info.value.stage == STAGE_IMAGE_DECODE
     assert info.value.message == "The source image could not be read."
-    assert info.value.detail
+    assert not destination.exists()
     assert files_under(cache.root) == []
 
 
 def test_failed_regeneration_preserves_the_existing_valid_preview(tmp_path, cache, generator):
-    source = write_test_image(tmp_path / "src" / "good.png", 100, 60, "png")
+    source = write_test_image(tmp_path / "src" / "keep.png", 200, 150, "png")
     destination = destination_for(cache, source)
     generator.generate(source, destination)
     good_bytes = destination.read_bytes()
-    source.write_bytes(b"corrupted after the first scan" * 10)
+    source.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 300)  # now corrupt
 
-    with pytest.raises(PreviewError) as info:
+    with pytest.raises(PreviewError):
         generator.generate(source, destination)
 
-    assert info.value.stage == STAGE_IMAGE_DECODE
     assert destination.read_bytes() == good_bytes
-    assert validate_image_preview(destination).valid
     assert temporary_files(cache.root) == []
+
+
+# ---------------------------------------------------------------------------
+# Cancellation (spec §13)
+# ---------------------------------------------------------------------------
 
 
 def test_cancellation_after_decode_raises_and_leaves_nothing(tmp_path, cache, generator):
@@ -941,17 +857,22 @@ def test_completed_generation_without_cancel_checks_every_stage(tmp_path, cache,
     assert calls["count"] >= 3
 
 
+# ---------------------------------------------------------------------------
+# Source changes and write failures
+# ---------------------------------------------------------------------------
+
+
 def test_source_modified_during_generation_is_reported(tmp_path, cache, generator, monkeypatch):
     source = write_test_image(tmp_path / "src" / "changing.png", 200, 150, "png")
     destination = destination_for(cache, source)
+    original_encode = image_preview.encode_jpeg
 
-    class SourceMutatingWriter(QImageWriter):
-        def write(self, image):
-            with open(source, "ab") as handle:
-                handle.write(b"\x00" * 64)  # size changes even if mtime granularity hides the edit
-            return super().write(image)
+    def mutating_encode(image, temp_path, jpeg_quality, **kwargs):
+        with open(source, "ab") as handle:
+            handle.write(b"\x00" * 64)  # size changes even if mtime granularity hides the edit
+        original_encode(image, temp_path, jpeg_quality, **kwargs)
 
-    monkeypatch.setattr(image_preview, "QImageWriter", SourceMutatingWriter)
+    monkeypatch.setattr(image_preview, "encode_jpeg", mutating_encode)
 
     with pytest.raises(PreviewError) as info:
         generator.generate(source, destination)
@@ -965,14 +886,13 @@ def test_source_modified_during_generation_is_reported(tmp_path, cache, generato
 def test_source_removed_during_generation_is_reported(tmp_path, cache, generator, monkeypatch):
     source = write_test_image(tmp_path / "src" / "vanishing.png", 200, 150, "png")
     destination = destination_for(cache, source)
+    original_encode = image_preview.encode_jpeg
 
-    class SourceDeletingWriter(QImageWriter):
-        def write(self, image):
-            written = super().write(image)
-            source.unlink()
-            return written
+    def deleting_encode(image, temp_path, jpeg_quality, **kwargs):
+        original_encode(image, temp_path, jpeg_quality, **kwargs)
+        source.unlink()
 
-    monkeypatch.setattr(image_preview, "QImageWriter", SourceDeletingWriter)
+    monkeypatch.setattr(image_preview, "encode_jpeg", deleting_encode)
 
     with pytest.raises(PreviewError) as info:
         generator.generate(source, destination)
@@ -986,67 +906,42 @@ def test_source_removed_during_generation_is_reported(tmp_path, cache, generator
 def test_encode_failure_mentioning_space_is_classified_as_disk_full(tmp_path, cache, generator, monkeypatch):
     source = write_test_image(tmp_path / "src" / "full-disk.png", 200, 150, "png")
     destination = destination_for(cache, source)
-    created: list[tuple[str, bytes, int | None]] = []
+    partial: list[pathlib.Path] = []
 
-    class FullDiskWriter:
-        def __init__(self, path, image_format):
-            self.path = path
-            self.image_format = image_format
-            self.quality = None
+    def full_disk_save(self, fp, format=None, **params):
+        pathlib.Path(fp).write_bytes(b"\xff\xd8partial")  # half-written file
+        partial.append(pathlib.Path(fp))
+        raise OSError(28, "No space left on device")
 
-        def setQuality(self, quality):
-            self.quality = quality
-            created.append((self.path, self.image_format, quality))
-
-        def write(self, image):
-            return False
-
-        def errorString(self):
-            return "Not enough space on the device"
-
-    monkeypatch.setattr(image_preview, "QImageWriter", FullDiskWriter)
+    monkeypatch.setattr(Image.Image, "save", full_disk_save)
 
     with pytest.raises(PreviewError) as info:
         generator.generate(source, destination)
 
     assert info.value.stage == STAGE_DISK_FULL
     assert info.value.message == "Could not write preview."
-    assert "Not enough space" in info.value.detail
-    path_text, image_format, quality = created[0]
-    assert image_format == b"jpeg"
-    assert quality == 82
-    temp = pathlib.Path(path_text)
-    assert temp.parent == destination.parent and ".tmp-" in temp.name
+    assert "No space left" in info.value.detail
+    assert partial and not partial[0].exists()
     assert not destination.exists()
     assert temporary_files(cache.root) == []
 
 
 def test_other_encode_failure_is_classified_as_image_encode(tmp_path, cache, generator, monkeypatch):
-    source = write_test_image(tmp_path / "src" / "unwritable.png", 200, 150, "png")
+    source = write_test_image(tmp_path / "src" / "encode-fail.png", 200, 150, "png")
     destination = destination_for(cache, source)
 
-    class BrokenWriter:
-        def __init__(self, path, image_format):
-            pass
+    def failing_save(self, fp, format=None, **params):
+        raise OSError("encoder error -2 when writing image file")
 
-        def setQuality(self, quality):
-            pass
-
-        def write(self, image):
-            return False
-
-        def errorString(self):
-            return "Device not writable"
-
-    monkeypatch.setattr(image_preview, "QImageWriter", BrokenWriter)
+    monkeypatch.setattr(Image.Image, "save", failing_save)
 
     with pytest.raises(PreviewError) as info:
         generator.generate(source, destination)
 
     assert info.value.stage == STAGE_IMAGE_ENCODE
-    assert info.value.detail == "Device not writable"
-    assert not destination.exists()
-    assert temporary_files(cache.root) == []
+    assert info.value.message == "Could not write preview."
+    assert "encoder error" in info.value.detail
+    assert files_under(cache.root) == []
 
 
 def test_invalid_temporary_output_fails_validation_and_is_removed(tmp_path, cache, generator, monkeypatch):
@@ -1072,7 +967,7 @@ def test_invalid_temporary_output_fails_validation_and_is_removed(tmp_path, cach
 
 
 def test_unexpected_exception_still_removes_the_temporary(tmp_path, cache, generator, monkeypatch):
-    source = write_test_image(tmp_path / "src" / "transform.png", 200, 150, "png")
+    source = write_test_image(tmp_path / "src" / "unexpected.png", 200, 150, "png")
     destination = destination_for(cache, source)
     issued: list[pathlib.Path] = []
     original_temporary_path = cache.temporary_path
@@ -1099,15 +994,18 @@ def test_unexpected_exception_still_removes_the_temporary(tmp_path, cache, gener
 def test_transform_failure_is_classified_as_image_transform(tmp_path, monkeypatch):
     cache = make_cache(tmp_path, max_dimension=320)
     source = write_test_image(tmp_path / "src" / "big.png", 640, 480, "png")
-    monkeypatch.setattr(image_preview.QImageReader, "setScaledSize", lambda self, size: None)
-    monkeypatch.setattr(image_preview.QImage, "scaled", lambda self, *args, **kwargs: QImage())
+
+    def failing_resize(self, *args, **kwargs):
+        raise ValueError("simulated resampling failure")
+
+    monkeypatch.setattr(Image.Image, "resize", failing_resize)
 
     with pytest.raises(PreviewError) as info:
         ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
 
     assert info.value.stage == STAGE_IMAGE_TRANSFORM
-    assert info.value.message == "The image could not be resized."
-    assert temporary_files(cache.root) == []
+    assert info.value.message == "The image could not be prepared for encoding."
+    assert "simulated resampling failure" in info.value.detail
     assert files_under(cache.root) == []
 
 
@@ -1123,7 +1021,244 @@ def test_invalid_image_profile_is_reported_as_configuration_error(tmp_path, cach
 
 
 # ---------------------------------------------------------------------------
-# Backend self-test (spec section 2C)
+# Camera RAW via rawpy / LibRaw (spec §39)
+# ---------------------------------------------------------------------------
+
+
+def test_raw_with_a_full_size_embedded_jpeg_uses_the_embedded_preview(tmp_path, cache, generator):
+    source = write_dng(tmp_path / "src" / "shot.dng", 96, 64, embedded_jpeg=jpeg_bytes(96, 64, (200, 40, 40)))
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.status == PREVIEW_GENERATED
+    assert result.detail == SOURCE_RAW_EMBEDDED
+    assert (result.width, result.height) == (96, 64)
+    preview = read_jpeg(result.path)
+    assert colour_distance(pixel(preview, 48, 32), (200, 40, 40)) <= 12
+    assert validate_image_preview(result.path).valid
+
+
+def test_raw_embedded_preview_only_needs_to_cover_the_configured_maximum(tmp_path):
+    cache = make_cache(tmp_path, max_dimension=320)
+    source = write_dng(tmp_path / "src" / "shot.dng", 1600, 1200, embedded_jpeg=jpeg_bytes(800, 600, (40, 200, 40)))
+
+    result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
+
+    assert result.detail == SOURCE_RAW_EMBEDDED
+    assert (result.width, result.height) == (320, 240)
+    assert colour_distance(pixel(read_jpeg(result.path), 160, 120), (40, 200, 40)) <= 12
+
+
+def test_raw_with_a_small_embedded_jpeg_falls_back_to_demosaicing(tmp_path, cache, generator):
+    source = write_dng(tmp_path / "src" / "shot.dng", 96, 64, embedded_jpeg=jpeg_bytes(48, 32, (200, 40, 40)))
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.detail == SOURCE_RAW_DEMOSAIC
+    assert (result.width, result.height) == (96, 64)
+    preview = read_jpeg(result.path)
+    assert colour_distance(pixel(preview, 48, 32), (200, 40, 40)) > 40, "the thumbnail colour must not appear"
+
+
+def test_raw_without_an_embedded_preview_is_demosaiced(tmp_path, cache, generator):
+    source = write_dng(tmp_path / "src" / "plain.dng", 96, 64)
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.status == PREVIEW_GENERATED
+    assert result.detail == SOURCE_RAW_DEMOSAIC
+    assert (result.width, result.height) == (96, 64)
+    preview = read_jpeg(result.path)
+    left, right = pixel(preview, 4, 32), pixel(preview, 91, 32)
+    assert right[0] > left[0] + 60, "the sensor gradient (red rising left to right) must survive"
+
+
+def test_raw_demosaic_uses_half_size_when_it_still_covers_the_maximum(tmp_path):
+    cache = make_cache(tmp_path, max_dimension=320)
+    source = write_dng(tmp_path / "src" / "plain.dng", 1600, 1200)
+
+    decoded = open_image(source, max_dimension=320)
+    assert decoded.source == SOURCE_RAW_DEMOSAIC
+    assert decoded.image.size == (800, 600), "LibRaw half-size output is enough for a 320 px preview"
+    decoded.image.close()
+
+    result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
+
+    assert (result.width, result.height) == (320, 240)
+
+
+def test_raw_demosaic_stays_full_size_when_half_size_would_be_too_small(tmp_path):
+    source = write_dng(tmp_path / "src" / "plain.dng", 400, 300)
+
+    decoded = open_image(source, max_dimension=320)
+
+    assert decoded.image.size == (400, 300)
+    decoded.image.close()
+
+
+def test_raw_orientation_from_libraw_rotates_the_demosaiced_image(tmp_path, cache, generator):
+    source = write_dng(tmp_path / "src" / "portrait.dng", 96, 64, orientation=6)
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.detail == SOURCE_RAW_DEMOSAIC
+    assert (result.width, result.height) == (64, 96)
+
+
+def test_raw_orientation_from_libraw_rotates_an_embedded_preview_without_exif(tmp_path, cache, generator):
+    source = write_dng(
+        tmp_path / "src" / "portrait.dng", 96, 64, orientation=6, embedded_jpeg=jpeg_bytes(96, 64, (200, 40, 40))
+    )
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.detail == SOURCE_RAW_EMBEDDED
+    assert (result.width, result.height) == (64, 96)
+
+
+def test_embedded_preview_with_its_own_exif_orientation_is_rotated_exactly_once(tmp_path, cache, generator):
+    embedded = jpeg_bytes(96, 64, (200, 40, 40), orientation=6)
+    source = write_dng(tmp_path / "src" / "portrait.dng", 96, 64, orientation=6, embedded_jpeg=embedded)
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.detail == SOURCE_RAW_EMBEDDED
+    assert (result.width, result.height) == (64, 96)
+    with Image.open(result.path) as preview:
+        assert preview.getexif().get(0x0112) is None
+
+
+def test_raw_dimensions_are_reported_after_orientation(tmp_path):
+    landscape = write_dng(tmp_path / "landscape.dng", 96, 64)
+    portrait = write_dng(tmp_path / "portrait.dng", 96, 64, orientation=6)
+
+    assert read_image_dimensions(landscape) == (96, 64, "dng")
+    assert read_image_dimensions(portrait) == (64, 96, "dng")
+
+
+def test_truncated_raw_fails_at_image_decode_without_temporaries(tmp_path, cache, generator):
+    source = tmp_path / "src" / "truncated.dng"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(build_dng(96, 64)[:200])
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert "RAW" in info.value.detail
+    assert files_under(cache.root) == []
+
+
+def test_garbage_with_a_raw_extension_fails_at_image_decode(tmp_path, cache, generator):
+    source = tmp_path / "src" / "garbage.cr2"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"not a canon raw file" * 30)
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert files_under(cache.root) == []
+    with pytest.raises(ImageOpenError):
+        read_image_dimensions(source)
+
+
+def test_raw_files_fail_visibly_when_rawpy_is_missing(tmp_path, cache, generator, monkeypatch):
+    source = write_dng(tmp_path / "src" / "shot.dng", 96, 64)
+    monkeypatch.setattr(image_preview, "rawpy", None)
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert "rawpy" in info.value.detail
+    with pytest.raises(ImageOpenError) as open_info:
+        read_image_dimensions(source)
+    assert open_info.value.unsupported is True
+    assert files_under(cache.root) == []
+
+
+def test_raw_pixel_budget_is_enforced_before_demosaicing(tmp_path, cache, generator, monkeypatch):
+    source = write_dng(tmp_path / "src" / "shot.dng", 96, 64)
+    monkeypatch.setattr(image_preview, "MAX_SOURCE_PIXELS", 1000)
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert "megapixel" in info.value.detail
+
+
+# ---------------------------------------------------------------------------
+# HEIC / HEIF via pillow-heif (spec §2C, §39)
+# ---------------------------------------------------------------------------
+
+
+def test_heic_source_produces_a_valid_preview(tmp_path, cache, generator):
+    source = write_heic(tmp_path / "src" / "phone.heic", 120, 80, (30, 120, 200))
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    assert result.status == PREVIEW_GENERATED
+    assert result.detail == SOURCE_PILLOW
+    assert (result.width, result.height) == (120, 80)
+    assert colour_distance(pixel(read_jpeg(result.path), 60, 40), (30, 120, 200)) <= 16
+    assert read_image_dimensions(source) == (120, 80, "heif")
+
+
+def test_large_heic_is_downscaled(tmp_path):
+    cache = make_cache(tmp_path, max_dimension=320)
+    source = write_heic(tmp_path / "src" / "phone.heif", 800, 400)
+
+    result = ImagePreviewGenerator(cache).generate(source, destination_for(cache, source))
+
+    assert (result.width, result.height) == (320, 160)
+
+
+def test_corrupt_heic_fails_at_image_decode(tmp_path, cache, generator):
+    good = write_heic(tmp_path / "src" / "good.heic", 120, 80)
+    source = tmp_path / "src" / "bad.heic"
+    data = good.read_bytes()
+    source.write_bytes(data[: len(data) // 2])
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source))
+
+    assert info.value.stage == STAGE_IMAGE_DECODE
+    assert files_under(cache.root) == []
+
+
+# ---------------------------------------------------------------------------
+# read_image_dimensions (used by media metadata)
+# ---------------------------------------------------------------------------
+
+
+def test_read_image_dimensions_applies_exif_orientation(tmp_path):
+    plain = write_test_image(tmp_path / "plain.png", 13, 7, "png")
+    rotated = write_jpeg_with_exif_orientation(tmp_path / "rotated.jpg", 200, 100, 6)
+    flipped = write_jpeg_with_exif_orientation(tmp_path / "flipped.jpg", 200, 100, 2)
+
+    assert read_image_dimensions(plain) == (13, 7, "png")
+    assert read_image_dimensions(rotated) == (100, 200, "jpeg")
+    assert read_image_dimensions(flipped) == (200, 100, "jpeg")
+
+
+def test_read_image_dimensions_reports_unsupported_and_corrupt_files(tmp_path):
+    garbage = tmp_path / "garbage.png"
+    garbage.write_bytes(b"nope" * 50)
+    with pytest.raises(ImageOpenError) as info:
+        read_image_dimensions(garbage)
+    assert info.value.unsupported is True
+
+    absurd = write_png_claiming_size(tmp_path / "absurd.png", 60000, 60000)
+    with pytest.raises(ImageOpenError) as too_large:
+        read_image_dimensions(absurd)
+    assert too_large.value.unsupported is False
+    assert "megapixel" in str(too_large.value)
+
+
+# ---------------------------------------------------------------------------
+# Backend self-test (spec §2C)
 # ---------------------------------------------------------------------------
 
 
@@ -1137,7 +1272,8 @@ def test_backend_self_test_encodes_validates_and_cleans_up(tmp_path):
     assert isinstance(message, str)
     assert message.startswith(f"Encoded a {width}x{height} test image to JPEG quality 60 (")
     assert " KB) in " in message or " B) in " in message
-    assert message.endswith(str(cache.root))
+    assert str(cache.root) in message
+    assert message.endswith(IMAGE_BACKEND_NAME)
     assert cache.root.is_dir()
     assert files_under(cache.root) == []
 
@@ -1145,24 +1281,22 @@ def test_backend_self_test_encodes_validates_and_cleans_up(tmp_path):
 def test_backend_self_test_uses_the_real_pipeline(tmp_path, monkeypatch):
     cache = make_cache(tmp_path)
     seen: dict[str, object] = {}
-    original_encode = image_preview._encode_jpeg
+    original_encode = image_preview.encode_jpeg
 
-    def recording_encode(image, temp_path, jpeg_quality):
-        seen["size"] = image.size().toTuple()
-        seen["alpha"] = image.hasAlphaChannel()
-        seen["format"] = image.format()
+    def recording_encode(image, temp_path, jpeg_quality, **kwargs):
+        seen["size"] = image.size
+        seen["mode"] = image.mode
         seen["temp"] = pathlib.Path(temp_path)
         seen["quality"] = jpeg_quality
-        original_encode(image, temp_path, jpeg_quality)
+        original_encode(image, temp_path, jpeg_quality, **kwargs)
         seen["temp_exists"] = pathlib.Path(temp_path).is_file()
 
-    monkeypatch.setattr(image_preview, "_encode_jpeg", recording_encode)
+    monkeypatch.setattr(image_preview, "encode_jpeg", recording_encode)
 
     run_image_backend_test(cache)
 
     assert seen["size"] == IMAGE_TEST_SIZE
-    assert seen["alpha"] is False
-    assert seen["format"] == QImage.Format.Format_RGB32
+    assert seen["mode"] == "RGB", "the gradient's alpha must have been flattened"
     assert seen["quality"] == 82
     temp = seen["temp"]
     assert temp.parent == cache.root
@@ -1175,22 +1309,11 @@ def test_backend_self_test_uses_the_real_pipeline(tmp_path, monkeypatch):
 def test_backend_self_test_failure_raises_and_leaves_no_files(tmp_path, monkeypatch):
     cache = make_cache(tmp_path)
 
-    class FullDiskWriter:
-        supportedImageFormats = staticmethod(QImageWriter.supportedImageFormats)
+    def full_disk_save(self, fp, format=None, **params):
+        pathlib.Path(fp).write_bytes(b"partial")
+        raise OSError("There is not enough space on the disk.")
 
-        def __init__(self, path, image_format):
-            pathlib.Path(path).write_bytes(b"partial")  # simulate a half-written file
-
-        def setQuality(self, quality):
-            pass
-
-        def write(self, image):
-            return False
-
-        def errorString(self):
-            return "There is not enough space on the disk."
-
-    monkeypatch.setattr(image_preview, "QImageWriter", FullDiskWriter)
+    monkeypatch.setattr(Image.Image, "save", full_disk_save)
 
     with pytest.raises(PreviewError) as info:
         run_image_backend_test(cache)
@@ -1202,12 +1325,12 @@ def test_backend_self_test_failure_raises_and_leaves_no_files(tmp_path, monkeypa
 
 def test_backend_self_test_reports_unavailable_backend(tmp_path, monkeypatch):
     cache = make_cache(tmp_path)
-    monkeypatch.setattr(image_preview, "image_backend_available", lambda: (False, "no JPEG plugin"))
+    monkeypatch.setattr(image_preview, "image_backend_available", lambda: (False, "rawpy is not installed"))
 
     with pytest.raises(PreviewError) as info:
         run_image_backend_test(cache)
 
-    assert info.value.message == "no JPEG plugin"
+    assert info.value.message == "rawpy is not installed"
     assert files_under(cache.root) == []
 
 
@@ -1220,3 +1343,109 @@ def test_backend_self_test_rejects_invalid_profile(tmp_path, monkeypatch):
 
     assert info.value.stage == STAGE_CONFIGURATION
     assert files_under(cache.root) == []
+
+
+def test_gradient_test_image_has_alpha_and_the_requested_size():
+    image = image_preview.make_gradient_test_image(*IMAGE_TEST_SIZE)
+
+    assert image.mode == "RGBA"
+    assert image.size == IMAGE_TEST_SIZE
+    alpha = np.asarray(image)[:, :, 3]
+    assert alpha.min() < 32 and alpha.max() == 255
+
+
+def test_prepare_preview_image_flattens_without_touching_opaque_pixels():
+    buffer = io.BytesIO()
+    make_test_image(40, 30, alpha=True).save(buffer, "PNG")
+    with Image.open(io.BytesIO(buffer.getvalue())) as image:
+        prepared = image_preview.prepare_preview_image(image, 1600)
+
+    assert prepared.mode == "RGB" and prepared.size == (40, 30)
+    assert pixel(prepared, 5, 5) == (0x33, 0x66, 0xCC)
+    assert pixel(prepared, 35, 5) == GREY
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups: tRNS transparency, hostile preview headers, hash-time snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_rgb_png_with_single_colour_transparency_is_flattened(tmp_path, cache, generator):
+    source = tmp_path / "src" / "trns.png"
+    source.parent.mkdir(parents=True)
+    image = Image.new("RGB", (60, 40), (255, 255, 255))
+    for x in range(30):
+        for y in range(40):
+            image.putpixel((x, y), (0x33, 0x66, 0xCC))
+    image.save(source, "PNG", transparency=(255, 255, 255))  # white is the transparent key colour
+    with Image.open(source) as check:
+        assert check.mode == "RGB" and "transparency" in check.info
+
+    result = generator.generate(source, destination_for(cache, source))
+
+    preview = read_jpeg(result.path)
+    assert colour_distance(pixel(preview, 10, 20), (0x33, 0x66, 0xCC)) <= 8
+    assert colour_distance(pixel(preview, 50, 20), GREY) <= 6, "the keyed-transparent area must become grey"
+
+
+def test_validate_rejects_a_jpeg_header_claiming_absurd_dimensions(tmp_path):
+    path = write_test_image(tmp_path / "huge.jpg", 40, 30, "jpeg")
+    data = bytearray(path.read_bytes())
+    sof = data.find(b"\xff\xc0")
+    assert sof > 0
+    struct.pack_into(">HH", data, sof + 5, 60000, 60000)  # SOF0: precision byte, then height, width
+    path.write_bytes(bytes(data))
+
+    validation = validate_image_preview(path)
+
+    assert validation.valid is False
+    assert "60000x60000" in validation.message and "megapixel" in validation.message
+
+
+def test_generate_refuses_a_source_that_changed_since_it_was_hashed(tmp_path, cache, generator, monkeypatch):
+    source = write_test_image(tmp_path / "src" / "hashed.png", 200, 150, "png")
+    hashed_stat = os.lstat(source)
+    with open(source, "ab") as handle:
+        handle.write(b"\x00" * 32)  # the file changed after its SHA-256 was taken
+    later = time.time() + 5
+    os.utime(source, (later, later))
+    decoded = {"count": 0}
+    original_decode = ImagePreviewGenerator._decode
+
+    def counting_decode(self, path):
+        decoded["count"] += 1
+        return original_decode(self, path)
+
+    monkeypatch.setattr(ImagePreviewGenerator, "_decode", counting_decode)
+
+    with pytest.raises(PreviewError) as info:
+        generator.generate(source, destination_for(cache, source), source_stat=hashed_stat)
+
+    assert info.value.stage == STAGE_SOURCE_CHANGED
+    assert info.value.message == "The source file changed between hashing and preview generation."
+    assert decoded["count"] == 0, "nothing may be decoded from a source that no longer matches its hash"
+    assert files_under(cache.root) == []
+
+
+def test_generate_accepts_a_matching_hash_time_snapshot(tmp_path, cache, generator):
+    source = write_test_image(tmp_path / "src" / "stable.png", 200, 150, "png")
+
+    result = generator.generate(source, destination_for(cache, source), source_stat=os.lstat(source))
+
+    assert result.status == PREVIEW_GENERATED
+    assert (result.width, result.height) == (200, 150)
+
+
+def test_icc_profile_is_dropped_when_the_colour_model_changes(tmp_path, cache, generator):
+    fake_icc = b"CMYK_PROFILE_BYTES" * 8
+    cmyk = tmp_path / "src" / "print.jpg"
+    cmyk.parent.mkdir(parents=True)
+    Image.new("CMYK", (40, 30), (0, 255, 255, 0)).save(cmyk, "JPEG", icc_profile=fake_icc)
+    grey = tmp_path / "src" / "scan.tif"
+    Image.new("L", (40, 30), 90).save(grey, "TIFF", icc_profile=b"GRAY_PROFILE" * 8)
+
+    for source in (cmyk, grey):
+        result = generator.generate(source, destination_for(cache, source))
+        with Image.open(result.path) as preview:
+            assert preview.mode == "RGB"
+            assert "icc_profile" not in preview.info, f"{source.name}: a non-RGB profile must not be copied"

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .database import Database, format_timestamp, utc_now
+from .database import COMPLETED_SCAN_STATUSES, Database, format_timestamp, utc_now
 from .media_metadata import (
     MediaInspectionCancelled,
     MediaMetadataExtractor,
@@ -23,6 +23,7 @@ from .preview_service import (
     PreviewStatistics,
     disabled_statistics,
     hash_unavailable_status_record,
+    preview_report_message,
     preview_warning_message,
     scan_outcome,
     status_record_for,
@@ -124,14 +125,10 @@ class ScanResult:
         return PreviewStatistics.from_dict(self.preview)
 
     @property
-    def outcome(self) -> str:
-        """``completed_with_warnings`` when indexing succeeded but previews failed.
+    def indexed(self) -> bool:
+        """True when the catalogue was updated (``completed`` or ``completed_with_warnings``)."""
 
-        The persisted scan status is unchanged (``completed``) because other
-        catalogue features key on it; the outcome is what the UI reports.
-        """
-
-        return scan_outcome(self.status, self.preview)
+        return self.status in COMPLETED_SCAN_STATUSES
 
 
 class ScanCancelled(Exception):
@@ -199,6 +196,16 @@ class VolumeScanner:
             catalogue_path,
             *(f"{catalogue_path}{suffix}" for suffix in ("-wal", "-shm", "-journal")),
         }
+        # A preview root inside the scanned volume must not be indexed as
+        # archive content (each rescan would otherwise preview the previews).
+        self._preview_root_path: str | None = None
+        if preview_service is not None:
+            try:
+                self._preview_root_path = os.path.normcase(
+                    os.path.realpath(os.fspath(preview_service.root))
+                )
+            except (OSError, ValueError, TypeError):
+                self._preview_root_path = None
 
     def scan(self, volume_id: int) -> ScanResult:
         self.files_hashed = 0
@@ -312,6 +319,13 @@ class VolumeScanner:
                             self.db.add_scan_error(scan_id, volume_id, rel_path, str(exc))
                             continue
                         if self._is_link_or_reparse_point(stat_result) or not stat.S_ISDIR(stat_result.st_mode):
+                            continue
+                        if self._is_preview_storage_path(full_path):
+                            self._emit_progress(
+                                files_seen,
+                                folders_seen,
+                                f"Skipping the offline preview directory · {rel_path}",
+                            )
                             continue
 
                         folder_id = self.db.ensure_folder(
@@ -445,6 +459,7 @@ class VolumeScanner:
                                 relative_path=rel_path,
                                 file_name=file_name,
                                 content_hash=content_hash,
+                                source_stat=stat_result,
                                 volume_id=volume_id,
                                 volume_label=volume_label,
                                 media_metadata=media_metadata,
@@ -500,8 +515,13 @@ class VolumeScanner:
                 else:
                     self.db.refresh_volume_counts(volume_id)
 
-            if status == "completed" and message is None:
-                message = self._preview_report_message()
+            if status == "completed":
+                # Spec §16: indexing succeeded, but preview problems downgrade the
+                # persisted status to completed_with_warnings.  Everything that
+                # treats a scan as "applied" accepts both (COMPLETED_SCAN_STATUSES).
+                status = scan_outcome(status, self.preview_statistics)
+                if message is None:
+                    message = self._preview_report_message()
             summary = changes.as_dict() if changes is not None else None
             self.db.finish_scan(
                 scan_id,
@@ -588,11 +608,15 @@ class VolumeScanner:
         media_metadata: MediaMetadata | None,
         files_seen: int,
         folders_seen: int,
+        source_stat: os.stat_result | None = None,
     ) -> None:
         service = self.preview_service
         if service is None:
             return
         if content_hash is None:
+            # Spec §9: never without the final SHA-256.  Counted so the
+            # end-of-scan report reconciles with the number of media files.
+            service.statistics.hash_unavailable += 1
             self.db.replace_file_preview_status(
                 file_id,
                 hash_unavailable_status_record(
@@ -624,6 +648,7 @@ class VolumeScanner:
                     f"{label} · {text}",
                 ),
                 expected_duration_ms=expected_duration_ms,
+                source_stat=source_stat,
             )
         except PreviewCancelled as exc:
             raise ScanCancelled("Scan cancelled.") from exc
@@ -653,9 +678,7 @@ class VolumeScanner:
         stats = self.preview_statistics
         if stats.mode == MODE_SKIPPED_PREFLIGHT:
             return stats.message or None
-        if stats.has_problems:
-            return preview_warning_message(stats) or None
-        return None
+        return preview_report_message(stats) or None
 
     def _result(
         self,
@@ -800,6 +823,14 @@ class VolumeScanner:
     def _is_catalogue_storage_path(self, path: Path) -> bool:
         normalized = os.path.normcase(os.path.abspath(str(path)))
         return normalized in self._catalogue_storage_paths
+
+    def _is_preview_storage_path(self, path: Path) -> bool:
+        if self._preview_root_path is None:
+            return False
+        try:
+            return os.path.normcase(os.path.realpath(os.fspath(path))) == self._preview_root_path
+        except (OSError, ValueError):
+            return False
 
     def _modified_at(self, path: Path) -> str | None:
         try:

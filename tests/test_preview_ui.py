@@ -1057,6 +1057,7 @@ def test_unreferenced_worker_lists_only_current_profile_previews_not_in_catalogu
 
 def test_unreferenced_worker_reports_missing_catalogue(app, tmp_path):
     settings = enabled_settings(tmp_path)
+    settings.root_path.mkdir(parents=True)  # the store exists; only the catalogue is missing
     worker = UnreferencedPreviewWorker(settings, tmp_path / "missing.jvvv")
     failures: list[str] = []
     finished: list[object] = []
@@ -1148,3 +1149,134 @@ def test_cache_dialog_marks_a_cancelled_unreferenced_comparison_as_partial(app, 
 
     dialog.set_unreferenced([], 0)
     assert dialog.unreferenced_count_label.text().startswith("No previews")
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups (spec §22: a missing root is an error; stale lists are dropped)
+# ---------------------------------------------------------------------------
+
+
+def test_store_workers_report_a_missing_preview_root_instead_of_an_empty_store(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    assert not settings.root_path.exists()
+
+    statistics_worker = PreviewStoreStatisticsWorker(settings)
+    finished: list[object] = []
+    failed: list[str] = []
+    statistics_worker.finished.connect(lambda *args: finished.append(args))
+    statistics_worker.failed.connect(failed.append)
+    statistics_worker.run()
+    assert finished == []
+    assert len(failed) == 1
+    assert "does not exist or is not reachable" in failed[0]
+    assert str(settings.root_path) in failed[0]
+
+    db_path = tmp_path / "catalogue.jvvv"
+    Database(db_path).close()
+    unreferenced_worker = UnreferencedPreviewWorker(settings, db_path)
+    finished_lists: list[object] = []
+    failed_lists: list[str] = []
+    unreferenced_worker.finished.connect(lambda *args: finished_lists.append(args))
+    unreferenced_worker.failed.connect(failed_lists.append)
+    unreferenced_worker.run()
+    assert finished_lists == [], "a disconnected root must never read as 'nothing unreferenced'"
+    assert len(failed_lists) == 1
+    assert "does not exist or is not reachable" in failed_lists[0]
+
+
+def test_cache_dialog_invalidate_unreferenced_clears_the_list_and_explains(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    cache = PreviewCache(settings.root_path, settings.image, settings.video)
+    dialog = PreviewCacheDialog(settings)
+    entries = [
+        PreviewEntry(cache.preview_path("image", sha_hex("a")), "image", settings.image.profile_id, sha_hex("a"), 1_500),
+        PreviewEntry(cache.preview_path("video", sha_hex("b")), "video", settings.video.profile_id, sha_hex("b"), 2_500),
+    ]
+    dialog.set_unreferenced(entries, 2)
+    assert dialog.unreferenced_table.rowCount() == 2
+
+    dialog.invalidate_unreferenced()
+
+    assert dialog.unreferenced_table.rowCount() == 0
+    assert "run Show Unreferenced Previews again" in dialog.status_label.text()
+
+    dialog.status_label.setText("untouched")
+    dialog.invalidate_unreferenced()  # nothing displayed: nothing to say
+    assert dialog.status_label.text() == "untouched"
+
+
+# ---------------------------------------------------------------------------
+# Delete Temporary Files (cache manager)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_temporaries_worker_removes_old_leftovers_and_keeps_recent_ones(app, tmp_path):
+    import time
+
+    from jvvv.preview_ui import DeleteTemporariesWorker
+
+    settings = enabled_settings(tmp_path)
+    cache = PreviewCache(settings.root_path, settings.image, settings.video)
+    digest = sha_hex("leftover")
+    final = cache.preview_path("image", digest)
+    cache.ensure_parent(final)
+    old_temp = cache.temporary_path(final)
+    old_temp.write_bytes(b"partial")
+    stamp = time.time() - 3 * 86400
+    os.utime(old_temp, (stamp, stamp))
+    running_final = cache.preview_path("image", sha_hex("running"))
+    cache.ensure_parent(running_final)
+    recent_temp = cache.temporary_path(running_final)
+    recent_temp.write_bytes(b"partial")
+    write_preview(cache, "image", sha_hex("finished"), 100)
+
+    worker = DeleteTemporariesWorker(settings)
+    results: list[tuple[int, int, list]] = []
+    failures: list[str] = []
+    worker.finished.connect(lambda deleted, kept, errors: results.append((deleted, kept, errors)))
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert failures == []
+    assert results == [(1, 1, [])]
+    assert not old_temp.exists()
+    assert recent_temp.exists()
+    assert cache.preview_path("image", sha_hex("finished")).exists()
+
+    missing_root = DeleteTemporariesWorker(PreviewSettings(enabled=True, root_directory=str(tmp_path / "gone")))
+    gone: list[str] = []
+    missing_root.failed.connect(gone.append)
+    missing_root.run()
+    assert len(gone) == 1 and "does not exist or is not reachable" in gone[0]
+
+
+def test_cache_dialog_offers_delete_temporary_files_with_confirmation(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    dialog = PreviewCacheDialog(settings)
+    requests: list[bool] = []
+    dialog.delete_temporaries_requested.connect(lambda: requests.append(True))
+    asked: list[str] = []
+
+    def decline(parent, title, text):
+        asked.append(title)
+        return False
+
+    dialog.confirm = decline
+    dialog.temporaries_button.click()
+    assert asked == ["Delete Temporary Files"] and requests == []
+
+    dialog.confirm = lambda parent, title, text: "newer than 24 hours are kept" in text
+    dialog.temporaries_button.click()
+    assert requests == [True]
+
+    dialog.set_temporaries_deleted(3, 1, ["x: locked"])
+    assert dialog.temporary_label.text() == "2"
+    assert "3 temporary file(s) deleted" in dialog.status_label.text()
+    assert "1 newer than 24 hours kept" in dialog.status_label.text()
+    assert "1 could not be deleted" in dialog.status_label.text()
+
+    dialog.set_busy(True, "working")
+    assert not dialog.temporaries_button.isEnabled()
+    dialog.set_busy(False)
+    assert dialog.temporaries_button.isEnabled()

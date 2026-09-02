@@ -11,12 +11,45 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from PySide6.QtGui import QImageReader
 
-
-IMAGE_EXTENSIONS = frozenset(
-    {"bmp", "gif", "heic", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp"}
+# Common bitmap formats decoded by Pillow.
+STANDARD_IMAGE_EXTENSIONS = frozenset(
+    {"bmp", "gif", "ico", "jfif", "jpeg", "jpg", "png", "tif", "tiff", "webp"}
 )
+# HEIC/HEIF containers decoded through pillow-heif (libheif).
+HEIF_EXTENSIONS = frozenset({"heic", "heif", "hif"})
+# Camera RAW formats decoded through rawpy (LibRaw).  The generic ".raw"
+# extension is deliberately excluded because it is also used for arbitrary
+# binary dumps that would only produce spurious preview failures.
+RAW_EXTENSIONS = frozenset(
+    {
+        "3fr",  # Hasselblad
+        "arw",  # Sony
+        "cr2",  # Canon
+        "cr3",  # Canon
+        "crw",  # Canon (older)
+        "dcr",  # Kodak
+        "dng",  # Adobe Digital Negative
+        "erf",  # Epson
+        "iiq",  # Phase One
+        "kdc",  # Kodak
+        "mef",  # Mamiya
+        "mos",  # Leaf
+        "mrw",  # Minolta
+        "nef",  # Nikon
+        "nrw",  # Nikon
+        "orf",  # Olympus / OM System
+        "pef",  # Pentax
+        "raf",  # Fujifilm
+        "rw2",  # Panasonic
+        "rwl",  # Leica
+        "sr2",  # Sony (older)
+        "srf",  # Sony (older)
+        "srw",  # Samsung
+        "x3f",  # Sigma
+    }
+)
+IMAGE_EXTENSIONS = STANDARD_IMAGE_EXTENSIONS | HEIF_EXTENSIONS | RAW_EXTENSIONS
 AUDIO_EXTENSIONS = frozenset(
     {"aac", "flac", "m4a", "mp3", "ogg", "wav", "wave", "wma"}
 )
@@ -299,28 +332,28 @@ def _inspect_image(
     path: Path,
     cancel_callback: CancelCallback | None,
 ) -> MediaMetadata:
-    reader = QImageReader(os.fspath(path))
-    size = reader.size()
-    _raise_if_cancelled(cancel_callback)
-    image_format = bytes(reader.format()).decode("ascii", "replace").casefold() or None
-    if size.isValid() and size.width() > 0 and size.height() > 0:
-        return MediaMetadata(
-            status="complete",
-            media_kind="image",
-            source="qt-image",
-            container_format=image_format,
-            width=size.width(),
-            height=size.height(),
-        )
+    # The same image stack that generates offline previews (Pillow, pillow-heif
+    # and rawpy) reports dimensions, so HEIC and camera RAW files get real sizes.
+    from .image_preview import ImageOpenError, read_image_dimensions
 
-    message = _detail(reader.errorString() or "Qt could not read the image header.")
-    status = "unavailable" if "unsupported" in message.casefold() else "failed"
+    _raise_if_cancelled(cancel_callback)
+    try:
+        width, height, image_format = read_image_dimensions(path)
+    except ImageOpenError as exc:
+        return MediaMetadata(
+            status="unavailable" if exc.unsupported else "failed",
+            media_kind="image",
+            source="pillow",
+            container_format=exc.image_format or None,
+            message=_detail(str(exc)),
+        )
     return MediaMetadata(
-        status=status,
+        status="complete",
         media_kind="image",
-        source="qt-image",
-        container_format=image_format,
-        message=message,
+        source="pillow",
+        container_format=image_format or None,
+        width=width,
+        height=height,
     )
 
 

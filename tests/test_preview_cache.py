@@ -5,6 +5,7 @@ import hashlib
 import itertools
 import json
 import os
+import time
 import pathlib
 import sys
 from pathlib import Path
@@ -1502,3 +1503,94 @@ def test_success_paths_leave_no_temporary_files(tmp_path):
     for path in root.rglob("*"):
         if path.is_file():
             assert PreviewCache.parse_preview_name(path.name) is not None
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups: directory junctions inside the store never lead outside it (spec §22)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions are a Windows feature")
+def test_junction_inside_the_store_is_neither_listed_nor_deletable(tmp_path):
+    import _winapi
+
+    from jvvv.preview_config import ImagePreviewProfile, VideoPreviewProfile
+
+    cache = PreviewCache(tmp_path / "previews", ImagePreviewProfile(), VideoPreviewProfile())
+    profile_id = cache.profile_id("image")
+    victim_dir = tmp_path / "elsewhere"
+    victim_dir.mkdir()
+    victim = victim_dir / ("ab" + "0" * 62 + ".jpg")
+    victim.write_bytes(b"precious bytes outside the preview store")
+    prefix_dir = cache.root / "images" / profile_id / "ab"
+    prefix_dir.parent.mkdir(parents=True)
+    _winapi.CreateJunction(str(victim_dir), str(prefix_dir))
+    assert (prefix_dir / victim.name).exists(), "the junction must resolve for the test to mean anything"
+
+    assert list(cache.iter_previews("image", profile_id)) == []
+    assert cache.store_statistics().image_count == 0
+    assert cache.contains(prefix_dir / victim.name) is False
+    with pytest.raises(PreviewError):
+        cache.remove_preview(prefix_dir / victim.name)
+    assert victim.exists()
+
+
+# ---------------------------------------------------------------------------
+# Leftover temporary files (crash / power loss) can be found and removed safely
+# ---------------------------------------------------------------------------
+
+
+def _temp_cache(tmp_path):
+    from jvvv.preview_config import ImagePreviewProfile, VideoPreviewProfile
+
+    return PreviewCache(tmp_path / "previews", ImagePreviewProfile(), VideoPreviewProfile())
+
+
+def _write_temporary(cache, final_path, *, age_seconds: float) -> Path:
+    cache.ensure_parent(final_path)
+    temp = cache.temporary_path(final_path)
+    temp.write_bytes(b"partial")
+    stamp = time.time() - age_seconds
+    os.utime(temp, (stamp, stamp))
+    return temp
+
+
+def test_iter_temporary_files_finds_leftovers_in_profiles_and_root_only(tmp_path):
+    cache = _temp_cache(tmp_path)
+    digest = "ab" + "0" * 62
+    old_image_temp = _write_temporary(cache, cache.preview_path("image", digest), age_seconds=3 * 86400)
+    video_temp = _write_temporary(cache, cache.preview_path("video", digest), age_seconds=60)
+    root_temp = _write_temporary(cache, cache.root / "jvvv-image-test.jpg", age_seconds=3 * 86400)
+    final = cache.preview_path("image", "cd" + "0" * 62)
+    cache.ensure_parent(final)
+    final.write_bytes(b"a finished preview")
+    (cache.root / "notes.txt").write_text("not ours", encoding="utf-8")
+
+    found = sorted(cache.iter_temporary_files())
+
+    assert found == sorted([old_image_temp, video_temp, root_temp])
+
+
+def test_remove_stale_temporary_keeps_recent_files_and_refuses_non_temporaries(tmp_path):
+    cache = _temp_cache(tmp_path)
+    digest = "ab" + "0" * 62
+    old_temp = _write_temporary(cache, cache.preview_path("image", digest), age_seconds=3 * 86400)
+    recent_temp = _write_temporary(cache, cache.preview_path("video", digest), age_seconds=60)
+    final = cache.preview_path("image", "cd" + "0" * 62)
+    cache.ensure_parent(final)
+    final.write_bytes(b"a finished preview")
+    outside = tmp_path / ".elsewhere.jpg.tmp-deadbeefdeadbeef"
+    outside.write_bytes(b"not in the store")
+
+    assert cache.remove_stale_temporary(old_temp) is True
+    assert not old_temp.exists()
+    assert cache.remove_stale_temporary(recent_temp) is False
+    assert recent_temp.exists(), "a file another JVVV window may still be writing is kept"
+    assert cache.remove_stale_temporary(recent_temp, now=time.time() + 2 * 86400) is True
+    assert cache.remove_stale_temporary(old_temp) is False, "already gone: nothing to do"
+    with pytest.raises(PreviewError):
+        cache.remove_stale_temporary(final)
+    assert final.exists()
+    with pytest.raises(PreviewError):
+        cache.remove_stale_temporary(outside)
+    assert outside.exists()

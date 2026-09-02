@@ -10,6 +10,7 @@ from jvvv.database import (
     Database,
     InvalidCatalogueError,
     SCHEMA_VERSION,
+    UPGRADABLE_SCHEMA_VERSIONS,
     UnsupportedCatalogueError,
     count_rows,
     create_catalogue,
@@ -761,7 +762,9 @@ def test_mirror_relationships_are_validated_and_block_master_deletion(tmp_path):
         db.close()
 
 
-@pytest.mark.parametrize("schema_version", range(1, SCHEMA_VERSION))
+@pytest.mark.parametrize(
+    "schema_version", sorted(set(range(1, SCHEMA_VERSION)) - UPGRADABLE_SCHEMA_VERSIONS)
+)
 def test_retired_catalogue_versions_are_rejected_without_modification(
     tmp_path,
     schema_version,

@@ -47,6 +47,7 @@ from .database import Database
 from .media_metadata import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from .preview_cache import (
     STAGE_CONFIGURATION,
+    STAGE_PREVIEW_ROOT,
     PreviewCache,
     PreviewCancelled,
     PreviewEntry,
@@ -787,6 +788,7 @@ class PreviewCacheDialog(QDialog):
     scan_requested = Signal()
     unreferenced_requested = Signal()
     delete_requested = Signal(list)
+    delete_temporaries_requested = Signal()
     open_folder_requested = Signal()
     cancel_requested = Signal()
 
@@ -837,12 +839,19 @@ class PreviewCacheDialog(QDialog):
             "List previews under the current profiles whose SHA-256 is not recorded "
             "in the open catalogue"
         )
+        self.temporaries_button = QPushButton("Delete Temporary Files")
+        self.temporaries_button.setToolTip(
+            "Remove leftover .tmp- files from interrupted preview generation. Files "
+            "newer than 24 hours are kept because another JVVV window may still be "
+            "writing them."
+        )
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         actions = QHBoxLayout()
         actions.addWidget(self.open_folder_button)
         actions.addWidget(self.scan_button)
         actions.addWidget(self.unreferenced_button)
+        actions.addWidget(self.temporaries_button)
         actions.addStretch(1)
         actions.addWidget(self.cancel_button)
 
@@ -923,6 +932,7 @@ class PreviewCacheDialog(QDialog):
         self.unreferenced_button.clicked.connect(self.unreferenced_requested)
         self.cancel_button.clicked.connect(self.cancel_requested)
         self.delete_button.clicked.connect(self.on_delete_clicked)
+        self.temporaries_button.clicked.connect(self.on_delete_temporaries_clicked)
         self.select_all_button.clicked.connect(lambda: self._set_all_checked(True))
         self.select_none_button.clicked.connect(lambda: self._set_all_checked(False))
 
@@ -1064,6 +1074,21 @@ class PreviewCacheDialog(QDialog):
         self._refresh_unreferenced_count()
         self._update_delete_button()
 
+    def invalidate_unreferenced(self) -> None:
+        """Drop a displayed unreferenced list once the catalogue has changed (spec §22).
+
+        The list means "not referenced by this catalogue *as it was when the
+        list was made*"; after a scan or delete the user must compare again
+        before deleting anything.
+        """
+
+        if not self._entries and not self._total_found:
+            return
+        self.set_unreferenced([], 0)
+        self.status_label.setText(
+            "The catalogue changed — run Show Unreferenced Previews again before deleting anything."
+        )
+
     def _refresh_unreferenced_count(self) -> None:
         shown = len(self._entries)
         total = self._total_found
@@ -1128,6 +1153,7 @@ class PreviewCacheDialog(QDialog):
         has_root = bool(self._settings.root_directory.strip())
         self.scan_button.setEnabled(not busy and has_root)
         self.unreferenced_button.setEnabled(not busy and has_root)
+        self.temporaries_button.setEnabled(not busy and has_root)
         self.open_folder_button.setEnabled(not busy and has_root)
         self.select_all_button.setEnabled(not busy)
         self.select_none_button.setEnabled(not busy)
@@ -1171,6 +1197,30 @@ class PreviewCacheDialog(QDialog):
         self.delete_button.setEnabled(
             not self._busy and bool(self.selected_unreferenced_paths())
         )
+
+    def on_delete_temporaries_clicked(self) -> None:
+        text = (
+            "Delete leftover temporary preview files?\n\n"
+            "A temporary file (.<name>.tmp-…) is a preview that was still being written "
+            "when JVVV or the computer stopped. Files newer than 24 hours are kept, because "
+            "a scan running in another JVVV window may still be writing them.\n\n"
+            "Finished previews are never touched by this action."
+        )
+        if not self.confirm(self, "Delete Temporary Files", text):
+            return
+        self.delete_temporaries_requested.emit()
+
+    def set_temporaries_deleted(self, deleted: int, kept: int, errors: list[str]) -> None:
+        """Report the outcome of Delete Temporary Files and refresh the count."""
+
+        remaining = int(kept) + len(errors)
+        self.temporary_label.setText(f"{remaining:,}")
+        message = f"{int(deleted):,} temporary file(s) deleted"
+        if kept:
+            message += f"; {int(kept):,} newer than 24 hours kept"
+        if errors:
+            message += f"; {len(errors):,} could not be deleted"
+        self.status_label.setText(message + ".")
 
     def on_delete_clicked(self) -> None:
         paths = self.selected_unreferenced_paths()
@@ -1218,6 +1268,25 @@ def _cache_for(settings: PreviewSettings) -> PreviewCache:
     return PreviewCache(root, settings.image, settings.video)
 
 
+def _require_store(cache: PreviewCache) -> None:
+    """A missing or disconnected preview root is an error, never an empty store (spec §22, §26)."""
+
+    try:
+        present = cache.root.is_dir()
+    except OSError as exc:
+        raise PreviewError(
+            STAGE_PREVIEW_ROOT,
+            f"The preview directory could not be reached: {cache.root}",
+            detail=str(exc),
+        ) from exc
+    if not present:
+        raise PreviewError(
+            STAGE_PREVIEW_ROOT,
+            f"The preview directory does not exist or is not reachable: {cache.root}",
+            detail="Reconnect the drive or choose the preview directory again in Settings > Preferences.",
+        )
+
+
 class _CancellableWorker(QObject):
     def __init__(self) -> None:
         super().__init__()
@@ -1248,6 +1317,7 @@ class PreviewStoreStatisticsWorker(_CancellableWorker):
     def run(self) -> None:
         try:
             cache = _cache_for(self.settings)
+            _require_store(cache)
             statistics = cache.store_statistics(
                 cancel_callback=self.is_cancelled,
                 progress_callback=self._report_progress,
@@ -1286,6 +1356,7 @@ class UnreferencedPreviewWorker(_CancellableWorker):
         cancelled = False
         try:
             cache = _cache_for(self.settings)
+            _require_store(cache)
             # Read-only: the catalogue is never modified. The SHA-256 lookup is a
             # connection-local TEMP table that Database manages itself.
             db = Database(self.db_path, initialize=False, create=False, read_only=True)
@@ -1329,6 +1400,43 @@ class UnreferencedPreviewWorker(_CancellableWorker):
         self.finished.emit(entries, total_found)
 
 
+class DeleteTemporariesWorker(_CancellableWorker):
+    """Remove leftover temporary files older than a day; recent ones are kept."""
+
+    progress = Signal(int, str)
+    finished = Signal(int, int, list)  # deleted, kept (too recent), error texts
+    failed = Signal(str)
+
+    def __init__(self, settings: PreviewSettings) -> None:
+        super().__init__()
+        self.settings = settings
+
+    @Slot()
+    def run(self) -> None:
+        deleted = kept = examined = 0
+        errors: list[str] = []
+        try:
+            cache = _cache_for(self.settings)
+            _require_store(cache)
+            for path in cache.iter_temporary_files(cancel_callback=self.is_cancelled):
+                examined += 1
+                try:
+                    if cache.remove_stale_temporary(path):
+                        deleted += 1
+                    else:
+                        kept += 1
+                except PreviewError as exc:
+                    errors.append(f"{path}: {exc}")
+                if examined % DELETE_PROGRESS_INTERVAL == 0:
+                    self.progress.emit(examined, f"Deleted {deleted:,} temporary files")
+        except PreviewCancelled:
+            errors.append("Cancelled before every temporary file was examined.")
+        except Exception as exc:
+            self.failed.emit(_describe_exception(exc))
+            return
+        self.finished.emit(deleted, kept, errors)
+
+
 class DeletePreviewsWorker(_CancellableWorker):
     """Delete selected previews one by one; a failure never stops the others."""
 
@@ -1370,6 +1478,7 @@ class DeletePreviewsWorker(_CancellableWorker):
 
 __all__ = [
     "DeletePreviewsWorker",
+    "DeleteTemporariesWorker",
     "FAILURE_COLUMNS",
     "MAX_UNREFERENCED_ROWS",
     "OfflinePreviewSettingsWidget",

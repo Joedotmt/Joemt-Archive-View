@@ -24,6 +24,8 @@ import errno
 import os
 import re
 import secrets
+import stat
+import time
 import shutil
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field
@@ -378,6 +380,42 @@ class RootValidation:
 # ---------------------------------------------------------------------------
 
 
+def ensure_source_snapshot(
+    source: Path,
+    current: os.stat_result,
+    expected: os.stat_result | None,
+) -> None:
+    """Raise ``source-changed`` when ``current`` differs from the hash-time snapshot.
+
+    The scanner hashes a file, stores its record, probes its media details and
+    only then asks for a preview.  A file replaced inside that window must not
+    be previewed under the old SHA-256 (spec §9, §32), so generators compare
+    their own fresh ``lstat`` against the snapshot taken when the hash was
+    computed before they read a single byte.
+    """
+
+    if expected is None:
+        return
+    changed = (
+        current.st_size != expected.st_size
+        or current.st_mtime_ns != expected.st_mtime_ns
+        or (expected.st_ino and current.st_ino and current.st_ino != expected.st_ino)
+    )
+    if changed:
+        raise PreviewError(
+            STAGE_SOURCE_CHANGED,
+            "The source file changed between hashing and preview generation.",
+            detail=(
+                f"size {expected.st_size} -> {current.st_size} bytes, "
+                f"mtime_ns {expected.st_mtime_ns} -> {current.st_mtime_ns}"
+            ),
+        )
+
+
+# Temporaries younger than this may belong to a scan running in another JVVV window.
+STALE_TEMPORARY_AGE_SECONDS = 24 * 60 * 60
+
+
 class PreviewCache:
     """Hash-addressed preview store. Root layout (spec §4, §6)::
 
@@ -578,8 +616,10 @@ class PreviewCache:
         """True when ``path`` lies strictly inside the preview root."""
 
         try:
-            root_text = os.path.normcase(os.path.abspath(os.fspath(self.root)))
-            candidate = os.path.normcase(os.path.abspath(os.fspath(path)))
+            # realpath: a junction or symlink inside the store must not make a
+            # file elsewhere look like part of it (spec §22 deletion safety).
+            root_text = os.path.normcase(os.path.realpath(os.fspath(self.root)))
+            candidate = os.path.normcase(os.path.realpath(os.fspath(path)))
         except (TypeError, ValueError, OSError):
             return False
         prefix = root_text.rstrip("\\/") + os.sep
@@ -701,6 +741,81 @@ class PreviewCache:
             profiles=profiles,
             cancelled=cancelled,
         )
+
+    def iter_temporary_files(
+        self, *, cancel_callback: CancelCallback | None = None
+    ) -> Iterator[Path]:
+        """Stream every ``.<name>.tmp-<hex>`` file under the store (profiles and the root)."""
+
+        for media_kind in PREVIEW_MEDIA_KINDS:
+            for profile_id in self.iter_profile_ids(media_kind):
+                for prefix_directory, entry in self._walk_profile(media_kind, profile_id, cancel_callback):
+                    if self.is_temporary_name(entry.name):
+                        yield prefix_directory / entry.name
+        _raise_if_cancelled(cancel_callback)
+        for entry in self._scan_directory(self.root):
+            if _is_regular_file(entry) and self.is_temporary_name(entry.name):
+                yield self.root / entry.name
+
+    def remove_stale_temporary(
+        self,
+        path: Path,
+        *,
+        now: float | None = None,
+        min_age_seconds: float = STALE_TEMPORARY_AGE_SECONDS,
+    ) -> bool:
+        """Delete one leftover temporary file; ``True`` when it was removed.
+
+        Temporaries normally vanish with the generation that wrote them; the
+        ones that survive a crash or power loss can only be removed here.  A
+        file younger than ``min_age_seconds`` is kept because another JVVV
+        window sharing the root may still be writing it.  Anything that is not
+        a temporary file strictly inside the root is refused.
+        """
+
+        target = Path(path)
+        if not self.contains(target):
+            raise PreviewError(
+                STAGE_CONFIGURATION,
+                "Refusing to delete a file outside the preview storage directory.",
+                detail=os.fspath(target),
+            )
+        if not self.is_temporary_name(target.name):
+            raise PreviewError(
+                STAGE_CONFIGURATION,
+                "Refusing to delete a file that is not a preview temporary file.",
+                detail=os.fspath(target),
+            )
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise PreviewError(
+                classify_os_error(exc, STAGE_TEMP_FILE),
+                f"Could not read the temporary file {target}.",
+                detail=os_error_detail(exc),
+            ) from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise PreviewError(
+                STAGE_CONFIGURATION,
+                "Refusing to delete something that is not a regular file.",
+                detail=os.fspath(target),
+            )
+        current = time.time() if now is None else float(now)
+        if current - info.st_mtime < min_age_seconds:
+            return False
+        try:
+            os.remove(target)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise PreviewError(
+                classify_os_error(exc, STAGE_TEMP_FILE),
+                f"Could not delete the temporary file {target}.",
+                detail=os_error_detail(exc),
+            ) from exc
+        return True
 
     def remove_preview(self, path: Path) -> None:
         """Delete one preview file; refuses anything outside the root or not preview-named."""
@@ -845,8 +960,13 @@ def _store_read_error(directory: Path, exc: OSError) -> PreviewError:
 
 
 def _is_directory(entry: os.DirEntry[str]) -> bool:
+    """A real subdirectory: junctions and directory symlinks are never walked."""
+
     try:
-        return entry.is_dir()
+        if not entry.is_dir(follow_symlinks=False):
+            return False
+        attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+        return not attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     except OSError:
         return False
 

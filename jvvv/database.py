@@ -16,7 +16,13 @@ from .folder_statistics import calculate_folder_statistics
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
 SCHEMA_VERSION = 12
+# Older schema versions this build upgrades in place when a catalogue is
+# opened read-write.  Only the single step that real catalogues need exists.
+UPGRADABLE_SCHEMA_VERSIONS = frozenset({11})
 CATALOGUE_EXTENSION = ".jvvv"
+# Scan statuses whose catalogue changes were applied.  ``completed_with_warnings``
+# means indexing succeeded but some offline previews were not created (spec §16).
+COMPLETED_SCAN_STATUSES = frozenset({"completed", "completed_with_warnings"})
 AID_DRIVE_ID_RE = re.compile(r"^AID-(\d{3,})$")
 ARCHIVE_STATUSES = ["Archive", "Maintenance", "In Use", "Retired", "Missing", "Faulty"]
 VOLUME_CONDITIONS = ["New", "Good", "Fair", "Poor", "Damaged", "Failed", "Unknown"]
@@ -193,6 +199,51 @@ REQUIRED_COLUMNS = {
 }
 
 
+# Columns added to scan_history by the v11 -> v12 upgrade (offline previews).
+SCAN_HISTORY_PREVIEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("preview_mode", "TEXT NOT NULL DEFAULT 'disabled'"),
+    ("image_previews_generated", "INTEGER NOT NULL DEFAULT 0"),
+    ("image_previews_reused", "INTEGER NOT NULL DEFAULT 0"),
+    ("image_previews_failed", "INTEGER NOT NULL DEFAULT 0"),
+    ("video_previews_generated", "INTEGER NOT NULL DEFAULT 0"),
+    ("video_previews_reused", "INTEGER NOT NULL DEFAULT 0"),
+    ("video_previews_failed", "INTEGER NOT NULL DEFAULT 0"),
+    ("previews_storage_skipped", "INTEGER NOT NULL DEFAULT 0"),
+    ("preview_bytes_written", "INTEGER NOT NULL DEFAULT 0"),
+    ("preview_message", "TEXT NOT NULL DEFAULT ''"),
+)
+
+FILE_PREVIEW_STATUS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS file_preview_status (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        media_kind TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_hash BLOB,
+        preview_size INTEGER,
+        preview_width INTEGER,
+        preview_height INTEGER,
+        preview_duration_ms INTEGER,
+        generated_at TEXT,
+        error_stage TEXT,
+        error_message TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+    )
+    """
+FILE_PREVIEW_STATUS_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_file_preview_status_status ON file_preview_status(status)"
+)
+
+# The complete v11 -> v12 upgrade: additive only, so every existing row survives.
+V11_TO_V12_UPGRADE_SQL: tuple[str, ...] = (
+    *(
+        f"ALTER TABLE scan_history ADD COLUMN {name} {definition}"
+        for name, definition in SCAN_HISTORY_PREVIEW_COLUMNS
+    ),
+    FILE_PREVIEW_STATUS_TABLE_SQL,
+    FILE_PREVIEW_STATUS_INDEX_SQL,
+)
+
 CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
     """
     CREATE TABLE volumes (
@@ -307,23 +358,7 @@ CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
         preview_message TEXT NOT NULL DEFAULT ''
     )
     """,
-    """
-    CREATE TABLE file_preview_status (
-        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-        media_kind TEXT NOT NULL,
-        profile_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        source_hash BLOB,
-        preview_size INTEGER,
-        preview_width INTEGER,
-        preview_height INTEGER,
-        preview_duration_ms INTEGER,
-        generated_at TEXT,
-        error_stage TEXT,
-        error_message TEXT NOT NULL DEFAULT '',
-        updated_at TEXT NOT NULL
-    )
-    """,
+    FILE_PREVIEW_STATUS_TABLE_SQL,
     """
     CREATE TABLE scan_errors (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -368,7 +403,7 @@ CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
     "CREATE INDEX idx_scan_history_volume ON scan_history(volume_id)",
     "CREATE INDEX idx_scan_errors_scan ON scan_errors(scan_id)",
     "CREATE INDEX idx_scan_errors_volume ON scan_errors(volume_id)",
-    "CREATE INDEX idx_file_preview_status_status ON file_preview_status(status)",
+    FILE_PREVIEW_STATUS_INDEX_SQL,
     "CREATE INDEX idx_volume_register_status ON volume_register(status COLLATE NOCASE)",
     "CREATE INDEX idx_volume_register_condition ON volume_register(condition COLLATE NOCASE)",
     "CREATE INDEX idx_volume_register_connector ON volume_register(connector COLLATE NOCASE)",
@@ -520,7 +555,13 @@ class Database:
                 "open and close it there to convert it, then move it back to the network share."
             )
         stored_schema_version = self._database_header_schema_version(self.path)
-        if stored_schema_version not in (None, 0, SCHEMA_VERSION):
+        if stored_schema_version in UPGRADABLE_SCHEMA_VERSIONS and read_only:
+            raise UnsupportedCatalogueError(
+                self._upgrade_required_message(stored_schema_version)
+            )
+        if stored_schema_version not in (None, 0, SCHEMA_VERSION) and (
+            stored_schema_version not in UPGRADABLE_SCHEMA_VERSIONS
+        ):
             raise UnsupportedCatalogueError(
                 self._unsupported_schema_message(stored_schema_version)
             )
@@ -673,6 +714,9 @@ class Database:
 
     def initialize(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        if version in UPGRADABLE_SCHEMA_VERSIONS:
+            self.upgrade_schema(int(version))
+            version = SCHEMA_VERSION
         if version == SCHEMA_VERSION:
             self.validate_schema()
             return
@@ -715,6 +759,59 @@ class Database:
             f"supports version {SCHEMA_VERSION}."
         )
 
+    @staticmethod
+    def _upgrade_required_message(version: int) -> str:
+        return (
+            f"This catalogue uses schema version {version} and must be upgraded to "
+            f"version {SCHEMA_VERSION} before it can be used read-only. Open it normally "
+            "in JVVV once to upgrade it."
+        )
+
+    def upgrade_schema(self, version: int) -> None:
+        """Upgrade an older catalogue in place, atomically (currently v11 -> v12).
+
+        The upgrade only adds columns and one table, so every existing row is
+        preserved.  It runs in a single ``BEGIN IMMEDIATE`` transaction with the
+        new ``user_version`` written last, so a failure leaves the file at the
+        old version with no partial changes.
+        """
+
+        if version == SCHEMA_VERSION:
+            return
+        if version not in UPGRADABLE_SCHEMA_VERSIONS:
+            raise UnsupportedCatalogueError(self._unsupported_schema_message(int(version)))
+        if self.read_only:
+            raise UnsupportedCatalogueError(self._upgrade_required_message(int(version)))
+        self._operation = f"upgrading the catalogue schema from version {version} to {SCHEMA_VERSION}"
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+            if current != version:
+                raise CatalogueError(
+                    f"The catalogue schema changed while it was being upgraded "
+                    f"(expected version {version}, found {current})."
+                )
+            existing_columns = self._column_names("scan_history")
+            for statement in V11_TO_V12_UPGRADE_SQL:
+                if statement.startswith("ALTER TABLE scan_history ADD COLUMN"):
+                    column = statement.split()[5]
+                    if column in existing_columns:
+                        continue
+                self.connection.execute(statement)
+            self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.connection.commit()
+        except Exception as exc:
+            self.connection.rollback()
+            if isinstance(exc, CatalogueError):
+                raise
+            raise CatalogueError(
+                f"The catalogue could not be upgraded from schema version {version} to "
+                f"{SCHEMA_VERSION}; it was left unchanged. {exc}",
+                diagnostic_details=(
+                    self._diagnostic_details(exc) if isinstance(exc, sqlite3.Error) else ""
+                ),
+            ) from exc
+
     def validate_catalogue(self) -> None:
         try:
             # quick_check walks every table and index. On multi-gigabyte
@@ -742,6 +839,13 @@ class Database:
                 raise InvalidCatalogueError(
                     "The selected file is a SQLite database, but it is not a JVVV catalogue."
                 )
+            if version in UPGRADABLE_SCHEMA_VERSIONS:
+                if self.read_only:
+                    raise UnsupportedCatalogueError(
+                        self._upgrade_required_message(int(version))
+                    )
+                self.upgrade_schema(int(version))
+                version = SCHEMA_VERSION
             if version != SCHEMA_VERSION:
                 raise UnsupportedCatalogueError(
                     self._unsupported_schema_message(int(version))

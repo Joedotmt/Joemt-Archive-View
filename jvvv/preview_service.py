@@ -9,6 +9,9 @@ generating once preview storage has become unavailable (disk full, root gone).
 
 from __future__ import annotations
 
+import os
+import stat
+from functools import lru_cache
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -28,9 +31,13 @@ from .preview_cache import (
     PREVIEW_SKIPPED_STORAGE,
     PREVIEW_SKIPPED_UNSUPPORTED,
     STAGE_CONFIGURATION,
+    STAGE_FFMPEG_EXIT,
     STAGE_FFMPEG_START,
     STAGE_HASH_UNAVAILABLE,
+    STAGE_IMAGE_ENCODE,
+    STAGE_PERMISSION,
     STAGE_PREVIEW_ROOT,
+    STAGE_RENAME,
     STAGE_TEMP_FILE,
     STAGE_UNEXPECTED_ERROR,
     STORAGE_STAGES,
@@ -64,6 +71,12 @@ from .video_preview import (
 CancelCallback = Callable[[], bool]
 LogCallback = Callable[[str], None]
 
+# Failures that mean "could not write into the preview root"; they trigger a
+# re-check of the root so a vanished/read-only store stops generation (§17).
+WRITE_FAILURE_STAGES = frozenset(
+    {STAGE_PERMISSION, STAGE_RENAME, STAGE_TEMP_FILE, STAGE_IMAGE_ENCODE, STAGE_FFMPEG_EXIT}
+)
+
 # Persisted per-file statuses (database.PREVIEW_STATUS_VALUES).
 DB_STATUS_AVAILABLE = "available"
 DB_STATUS_FAILED = "failed"
@@ -93,6 +106,8 @@ class PreviewStatistics:
     bytes_written: int = 0
     storage_skipped: int = 0
     corrupt_replaced: int = 0
+    hash_unavailable: int = 0  # media files skipped because no SHA-256 was recorded (spec §9)
+    root: str = ""  # the preview root this scan wrote to (spec §15)
     storage_unavailable_reason: str | None = None
     message: str = ""
     failures: list[PreviewFailure] = field(default_factory=list)
@@ -129,6 +144,8 @@ class PreviewStatistics:
             "bytes_written": int(self.bytes_written),
             "storage_skipped": int(self.storage_skipped),
             "corrupt_replaced": int(self.corrupt_replaced),
+            "hash_unavailable": int(self.hash_unavailable),
+            "root": self.root,
             "storage_unavailable_reason": self.storage_unavailable_reason,
             "message": self.message,
             "failures": [failure.as_dict() for failure in self.failures],
@@ -154,6 +171,8 @@ class PreviewStatistics:
             bytes_written=int(data.get("bytes_written") or 0),
             storage_skipped=int(data.get("storage_skipped") or 0),
             corrupt_replaced=int(data.get("corrupt_replaced") or 0),
+            hash_unavailable=int(data.get("hash_unavailable") or 0),
+            root=str(data.get("root") or ""),
             storage_unavailable_reason=str(reason) if reason else None,
             message=str(data.get("message") or ""),
             failures=failures,
@@ -205,6 +224,14 @@ class PreviewStatistics:
                     f"  {self.corrupt_replaced:,}",
                 ]
             )
+        if self.hash_unavailable:
+            lines.extend(
+                [
+                    "",
+                    "Images/videos not attempted because no SHA-256 could be recorded:",
+                    f"  {self.hash_unavailable:,}",
+                ]
+            )
         if self.storage_skipped or self.storage_unavailable_reason:
             lines.extend(
                 [
@@ -219,11 +246,12 @@ class PreviewStatistics:
 
 
 def scan_outcome(status: str, statistics: PreviewStatistics | Mapping[str, Any] | None) -> str:
-    """Return the user-facing outcome for a scan status plus preview results.
+    """Return the scan status once preview results are taken into account.
 
-    Catalogue indexing results are never downgraded: the persisted scan status
-    stays ``completed`` (other subsystems key on it), but the reported outcome
-    becomes ``completed_with_warnings`` when previews failed (spec §16).
+    Catalogue indexing results are never downgraded: a ``completed`` scan with
+    preview failures becomes ``completed_with_warnings`` (spec §16), which the
+    scanner persists and every "completed scan" consumer accepts through
+    ``database.COMPLETED_SCAN_STATUSES``.
     """
 
     if status != "completed" or statistics is None:
@@ -259,6 +287,32 @@ def preview_warning_message(statistics: PreviewStatistics) -> str:
     if not parts:
         return ""
     return "Catalogue indexing succeeded, but " + " and ".join(parts) + "."
+
+
+def preview_report_message(statistics: PreviewStatistics) -> str:
+    """Scan-history sentence(s) about previews: failures, regenerated corrupt files, no-hash skips.
+
+    Persisted in ``scan_history.message`` so the facts spec §11 and §14 ask to
+    record survive after the live scan log is rebuilt.
+    """
+
+    parts = []
+    warning = preview_warning_message(statistics)
+    if warning:
+        parts.append(warning)
+    if statistics.corrupt_replaced:
+        count = statistics.corrupt_replaced
+        parts.append(
+            f"{count:,} existing preview{'s' if count != 1 else ''} failed validation and "
+            f"{'were' if count != 1 else 'was'} regenerated."
+        )
+    if statistics.hash_unavailable:
+        count = statistics.hash_unavailable
+        parts.append(
+            f"{count:,} image/video file{'s' if count != 1 else ''} had no SHA-256 recorded, "
+            "so no preview was attempted."
+        )
+    return " ".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -311,13 +365,21 @@ class PreviewValidationReport:
                 return step
         return None
 
+    @property
+    def failures(self) -> tuple[ValidationStep, ...]:
+        return tuple(step for step in self.steps if not step.passed and not step.skipped)
+
     def failure_summary(self, heading: str = "Offline previews could not be enabled.") -> str:
-        failure = self.first_failure
-        if failure is None:
+        """Name every failed check, not just the first (spec §2: "exactly which validation failed")."""
+
+        failures = self.failures
+        if not failures:
             return ""
-        lines = [heading, "", f"{failure.label} failed."]
-        if failure.detail:
-            lines.extend(["", failure.detail])
+        lines = [heading]
+        for failure in failures:
+            lines.extend(["", f"{failure.label} failed."])
+            if failure.detail:
+                lines.extend(["", failure.detail])
         return "\n".join(lines)
 
     def report_text(self) -> str:
@@ -411,39 +473,53 @@ def validate_preview_configuration(
         )
 
     # D. configuration values
+    configuration_ok = True
     try:
         settings.validate(require_root=True)
         image_profile_id = settings.image.profile_id
         video_profile_id = settings.video.profile_id
     except PreviewConfigError as exc:
+        configuration_ok = False
         add("configuration", "Configuration values", False, str(exc), stage=STAGE_CONFIGURATION)
-        return report()
-    add(
-        "configuration",
-        "Configuration values",
-        True,
-        f"image profile {image_profile_id}; video profile {video_profile_id}",
-    )
+    else:
+        add(
+            "configuration",
+            "Configuration values",
+            True,
+            f"image profile {image_profile_id}; video profile {video_profile_id}",
+        )
 
-    # A. preview root
-    cache = PreviewCache(settings.root_path or Path(root_text), settings.image, settings.video)
+    # A. preview root.  With invalid configuration values the filesystem is
+    # not touched, but the tool checks below still run so the report names
+    # every problem instead of guessing "FFmpeg: Not found" (spec §3).
+    cache: PreviewCache | None = None
     root_ok = False
-    try:
-        root_validation = cache.validate_root(create=True)
-        free_bytes = root_validation.free_bytes
-        total_bytes = root_validation.total_bytes
-        root_ok = True
-        add("preview-root", "Preview storage directory", True, root_validation.message)
-    except PreviewError as exc:
-        add("preview-root", "Preview storage directory", False, str(exc), stage=exc.stage)
-    except Exception as exc:  # pragma: no cover - defensive
+    if not configuration_ok:
         add(
             "preview-root",
             "Preview storage directory",
             False,
-            f"JVVV cannot use the preview directory {root_text}: {exc}",
-            stage=STAGE_PREVIEW_ROOT,
+            "Not run because the configuration values are invalid.",
+            skipped=True,
         )
+    else:
+        cache = PreviewCache(settings.root_path or Path(root_text), settings.image, settings.video)
+        try:
+            root_validation = cache.validate_root(create=True)
+            free_bytes = root_validation.free_bytes
+            total_bytes = root_validation.total_bytes
+            root_ok = True
+            add("preview-root", "Preview storage directory", True, root_validation.message)
+        except PreviewError as exc:
+            add("preview-root", "Preview storage directory", False, str(exc), stage=exc.stage)
+        except Exception as exc:  # pragma: no cover - defensive
+            add(
+                "preview-root",
+                "Preview storage directory",
+                False,
+                f"JVVV cannot use the preview directory {root_text}: {exc}",
+                stage=STAGE_PREVIEW_ROOT,
+            )
 
     # C. image backend
     try:
@@ -452,7 +528,7 @@ def validate_preview_configuration(
         backend_ok, backend_message = False, f"The image backend could not be checked: {exc}"
     add("image-backend", "Image preview backend", backend_ok, backend_message)
     if include_encode_tests:
-        if root_ok and backend_ok:
+        if root_ok and backend_ok and cache is not None:
             try:
                 add("image-test", "Image preview test encode", True, image_tester(cache))
             except PreviewError as exc:
@@ -524,7 +600,7 @@ def validate_preview_configuration(
         )
 
     if include_encode_tests:
-        if root_ok and ffmpeg_path and capabilities is not None and encoder_available:
+        if root_ok and ffmpeg_path and capabilities is not None and encoder_available and cache is not None:
             try:
                 add("video-test", "Video preview test encode", True, video_tester(ffmpeg_path, cache))
             except PreviewError as exc:
@@ -672,6 +748,36 @@ def preview_cache_for(settings: PreviewSettings) -> PreviewCache | None:
     return PreviewCache(root, settings.image, settings.video)
 
 
+@lru_cache(maxsize=512)
+def _validated_preview(
+    media_kind: str, path_text: str, size_bytes: int, mtime_ns: int
+) -> tuple[bool, int, int | None, int | None, int | None, str]:
+    """Validate a preview once per (path, size, mtime): the UI asks on every selection.
+
+    Full validation decodes the JPEG / parses the MP4 (spec §46 forbids
+    trusting a corrupt file), which is too slow to repeat for every arrow-key
+    move over a large-profile or network-hosted store.  The result is keyed by
+    the file's identity, so a replaced or truncated file is re-checked.
+    """
+
+    path = Path(path_text)
+    if media_kind == "image":
+        validation = validate_image_preview(path)
+        duration_ms = None
+    else:
+        video_validation = validate_video_preview(path)
+        validation = video_validation
+        duration_ms = video_validation.duration_ms
+    return (
+        bool(validation.valid),
+        int(validation.size_bytes),
+        validation.width,
+        validation.height,
+        duration_ms,
+        validation.message,
+    )
+
+
 def inspect_preview_file(
     settings: PreviewSettings,
     media_kind: str,
@@ -695,7 +801,8 @@ def inspect_preview_file(
     except PreviewError:
         return None
     try:
-        exists = path.is_file()
+        info = os.stat(path)
+        exists = stat.S_ISREG(info.st_mode)
     except OSError:
         exists = False
     if not exists:
@@ -712,13 +819,9 @@ def inspect_preview_file(
             "The preview file does not exist at the expected location.",
         )
     try:
-        if media_kind == "image":
-            validation = validate_image_preview(path)
-            duration_ms = None
-        else:
-            video_validation = validate_video_preview(path)
-            validation = video_validation
-            duration_ms = video_validation.duration_ms
+        valid, size_bytes, width, height, duration_ms, message = _validated_preview(
+            media_kind, os.fspath(path), int(info.st_size), int(info.st_mtime_ns)
+        )
     except Exception as exc:  # pragma: no cover - validators never raise
         return PreviewFileInfo(
             media_kind, profile_id, path, True, False, 0, None, None, None, str(exc)
@@ -728,12 +831,12 @@ def inspect_preview_file(
         profile_id,
         path,
         True,
-        bool(validation.valid),
-        int(validation.size_bytes),
-        validation.width,
-        validation.height,
+        valid,
+        size_bytes,
+        width,
+        height,
         duration_ms,
-        validation.message if not validation.valid else "",
+        message if not valid else "",
     )
 
 
@@ -770,7 +873,7 @@ class PreviewService:
             self.video_generator = VideoPreviewGenerator(self.cache, self.ffmpeg_path)
         else:
             self.video_generator = None
-        self.statistics = PreviewStatistics(mode=MODE_ENABLED)
+        self.statistics = PreviewStatistics(mode=MODE_ENABLED, root=str(self.cache.root))
         self.log_callback = log_callback
         self._in_flight: set[Path] = set()
 
@@ -825,6 +928,8 @@ class PreviewService:
                 "Preview storage became unavailable; no further previews will be "
                 f"attempted during this scan: {reason}"
             )
+        elif error.stage in WRITE_FAILURE_STAGES and self.statistics.storage_unavailable_reason is None:
+            self._recheck_storage_after_write_failure()
         return PreviewResult(
             status=PREVIEW_FAILED,
             media_kind=media_kind,
@@ -833,6 +938,30 @@ class PreviewService:
             stage=error.stage,
             message=error.message,
             detail=error.detail,
+        )
+
+    def _recheck_storage_after_write_failure(self) -> None:
+        """Re-prove the preview root after a write-side failure (spec §17).
+
+        A root that turned read-only or vanished mid-scan fails at the temp
+        file, encode or rename stage for every remaining candidate; that would
+        flood the failure list with thousands of identical rows.  If the root
+        no longer passes the create/read/remove check, generation stops for
+        the rest of the scan exactly as it does when the disk is full.
+        """
+
+        try:
+            self.cache.validate_root(create=False)
+        except PreviewError as exc:
+            reason = exc.message if not exc.detail else f"{exc.message} — {exc.detail}"
+        except Exception as exc:  # pragma: no cover - defensive
+            reason = f"The preview directory could not be re-checked: {exc}"
+        else:
+            return
+        self.statistics.storage_unavailable_reason = reason
+        self._log(
+            "Preview storage is no longer writable; no further previews will be "
+            f"attempted during this scan: {reason}"
         )
 
     def _skip_for_storage(self, media_kind: str, profile_id: str, destination: Path) -> PreviewResult:
@@ -863,8 +992,13 @@ class PreviewService:
         cancel_callback: CancelCallback | None = None,
         progress_callback: Callable[[str], None] | None = None,
         expected_duration_ms: int | None = None,
+        source_stat: os.stat_result | None = None,
     ) -> PreviewResult:
-        """Return the explicit outcome for one hashed, stable source file."""
+        """Return the explicit outcome for one hashed, stable source file.
+
+        ``source_stat`` is the ``lstat`` taken when ``content_hash`` was
+        computed; generators refuse sources that no longer match it (spec §32).
+        """
 
         if media_kind not in PREVIEW_MEDIA_KINDS:
             return PreviewResult(
@@ -995,6 +1129,7 @@ class PreviewService:
                     Path(source),
                     destination,
                     cancel_callback=cancel_callback,
+                    source_stat=source_stat,
                 )
             else:
                 result = self.video_generator.generate(
@@ -1003,6 +1138,7 @@ class PreviewService:
                     cancel_callback=cancel_callback,
                     progress_callback=_video_progress_adapter(progress_callback),
                     expected_duration_ms=expected_duration_ms,
+                    source_stat=source_stat,
                 )
         except PreviewCancelled:
             raise

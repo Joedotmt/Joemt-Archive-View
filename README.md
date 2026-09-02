@@ -74,9 +74,13 @@ python -m jvvv
 
 JVVV starts without opening a catalogue. Use **File > New Catalogue** to create
 a `.jvvv` file, or **File > Open Catalogue** to open an existing one. The file
-is a valid SQLite database and contains the full catalogue. This build opens
-only its current `.jvvv` schema and does not migrate catalogues from older
-schema versions.
+is a valid SQLite database and contains the full catalogue. A catalogue saved
+by the previous schema version (11) is upgraded in place the first time it is
+opened: the upgrade only adds the offline-preview table and columns, runs in one
+transaction, and is rolled back completely if anything fails. Older schema
+versions are refused without being modified. Read-only openings (for example a
+catalogue on read-only media) cannot upgrade, so open such a catalogue normally
+once first.
 
 Use **File > Create Catalogue Backup…** to save the open catalogue as a single
 ZIP. The backup stores irreducible catalogue state (including IDs,
@@ -121,7 +125,8 @@ If a file keeps changing or disappears while it is being hashed, it is skipped
 and reported as an incomplete scan area instead of saving a known-stale snapshot.
 
 Media details are descriptive and are never used as file identity. Image sizes
-and WAV details require no additional software. For broader audio/video details,
+(including HEIC/HEIF and camera RAW files, after EXIF orientation) and WAV
+details require no additional software. For broader audio/video details,
 install FFmpeg and make its `ffprobe` executable available on `PATH`; otherwise
 Properties explicitly says that those details were not collected. If a later
 probe fails, earlier details are retained only when SHA-256 proves the content is
@@ -166,10 +171,13 @@ executable if it is not on `PATH`, pick the image and video quality you want to
 spend storage on, and tick **Generate offline previews while scanning**.
 
 Ticking the box immediately proves the configuration works: JVVV writes and
-removes a test file in the preview directory, encodes a tiny test image with the
-Qt JPEG writer, starts FFmpeg, checks its version and its H.264 `libx264`
-encoder, and encodes a tiny test video into the preview directory. If any step
-fails, the box turns itself back off and a dialog states exactly what failed.
+removes a test file in the preview directory, checks that every image library is
+present (Pillow with JPEG support, pillow-heif with an HEVC decoder for
+HEIC/HEIF, and rawpy/LibRaw for camera RAW), encodes a tiny test image, starts
+FFmpeg, checks its version and its H.264 `libx264` encoder, and encodes a tiny
+test video into the preview directory. If any step fails, the box turns itself
+back off and a dialog states exactly what failed; previews are never left in a
+partially working enabled state.
 **Test Preview Configuration** runs the same checks without changing the
 setting and reports the directory, free space, FFmpeg path and version, encoder
 availability, both test encodes, and an overall PASS or FAIL. Changing the
@@ -189,10 +197,28 @@ new profile directory; nothing from an older profile is deleted or converted
 automatically, and changing the preview directory does not move existing
 previews.
 
+Image previews are produced by one pipeline built on Pillow: JPEG, PNG, TIFF,
+WebP, GIF (first frame), BMP and ICO directly; HEIC/HEIF (`.heic`, `.heif`,
+`.hif`) through pillow-heif (libheif); and camera RAW through rawpy (LibRaw):
+DNG, CR2, CR3, CRW, NEF, NRW, ARW, SR2, SRF, RAF, ORF, RW2, RWL, PEF, SRW, 3FR,
+IIQ, MEF, MOS, MRW, ERF, KDC, DCR and X3F. For a RAW file JVVV first asks LibRaw
+for the camera's embedded JPEG preview and uses it when its larger side is at
+least as large as the preview needs; otherwise the sensor data is demosaiced
+(at half size when that still covers the configured maximum). Every path then
+applies EXIF orientation (or LibRaw's orientation flag), flattens transparency
+onto neutral grey, downsizes to the configured maximum without ever upscaling,
+and writes a JPEG that carries only the ICC profile — no EXIF, XMP, comments or
+other source metadata. Decoding is refused above 600 megapixels.
+
 During a scan, previews are generated only after a file's SHA-256 has been
-recorded and the file has passed the stability checks. An existing preview with
-the same SHA-256 and profile is validated and reused; a corrupt one is
-regenerated. Output is always written to a temporary file in the target
+recorded and the file has passed the stability checks; a source that changes
+between hashing and preview generation is reported as a failure rather than
+previewed under the old hash. If the preview directory lies inside the volume
+being scanned it is skipped, so previews are never catalogued as archive
+content. An existing preview with
+the same SHA-256 and profile is validated and reused; a corrupt one (including
+an MP4 proxy truncated by an interrupted copy) is regenerated and the scan
+report records how many were replaced. Output is always written to a temporary file in the target
 directory, validated (JPEG decode, or an MP4 structure check for a video
 stream and duration), and only then renamed into place. Cancelling a scan stops
 any running FFmpeg process and removes temporary files. Video proxies are
@@ -205,8 +231,11 @@ scan without previews just once (the scan report records why), or cancel. At
 the end of a scan with previews enabled, an **Offline Preview Summary** shows
 generated, reused, and failed counts for images and videos, the preview
 directory, and the space written by the scan. If anything failed, the scan is
-reported as **completed with preview errors** and **View Preview Failures**
-lists every failed item with its stage and technical detail. If the preview
+reported as **completed with preview errors** (stored in the scan history as
+status `completed_with_warnings`, which every other feature — Backup Evidence,
+volume summaries, scan reports — treats as a completed, fully indexed scan) and
+**View Preview Failures** lists every failed item with its stage and technical
+detail. If the preview
 disk fills up or the directory becomes unavailable, generation stops for the
 rest of that scan, catalogue indexing continues, and the report distinguishes
 direct failures from previews that were not attempted. Preview failures never
@@ -226,7 +255,14 @@ previews it holds and how much space they use. **Show Unreferenced Previews**
 lists files under the current profiles whose SHA-256 is not referenced by the
 open catalogue. Because other catalogues may share the same directory, nothing
 is deleted automatically: select the entries you want to remove and confirm
-**Delete Selected Unreferenced Previews**.
+**Delete Selected Unreferenced Previews**. The list is cleared whenever the
+catalogue changes, so it always has to be produced again before deleting.
+**Delete Temporary Files** removes `.tmp-` files left behind by an interrupted
+preview generation (a crash or power loss); files newer than 24 hours are kept
+because another JVVV window sharing the directory may still be writing them.
+Directory junctions or symbolic links inside the preview directory are never
+followed. If the preview directory is disconnected, the cache manager reports
+that instead of showing an empty store.
 
 ## Tests
 
@@ -234,12 +270,16 @@ is deleted automatically: select the entries you want to remove and confirm
 pytest
 ```
 
-The automated tests cover database initialization and current-schema validation, volume
-operations, streaming hashes, media inspection, scan cancellation/change review
-and rollback, hash-first backup evidence, semantic backup/restore integrity and
-atomicity, offline browsing, search, and the offline preview system (profile
-IDs, preview-root validation, image and video generation, atomic output,
-cancellation, failure reporting, scanner integration, and the Settings UI).
+The automated tests cover database initialization and current-schema validation,
+the in-place upgrade of schema-version-11 catalogues (row-for-row preservation,
+rollback on failure, read-only handling), volume operations, streaming hashes,
+media inspection, scan cancellation/change review and rollback, hash-first backup
+evidence, semantic backup/restore integrity and atomicity, offline browsing,
+search, and the offline preview system (profile IDs, preview-root validation,
+image generation for standard formats, HEIC and synthetic DNG camera RAW files
+including embedded-preview extraction, demosaic fallback and orientation, video
+generation, atomic output, cancellation, failure reporting, scanner integration,
+and the Settings UI).
 Tests that need a real FFmpeg are skipped unless `ffmpeg` is on `PATH` or the
 `JVVV_TEST_FFMPEG` environment variable points at an executable.
 

@@ -110,9 +110,11 @@ class RecordingImageGenerator:
         self.inner = ImagePreviewGenerator(cache)
         self.calls: list[Path] = []
 
-    def generate(self, source, destination, *, cancel_callback=None):
+    def generate(self, source, destination, *, cancel_callback=None, source_stat=None):
         self.calls.append(Path(source))
-        return self.inner.generate(source, destination, cancel_callback=cancel_callback)
+        return self.inner.generate(
+            source, destination, cancel_callback=cancel_callback, source_stat=source_stat
+        )
 
 
 class FailingImageGenerator:
@@ -122,7 +124,7 @@ class FailingImageGenerator:
         self.error = error
         self.calls: list[Path] = []
 
-    def generate(self, source, destination, *, cancel_callback=None):
+    def generate(self, source, destination, *, cancel_callback=None, source_stat=None):
         self.calls.append(Path(source))
         raise self.error
 
@@ -135,7 +137,7 @@ class CancellingImageGenerator:
         self.cancel_state = cancel_state
         self.calls: list[Path] = []
 
-    def generate(self, source, destination, *, cancel_callback=None):
+    def generate(self, source, destination, *, cancel_callback=None, source_stat=None):
         self.calls.append(Path(source))
         self.cache.ensure_parent(destination)
         temp_path = self.cache.temporary_path(destination)
@@ -166,6 +168,7 @@ class FakeVideoGenerator:
         cancel_callback=None,
         progress_callback=None,
         expected_duration_ms=None,
+        source_stat=None,
     ) -> PreviewResult:
         self.calls.append(Path(source))
         self.expected_durations.append(expected_duration_ms)
@@ -221,6 +224,7 @@ class FailingVideoGenerator:
         cancel_callback=None,
         progress_callback=None,
         expected_duration_ms=None,
+        source_stat=None,
     ):
         self.calls.append(Path(source))
         self.expected_durations.append(expected_duration_ms)
@@ -407,7 +411,6 @@ def test_disabled_previews_attempt_nothing_and_record_disabled_mode(
     result = make_scanner(catalogue).scan(volume_id)
 
     assert result.status == "completed"
-    assert result.outcome == "completed"
     assert result.files_seen == 4
     assert result.preview is not None
     assert result.preview["mode"] == MODE_DISABLED
@@ -446,7 +449,6 @@ def test_enabled_previews_generate_images_and_videos(catalogue, source, tmp_path
     result = make_scanner(catalogue, service).scan(volume_id)
 
     assert result.status == "completed"
-    assert result.outcome == "completed"
     assert result.errors_count == 0
     assert result.preview["mode"] == MODE_ENABLED
     assert result.preview["image_generated"] == 2
@@ -526,7 +528,6 @@ def test_rescan_reuses_existing_previews_without_regenerating(catalogue, source,
     second = make_scanner(catalogue, second_service).scan(volume_id)
 
     assert second.status == "completed"
-    assert second.outcome == "completed"
     assert second.preview["image_generated"] == 0
     assert second.preview["image_reused"] == 2
     assert second.preview["video_generated"] == 0
@@ -593,7 +594,6 @@ def test_skipped_preflight_statistics_are_recorded_without_a_service(catalogue, 
     result = make_scanner(catalogue, preview_statistics=statistics).scan(volume_id)
 
     assert result.status == "completed"
-    assert result.outcome == "completed"
     assert result.files_seen == 4
     assert result.preview["mode"] == MODE_SKIPPED_PREFLIGHT
     assert result.preview["image_generated"] == 0
@@ -627,8 +627,7 @@ def test_corrupt_image_fails_preview_but_keeps_the_catalogue_record(catalogue, s
 
     result = make_scanner(catalogue, service).scan(volume_id)
 
-    assert result.status == "completed"
-    assert result.outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert result.files_seen == 2
     assert result.errors_count == 0
     assert result.hash_errors == 0
@@ -668,7 +667,7 @@ def test_corrupt_image_fails_preview_but_keeps_the_catalogue_record(catalogue, s
     assert temporaries_under(cache.root) == []
 
     history = catalogue.list_scan_history(volume_id)[0]
-    assert history["status"] == "completed"
+    assert history["status"] == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert history["message"].startswith("Catalogue indexing succeeded, but")
     assert "1 offline preview was not created" in history["message"]
     assert result.message == history["message"]
@@ -702,8 +701,7 @@ def test_failed_video_and_image_previews_are_both_counted_and_reported(
 
     result = make_scanner(catalogue, service).scan(volume_id)
 
-    assert result.status == "completed"
-    assert result.outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert result.files_seen == 3
     assert result.errors_count == 0
     assert catalogue.list_scan_errors(volume_id) == []
@@ -779,7 +777,7 @@ def test_failed_video_and_image_previews_are_both_counted_and_reported(
     assert temporaries_under(cache.root) == []
 
     history = catalogue.list_scan_history(volume_id)[0]
-    assert history["status"] == "completed"
+    assert history["status"] == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert history["image_previews_generated"] == 1
     assert history["image_previews_failed"] == 1
     assert history["video_previews_generated"] == 0
@@ -827,8 +825,7 @@ def test_real_video_generator_nonzero_ffmpeg_exit_reaches_the_scan_report(
         progress_callback=lambda _files, _folders, message: messages.append(message),
     ).scan(volume_id)
 
-    assert result.status == "completed"
-    assert result.outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert result.errors_count == 0
     assert len(ffmpeg.calls) == 1
     process = ffmpeg.calls[0]
@@ -901,8 +898,7 @@ def test_videos_fail_visibly_when_ffmpeg_disappeared_after_validation(
 
     result = make_scanner(catalogue, service).scan(volume_id)
 
-    assert result.status == "completed"
-    assert result.outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert result.errors_count == 0
     assert result.files_seen == 3
     assert result.preview["image_generated"] == 1
@@ -950,8 +946,7 @@ def test_disk_full_stops_further_preview_generation(catalogue, source, tmp_path)
 
     result = make_scanner(catalogue, service).scan(volume_id)
 
-    assert result.status == "completed"
-    assert result.outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert result.errors_count == 0
     assert result.files_seen == 4
     assert [path.name for path in failing.calls] == ["alpha.png"]
@@ -1016,7 +1011,6 @@ def test_hash_unavailable_records_missing_status_without_calling_generators(
     assert result.preview["image_generated"] == 0
     assert result.preview["storage_skipped"] == 0
     assert result.preview["failures"] == []
-    assert result.outcome == "completed"
 
     files = file_rows(catalogue)
     assert files["Photos/alpha.png"]["content_hash"] is None
@@ -1071,7 +1065,6 @@ def test_cancellation_inside_a_generator_rolls_back_and_leaves_no_temporaries(
     ).scan(volume_id)
 
     assert result.status == "cancelled"
-    assert result.outcome == "cancelled"
     assert result.message == "Scan cancelled."
     assert [path.name for path in generator.calls] == ["alpha.png"]
     assert temporaries_under(cache.root) == []
@@ -1196,7 +1189,6 @@ def test_discarded_rescan_keeps_previous_preview_status_rows(catalogue, source, 
     ).scan(volume_id)
 
     assert result.status == "discarded"
-    assert result.outcome == "discarded"
     assert len(reviews) == 1
     assert reviews[0].files_changed == 1
     assert result.preview["image_generated"] == 1
@@ -1231,7 +1223,6 @@ def test_audio_files_get_no_preview_status_row(catalogue, source, tmp_path):
     result = make_scanner(catalogue, service).scan(volume_id)
 
     assert result.status == "completed"
-    assert result.outcome == "completed"
     assert result.files_seen == 3
     assert result.media_files == 3
     assert result.preview["image_generated"] == 1
@@ -1271,7 +1262,6 @@ def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, 
     ).scan(volume_id)
 
     assert result.status == "completed"
-    assert result.outcome == "completed"
     assert result.preview["video_generated"] == 1
     assert result.preview["video_failed"] == 0
     assert result.preview["failures"] == []
@@ -1321,8 +1311,7 @@ def test_real_ffmpeg_reports_an_undecodable_video_as_a_preview_failure(
         preview_service=service,
     ).scan(volume_id)
 
-    assert result.status == "completed"
-    assert result.outcome == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
     assert result.errors_count == 0
     assert result.preview["video_generated"] == 1
     assert result.preview["video_failed"] == 1
@@ -1353,3 +1342,151 @@ def test_real_ffmpeg_reports_an_undecodable_video_as_a_preview_failure(
     assert history["video_previews_failed"] == 1
     assert "1 offline preview was not created" in history["message"]
     assert history["errors_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups (spec §9/§32 hash window, §10 shared roots, §11 corrupt log, §14 counts)
+# ---------------------------------------------------------------------------
+
+
+class MutatingMediaExtractor(StubMediaExtractor):
+    """Changes PNG files during the media probe: the source differs from what was hashed."""
+
+    def inspect(self, path, *, extension=None, cancel_callback=None):
+        import os
+        import time
+
+        file_path = Path(path)
+        if file_path.suffix.lower() == ".png":
+            with open(file_path, "ab") as handle:
+                handle.write(b"\x00" * 64)
+            later = time.time() + 10
+            os.utime(file_path, (later, later))
+        return super().inspect(path, extension=extension, cancel_callback=cancel_callback)
+
+
+def test_source_changed_between_hashing_and_preview_is_not_previewed_under_the_old_hash(
+    catalogue, source, tmp_path
+):
+    from jvvv.preview_cache import STAGE_SOURCE_CHANGED
+
+    write_test_image(source / "Photos" / "alpha.png", 320, 240, "png")
+    hashed = sha256_of(source / "Photos" / "alpha.png")
+    service, cache = make_service(tmp_path)
+    volume_id = catalogue.create_volume("Drive", str(source))
+
+    result = make_scanner(catalogue, service, media_extractor=MutatingMediaExtractor()).scan(volume_id)
+
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    rows = preview_rows(catalogue)
+    assert rows["Photos/alpha.png"]["status"] == "failed"
+    assert rows["Photos/alpha.png"]["error_stage"] == STAGE_SOURCE_CHANGED
+    assert "between hashing and preview generation" in rows["Photos/alpha.png"]["error_message"]
+    assert not cache.preview_path("image", hashed).exists(), "no preview may be published under the old hash"
+    assert preview_files_under(cache.root) == []
+    assert temporaries_under(cache.root) == []
+    assert [failure.stage for failure in service.statistics.failures] == [STAGE_SOURCE_CHANGED]
+
+
+def test_a_second_catalogue_sharing_the_root_reuses_previews_without_generating(source, tmp_path):
+    write_test_image(source / "Photos" / "alpha.png", 320, 240, "png")
+    write_test_image(source / "Photos" / "beta.png", 300, 200, "png")
+
+    first_service, cache = make_service(tmp_path)
+    first_db = Database(tmp_path / "first.jvvv")
+    try:
+        first = make_scanner(first_db, first_service).scan(first_db.create_volume("Drive", str(source)))
+    finally:
+        first_db.close()
+    assert first.status == "completed"
+    assert first_service.statistics.image_generated == 2
+
+    second_service, _ = make_service(tmp_path)  # same root, a different catalogue file
+    second_db = Database(tmp_path / "second.jvvv")
+    try:
+        second = make_scanner(second_db, second_service).scan(second_db.create_volume("Drive", str(source)))
+        assert second.status == "completed"
+        assert second_service.statistics.image_reused == 2
+        assert second_service.statistics.image_generated == 0
+        assert second_service.image_generator.calls == []
+        assert {row["status"] for row in preview_rows(second_db).values()} == {"available"}
+    finally:
+        second_db.close()
+    assert len(preview_files_under(cache.root)) == 2
+
+
+def test_regenerated_corrupt_previews_are_recorded_in_the_scan_history(catalogue, source, tmp_path):
+    from jvvv.image_preview import validate_image_preview
+
+    write_test_image(source / "Photos" / "alpha.png", 320, 240, "png")
+    service, cache = make_service(tmp_path)
+    corrupt = cache.preview_path("image", sha256_of(source / "Photos" / "alpha.png"))
+    cache.ensure_parent(corrupt)
+    corrupt.write_bytes(b"not a jpeg at all")
+    volume_id = catalogue.create_volume("Drive", str(source))
+
+    result = make_scanner(catalogue, service).scan(volume_id)
+
+    assert result.status == "completed"
+    assert service.statistics.corrupt_replaced == 1
+    assert validate_image_preview(corrupt).valid
+    history = catalogue.list_scan_history(volume_id)[0]
+    assert history["status"] == "completed"
+    assert "1 existing preview failed validation and was regenerated." in history["message"]
+
+
+def test_media_files_without_a_hash_are_counted_in_the_preview_report(catalogue, source, tmp_path, monkeypatch):
+    write_test_image(source / "Photos" / "alpha.png", 320, 240, "png")
+    write_tiny_mp4(source / "Videos" / "clip.mp4")
+
+    def fail_hash(*_args, **_kwargs):
+        raise PermissionError("content read denied")
+
+    monkeypatch.setattr(VolumeScanner, "_hash_file", fail_hash)
+    service, _cache = make_service(
+        tmp_path,
+        image_generator=FailingImageGenerator(PreviewError(STAGE_IMAGE_DECODE, "must not run")),
+        video_generator=NeverCalledVideoGenerator(),
+    )
+    volume_id = catalogue.create_volume("Drive", str(source))
+
+    result = make_scanner(catalogue, service).scan(volume_id)
+
+    assert result.status == "completed"
+    assert result.preview["hash_unavailable"] == 2
+    assert service.statistics.hash_unavailable == 2
+    summary = service.statistics.summary_text(service.statistics.root)
+    assert "no SHA-256 could be recorded" in summary and "\n  2" in summary
+    history = catalogue.list_scan_history(volume_id)[0]
+    assert "2 image/video files had no SHA-256 recorded, so no preview was attempted." in history["message"]
+
+
+def test_a_preview_root_inside_the_scanned_volume_is_not_catalogued(catalogue, source, tmp_path):
+    write_test_image(source / "Photos" / "alpha.png", 320, 240, "png")
+    settings = PreviewSettings(enabled=True, root_directory=str(source / "JVVV Previews"))
+    cache = PreviewCache(settings.root_path, settings.image, settings.video)
+    volume_id = catalogue.create_volume("Drive", str(source))
+
+    def scan_once() -> tuple[PreviewService, object]:
+        service = PreviewService(
+            settings,
+            ffmpeg_path=FAKE_FFMPEG,
+            cache=cache,
+            image_generator=RecordingImageGenerator(cache),
+            video_generator=NeverCalledVideoGenerator(),
+        )
+        return service, make_scanner(catalogue, service).scan(volume_id)
+
+    first_service, first = scan_once()
+    assert first.status == "completed"
+    assert first_service.statistics.image_generated == 1
+    assert preview_files_under(cache.root), "the preview was written inside the scanned volume"
+
+    second_service, second = scan_once()
+
+    assert second.status == "completed"
+    assert second_service.statistics.image_reused == 1
+    assert second_service.statistics.image_generated == 0
+    assert set(file_rows(catalogue)) == {"Photos/alpha.png"}, "the preview store must not be indexed"
+    assert count_rows(catalogue, "files") == 1
+    assert len(preview_files_under(cache.root)) == 1, "no preview of a preview"

@@ -6,7 +6,7 @@ import subprocess
 import wave
 
 import pytest
-from PySide6.QtGui import QImage
+from PIL import Image
 
 from jvvv import media_metadata as media_module
 from jvvv.media_metadata import (
@@ -71,22 +71,55 @@ def test_non_media_file_does_not_create_a_status_record(tmp_path):
     assert result is None
 
 
-def test_qt_image_reader_collects_header_dimensions_without_optional_tools(tmp_path):
+def test_pillow_collects_image_dimensions_without_optional_tools(tmp_path):
     path = tmp_path / "frame.png"
-    image = QImage(13, 7, QImage.Format.Format_RGB32)
-    image.fill(0xFF336699)
-    assert image.save(str(path), "PNG")
+    Image.new("RGB", (13, 7), (0x33, 0x66, 0x99)).save(path, "PNG")
 
     result = MediaMetadataExtractor(discover_ffprobe=False).inspect(path)
 
     assert result == MediaMetadata(
         status="complete",
         media_kind="image",
-        source="qt-image",
+        source="pillow",
         container_format="png",
         width=13,
         height=7,
     )
+
+
+def test_image_dimensions_follow_exif_orientation(tmp_path):
+    path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    Image.new("RGB", (200, 100), (10, 10, 10)).save(path, "JPEG", exif=exif.tobytes())
+
+    result = MediaMetadataExtractor(discover_ffprobe=False).inspect(path)
+
+    assert (result.width, result.height, result.container_format) == (100, 200, "jpeg")
+
+
+def test_camera_raw_and_heic_are_image_media_with_dimensions(tmp_path):
+    import pathlib
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    from preview_fixtures import write_dng, write_heic
+
+    dng = write_dng(tmp_path / "shot.dng", 96, 64, orientation=6)
+    heic = write_heic(tmp_path / "phone.heic", 120, 80)
+    extractor = MediaMetadataExtractor(discover_ffprobe=False)
+
+    raw_result = extractor.inspect(dng)
+    heic_result = extractor.inspect(heic)
+
+    assert raw_result == MediaMetadata(
+        status="complete", media_kind="image", source="pillow", container_format="dng", width=64, height=96
+    )
+    assert heic_result == MediaMetadata(
+        status="complete", media_kind="image", source="pillow", container_format="heif", width=120, height=80
+    )
+    assert media_kind_for_extension(".CR3") == "image"
+    assert media_kind_for_extension("heif") == "image"
 
 
 def test_unreadable_image_returns_an_explicit_status_instead_of_raising(tmp_path):
@@ -98,7 +131,7 @@ def test_unreadable_image_returns_an_explicit_status_instead_of_raising(tmp_path
     assert result is not None
     assert result.media_kind == "image"
     assert result.status in {"unavailable", "failed"}
-    assert result.source == "qt-image"
+    assert result.source == "pillow"
     assert result.message
 
 

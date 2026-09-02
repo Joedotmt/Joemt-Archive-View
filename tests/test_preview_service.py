@@ -223,6 +223,7 @@ class FakeGenerator:
         cancel_callback=None,
         progress_callback=None,
         expected_duration_ms: int | None = None,
+        source_stat=None,
     ) -> PreviewResult:
         self.calls.append(
             SimpleNamespace(
@@ -231,6 +232,7 @@ class FakeGenerator:
                 cancel_callback=cancel_callback,
                 progress_callback=progress_callback,
                 expected_duration_ms=expected_duration_ms,
+                source_stat=source_stat,
             )
         )
         if self.error is not None:
@@ -405,7 +407,9 @@ def test_validation_all_pass_reports_every_required_item(settings, root):
         ({"root_directory": "   "}, "preview storage directory has not been selected"),
     ],
 )
-def test_validation_invalid_configuration_is_the_only_step(root, overrides, expected_detail):
+def test_validation_invalid_configuration_still_reports_the_tools_but_never_touches_the_root(
+    root, overrides, expected_detail
+):
     values = {"enabled": True, "root_directory": str(root)}
     values.update(overrides)
     settings = PreviewSettings(**values)
@@ -414,14 +418,27 @@ def test_validation_invalid_configuration_is_the_only_step(root, overrides, expe
     report = validate_preview_configuration(settings, **fake_validation_tools(calls))
 
     assert report.passed is False
-    assert step_keys(report) == ["configuration"]
+    assert step_keys(report) == FULL_STEP_KEYS
     step = report.steps[0]
     assert step.passed is False and step.skipped is False
     assert step.stage == STAGE_CONFIGURATION
     assert step.status_text == "FAIL"
     assert expected_detail.casefold() in step.detail.casefold()
-    assert calls == [], "no tool may run when the configuration values are invalid"
+    # Spec §3: the report still names the FFmpeg path/version and the image
+    # backend instead of claiming "Not found"; only the root and the encode
+    # tests are skipped, and the filesystem is never touched.
+    assert report.step("preview-root").skipped
+    assert report.step("image-test").skipped and report.step("video-test").skipped
+    assert report.step("image-backend").passed
+    assert report.step("ffmpeg-found").passed and report.ffmpeg_path == FAKE_FFMPEG
+    assert report.step("ffmpeg-encoder").passed
+    assert call_names(calls) == ["backend", "find", "probe"]
     assert not root.exists(), "an invalid configuration must not touch the filesystem"
+    text = report.report_text()
+    assert f"FFmpeg path: {FAKE_FFMPEG}" in text
+    assert "Not found" not in text
+    assert "[Not run] Preview storage directory" in text
+    assert report.failure_summary().count("failed.") == 1
     summary = report.failure_summary()
     assert summary.startswith("Offline previews could not be enabled.\n\n")
     assert "Configuration values failed." in summary
@@ -772,7 +789,7 @@ def test_service_unsupported_kind_is_skipped_without_counters(settings, source_f
     assert result.path is None
     assert "images and videos" in result.message
     assert image.calls == [] and video.calls == []
-    assert service.statistics == PreviewStatistics(mode=MODE_ENABLED)
+    assert service.statistics == PreviewStatistics(mode=MODE_ENABLED, root=str(settings.root_path))
     assert service.statistics.has_problems is False
     assert status_record_for(result, digest_of("song")) is None
 
@@ -1170,6 +1187,7 @@ def test_service_cancellation_is_raised_even_when_storage_is_unavailable(setting
 def test_service_permission_error_from_generator_is_permission_stage(settings, source_file):
     image = FakeGenerator("image", error=PermissionError(errno.EACCES, "Permission denied"))
     service = make_service(settings, image=image, video=FakeGenerator("video"))
+    settings.root_path.mkdir(parents=True)  # the root itself stays healthy: one file was denied
 
     result = ensure(service, "image", digest_of("denied"), source=source_file)
     following = ensure(service, "image", digest_of("next"), source=source_file, relative_path="Photos/next.jpg")
@@ -1178,7 +1196,7 @@ def test_service_permission_error_from_generator_is_permission_stage(settings, s
     assert result.stage == STAGE_PERMISSION
     assert result.message == "Could not write preview."
     assert "Permission denied" in result.detail
-    assert service.statistics.storage_unavailable_reason is None, "permission is not a storage stage"
+    assert service.statistics.storage_unavailable_reason is None, "a denied file with a healthy root is not a storage failure"
     assert following.status == PREVIEW_FAILED, "generation is still attempted for the next file"
     assert len(image.calls) == 2
     assert service.statistics.image_failed == 2
@@ -1193,7 +1211,7 @@ def test_service_cancellation_from_generator_propagates_and_leaves_counters_unch
         ensure(service, "image", digest_of("cancelled"), source=source_file)
 
     assert len(image.calls) == 1
-    assert service.statistics == PreviewStatistics(mode=MODE_ENABLED)
+    assert service.statistics == PreviewStatistics(mode=MODE_ENABLED, root=str(settings.root_path))
     assert service.statistics.failures == []
 
 
@@ -1205,7 +1223,7 @@ def test_service_cancel_callback_before_generation_raises_without_calling_genera
         ensure(service, "image", digest_of("early"), source=source_file, cancel_callback=lambda: True)
 
     assert image.calls == []
-    assert service.statistics == PreviewStatistics(mode=MODE_ENABLED)
+    assert service.statistics == PreviewStatistics(mode=MODE_ENABLED, root=str(settings.root_path))
 
 
 @pytest.mark.parametrize("explicit_path", ["", "C:/missing/ffmpeg.exe"])
@@ -1794,3 +1812,163 @@ def test_status_record_for_ignores_a_non_sha256_source_hash():
     assert record["status"] == "failed"
     assert record["source_hash"] is None
     assert status_record_for(result, digest_of("real"))["source_hash"] == digest_of("real")
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups (spec §2, §3, §9, §15, §17)
+# ---------------------------------------------------------------------------
+
+
+def test_failure_summary_names_every_failed_check(settings):
+    calls: list = []
+    tools = fake_validation_tools(
+        calls,
+        backend=(False, "rawpy (LibRaw camera RAW) is not installed"),
+        capabilities=RuntimeError("ffmpeg crashed while reporting its version"),
+    )
+
+    report = validate_preview_configuration(settings, **tools)
+    summary = report.failure_summary()
+
+    assert [step.key for step in report.failures] == ["image-backend", "ffmpeg-version"]
+    assert summary.startswith("Offline previews could not be enabled.")
+    assert "Image preview backend failed." in summary
+    assert "rawpy (LibRaw camera RAW) is not installed" in summary
+    assert "FFmpeg version failed." in summary
+    assert "ffmpeg crashed while reporting its version" in summary
+
+
+def test_statistics_round_trip_hash_unavailable_count_and_root():
+    stats = PreviewStatistics(mode=MODE_ENABLED, hash_unavailable=2, root=r"E:\Previews", image_generated=1)
+
+    assert PreviewStatistics.from_dict(stats.as_dict()) == stats
+    text = stats.summary_text(stats.root)
+    assert "Images/videos not attempted because no SHA-256 could be recorded:" in text
+    assert "\n  2" in text
+    assert PreviewStatistics.from_dict({}).hash_unavailable == 0
+    assert PreviewStatistics.from_dict({}).root == ""
+
+
+def test_preview_report_message_covers_failures_regenerations_and_unhashed_files():
+    from jvvv.preview_service import preview_report_message
+
+    stats = PreviewStatistics(mode=MODE_ENABLED, image_failed=1, corrupt_replaced=2, hash_unavailable=1)
+
+    message = preview_report_message(stats)
+
+    assert message.startswith("Catalogue indexing succeeded, but 1 offline preview was not created.")
+    assert "2 existing previews failed validation and were regenerated." in message
+    assert "1 image/video file had no SHA-256 recorded, so no preview was attempted." in message
+    assert preview_report_message(PreviewStatistics(mode=MODE_ENABLED)) == ""
+    single = preview_report_message(PreviewStatistics(mode=MODE_ENABLED, corrupt_replaced=1))
+    assert single == "1 existing preview failed validation and was regenerated."
+
+
+def test_service_records_the_root_it_writes_to(settings):
+    service = make_service(settings, image=FakeGenerator("image"), video=FakeGenerator("video"))
+
+    assert service.statistics.root == str(settings.root_path)
+    assert PreviewStatistics.from_dict(service.statistics.as_dict()).root == str(settings.root_path)
+
+
+def test_service_forwards_the_hash_time_snapshot_to_the_generators(settings, source_file, jpeg_payload):
+    image = FakeGenerator("image", payload=jpeg_payload)
+    service = make_service(settings, image=image)
+    snapshot = os.lstat(source_file)
+
+    ensure(service, "image", digest_of("snap"), source=source_file, source_stat=snapshot)
+
+    assert image.calls[0].source_stat is snapshot
+
+
+def test_service_write_failure_with_a_vanished_root_stops_further_generation(settings, source_file):
+    """Spec §17: a root that disappeared mid-scan must not flood the report with identical failures."""
+
+    image = FakeGenerator(
+        "image",
+        error=PreviewError(STAGE_PERMISSION, "Could not write preview.", detail="[WinError 5] Access is denied"),
+    )
+    log: list[str] = []
+    service = make_service(settings, image=image, log=log)
+    assert not settings.root_path.exists()
+
+    first = ensure(service, "image", digest_of("one"), source=source_file, relative_path="Photos/one.jpg")
+    second = ensure(service, "image", digest_of("two"), source=source_file, relative_path="Photos/two.jpg")
+
+    assert first.status == PREVIEW_FAILED and first.stage == STAGE_PERMISSION
+    assert second.status == PREVIEW_SKIPPED_STORAGE
+    assert len(image.calls) == 1
+    assert service.statistics.image_failed == 1 and service.statistics.storage_skipped == 1
+    assert "does not exist" in (service.statistics.storage_unavailable_reason or "")
+    assert any("no longer writable" in line for line in log)
+
+
+def test_service_write_failure_with_a_healthy_root_does_not_stop_generation(settings, source_file, jpeg_payload):
+    settings.root_path.mkdir(parents=True)
+    failing = FakeGenerator(
+        "image",
+        error=PreviewError(STAGE_IMAGE_ENCODE, "Could not write preview.", detail="encoder error -2"),
+    )
+    service = make_service(settings, image=failing)
+
+    first = ensure(service, "image", digest_of("one"), source=source_file, relative_path="Photos/one.jpg")
+    second = ensure(service, "image", digest_of("two"), source=source_file, relative_path="Photos/two.jpg")
+
+    assert first.status == second.status == PREVIEW_FAILED
+    assert len(failing.calls) == 2
+    assert service.statistics.storage_unavailable_reason is None
+    assert service.statistics.storage_skipped == 0
+    assert temporaries_under(settings.root_path) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters are a Windows concept")
+def test_service_with_an_unreachable_drive_stops_after_the_first_real_os_error(tmp_path):
+    used = {drive[0].upper() for drive in os.listdrives()}
+    free = next((letter for letter in "QRSTUVWXYZ" if letter not in used), None)
+    if free is None:
+        pytest.skip("every candidate drive letter is in use")
+    settings = PreviewSettings(enabled=True, root_directory=f"{free}:\\jvvv-previews")
+    service = PreviewService(settings, ffmpeg_path=FAKE_FFMPEG)  # real image generator
+    first_source = write_test_image(tmp_path / "one.png", 32, 24, "png")
+    second_source = write_test_image(tmp_path / "two.png", 32, 24, "png")
+
+    first = ensure(service, "image", digest_of("one"), source=first_source, relative_path="one.png")
+    second = ensure(service, "image", digest_of("two"), source=second_source, relative_path="two.png")
+
+    assert first.status == PREVIEW_FAILED and first.stage == STAGE_PREVIEW_ROOT
+    assert "[WinError" in (first.detail or "")
+    assert second.status == PREVIEW_SKIPPED_STORAGE
+    assert service.statistics.image_failed == 1 and service.statistics.storage_skipped == 1
+    assert "[WinError" in (service.statistics.storage_unavailable_reason or "")
+
+
+def test_inspect_preview_file_validates_once_per_file_identity(settings, monkeypatch):
+    cache = PreviewCache(settings.root_path, settings.image, settings.video)
+    digest = digest_of("cached")
+    path = cache.preview_path("image", digest)
+    cache.ensure_parent(path)
+    write_test_image(path, 40, 30, "jpeg")
+    calls: list[Path] = []
+    real_validate = service_module.validate_image_preview
+
+    def counting_validate(target):
+        calls.append(Path(target))
+        return real_validate(target)
+
+    monkeypatch.setattr(service_module, "validate_image_preview", counting_validate)
+    service_module._validated_preview.cache_clear()
+
+    first = inspect_preview_file(settings, "image", digest)
+    second = inspect_preview_file(settings, "image", digest)
+    assert first is not None and first.valid and second is not None and second.valid
+    assert len(calls) == 1, "the same unchanged file is validated once"
+
+    write_test_image(path, 60, 40, "jpeg")  # replaced on disk: size differs -> re-validated
+    third = inspect_preview_file(settings, "image", digest)
+    assert third is not None and (third.width, third.height) == (60, 40)
+    assert len(calls) == 2
+
+    path.write_bytes(b"corrupt" * 100)
+    fourth = inspect_preview_file(settings, "image", digest)
+    assert fourth is not None and fourth.exists and fourth.valid is False
+    assert len(calls) == 3

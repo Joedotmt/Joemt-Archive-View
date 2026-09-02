@@ -3138,7 +3138,7 @@ class BackupAnalysisEngine:
                 SELECT sh.*,
                        ROW_NUMBER() OVER (PARTITION BY volume_id ORDER BY id DESC) AS rank
                 FROM scan_history sh
-                WHERE status = 'completed'
+                WHERE status IN ('completed', 'completed_with_warnings')
             )
             SELECT v.id AS volume_id, COALESCE(r.drive_id, '') AS drive_id,
                    v.name AS volume_name, v.indexed_file_count, v.indexed_folder_count,
