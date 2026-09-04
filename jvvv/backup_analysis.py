@@ -33,6 +33,150 @@ IGNORED_COPY_METADATA_NAMES = {
     "wpsettings.dat",
 }
 
+# Evidence prose is persisted per analysis run. Keep these strings stable:
+# the UI derives a short reason label from the exact text (see
+# folder_reason_key / file_reason_key), so rewording here would orphan every
+# saved analysis until it is re-run.
+FOLDER_EVIDENCE_EXCLUDED = (
+    "This folder contains only known operating-system metadata, "
+    "which is excluded from copy coverage."
+)
+FOLDER_EVIDENCE_EMPTY = "The saved catalogue contains no files in this folder."
+FOLDER_EVIDENCE_UNKNOWN_SCAN = (
+    "The folder is empty in the catalogue, but the latest successful scan is "
+    "missing or reported access errors."
+)
+FOLDER_EVIDENCE_TRUSTED_HASHED = (
+    "A complete hash-aware structure matches on another drive: exact "
+    "SHA-256 content hashes, descendant filenames, and the content-bearing "
+    "folder layout all match. The folder name also matches. Known "
+    "operating-system metadata is excluded."
+)
+FOLDER_EVIDENCE_TRUSTED_LEGACY = (
+    "A complete metadata structure matches on another drive: at least "
+    "two content-file names and exact sizes plus the content-bearing "
+    "folder layout. These legacy records do not contain saved hashes. "
+    "The folder name also matches. Known operating-system metadata is "
+    "excluded."
+)
+FOLDER_EVIDENCE_SUPPRESSED_SUFFIX = (
+    " Additional repeated structures were suppressed because they "
+    "could not be paired without reusing a target folder."
+)
+FOLDER_EVIDENCE_MIXED_HASH = (
+    "The content-bearing structure matches, but only some descendant "
+    "records have comparable saved hashes. Mixed hash and legacy "
+    "evidence remains possible rather than being labelled complete."
+)
+FOLDER_EVIDENCE_UNTRUSTED_AND_RENAMED = (
+    "A content-bearing subtree matches structurally on other drives, "
+    "but some folder names differ and at least one exact-name pair has "
+    "an incomplete or error-bearing scan. This remains possible evidence."
+)
+FOLDER_EVIDENCE_UNTRUSTED_SCAN = (
+    "The saved folder name and content-bearing structure match, but at "
+    "least one applied scan has access errors or no trustworthy "
+    "denominator, so the result is not labelled complete."
+)
+FOLDER_EVIDENCE_RENAMED = (
+    "The content-bearing subtree has the same descendant names, exact "
+    "sizes, and layout, but the folder's own name differs. This is "
+    "possible evidence, not a complete folder match. Known "
+    "operating-system metadata is excluded."
+)
+FOLDER_EVIDENCE_COVERAGE = (
+    "Candidate descendant hash or filename-and-size matches were counted "
+    "on the best single other drive; a complete hash-aware folder structure "
+    "was not found."
+)
+FOLDER_EVIDENCE_AMBIGUOUS = (
+    "One or more descendant candidates are too common or compete with "
+    "repeated records, so the saved metadata cannot identify a useful "
+    "folder copy without creating misleading links."
+)
+FOLDER_EVIDENCE_SINGLE = (
+    "No descendant metadata match was found on another drive in this catalogue."
+)
+
+FILE_EVIDENCE_HASH_VERIFIED = "An exact SHA-256 content hash matches on another drive."
+FILE_EVIDENCE_HASH_VERIFIED_EXTRA_DRIVES = (
+    " Additional drives have metadata-only evidence because a "
+    "comparable saved hash was unavailable there."
+)
+FILE_EVIDENCE_PAIRED_SUFFIX = " Repeated records are paired one-to-one per drive."
+FILE_EVIDENCE_METADATA_LIKELY = (
+    "A comparable saved content hash was unavailable for at least one "
+    "record. Normalized filename, exact size, modified time, and parent "
+    "path match; repeated records are paired one-to-one per drive."
+)
+FILE_EVIDENCE_NAME_SIZE_ONLY = (
+    "Normalized filename and exact size match; parent path or modified "
+    "time differs or is unavailable. Repeated records are paired "
+    "one-to-one per drive for coverage."
+)
+FILE_EVIDENCE_HASH_CONFLICT = (
+    "Comparable SHA-256 content hashes differ even though the filename "
+    "and size metadata match. The records are not treated as copies."
+)
+FILE_EVIDENCE_COMPETING = (
+    "Several records on these drives share the same normalized filename "
+    "and exact size. The saved metadata cannot identify which repeated "
+    "item corresponds, so no arbitrary one-to-one copy is claimed."
+)
+FILE_EVIDENCE_REPETITIVE_HASH = (
+    "Exact hashed content occurs too repetitively to map safely to an "
+    "individual catalogue record. No arbitrary target is claimed."
+)
+FILE_EVIDENCE_TOO_COMMON_PREFIX = (
+    "The normalized filename-and-size combination is too common to "
+    "identify a useful copy:"
+)
+ITEM_EVIDENCE_MISSING = "This catalogue record is marked missing."
+
+_FOLDER_REASON_KEYS = {
+    FOLDER_EVIDENCE_EXCLUDED: "excluded",
+    FOLDER_EVIDENCE_EMPTY: "empty",
+    FOLDER_EVIDENCE_UNKNOWN_SCAN: "unknown_scan",
+    FOLDER_EVIDENCE_TRUSTED_HASHED: "trusted_hashed",
+    FOLDER_EVIDENCE_TRUSTED_LEGACY: "trusted_legacy",
+    FOLDER_EVIDENCE_MIXED_HASH: "mixed_hash",
+    FOLDER_EVIDENCE_UNTRUSTED_AND_RENAMED: "untrusted_and_renamed",
+    FOLDER_EVIDENCE_UNTRUSTED_SCAN: "untrusted_scan",
+    FOLDER_EVIDENCE_RENAMED: "renamed",
+    FOLDER_EVIDENCE_COVERAGE: "coverage",
+    FOLDER_EVIDENCE_AMBIGUOUS: "ambiguous",
+    FOLDER_EVIDENCE_SINGLE: "single",
+}
+_FILE_REASON_KEYS = {
+    FILE_EVIDENCE_METADATA_LIKELY: "metadata_likely",
+    FILE_EVIDENCE_NAME_SIZE_ONLY: "name_size_only",
+    FILE_EVIDENCE_HASH_CONFLICT: "hash_conflict",
+    FILE_EVIDENCE_COMPETING: "competing",
+    FILE_EVIDENCE_REPETITIVE_HASH: "repetitive_hash",
+}
+
+
+def folder_reason_key(evidence_text: str | None) -> str:
+    """Map saved folder evidence prose to a stable short key ('' if unknown)."""
+    text = str(evidence_text or "").strip()
+    if not text:
+        return ""
+    if text.endswith(FOLDER_EVIDENCE_SUPPRESSED_SUFFIX):
+        text = text[: -len(FOLDER_EVIDENCE_SUPPRESSED_SUFFIX)]
+    return _FOLDER_REASON_KEYS.get(text, "")
+
+
+def file_reason_key(evidence_text: str | None) -> str:
+    """Map saved file evidence prose to a stable short key ('' if unknown)."""
+    text = str(evidence_text or "").strip()
+    if not text:
+        return ""
+    if text.startswith(FILE_EVIDENCE_HASH_VERIFIED):
+        return "hash_verified"
+    if text.startswith(FILE_EVIDENCE_TOO_COMMON_PREFIX):
+        return "too_common"
+    return _FILE_REASON_KEYS.get(text, "")
+
 
 ANALYSIS_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "backup_analysis_runs": (
@@ -1586,59 +1730,35 @@ class BackupAnalysisEngine:
                 if verified_targets:
                     status = "likely"
                     reported_volumes = sorted(set(likely_targets) | set(possible_targets))
-                    evidence = (
-                        "An exact SHA-256 content hash matches on another drive."
-                    )
+                    evidence = FILE_EVIDENCE_HASH_VERIFIED
                     if metadata_likely_targets - verified_targets or possible_targets:
-                        evidence += (
-                            " Additional drives have metadata-only evidence because a "
-                            "comparable saved hash was unavailable there."
-                        )
-                    evidence += " Repeated records are paired one-to-one per drive."
+                        evidence += FILE_EVIDENCE_HASH_VERIFIED_EXTRA_DRIVES
+                    evidence += FILE_EVIDENCE_PAIRED_SUFFIX
                 elif likely_targets:
                     status = "likely"
                     reported_volumes = sorted(set(likely_targets) | set(possible_targets))
-                    evidence = (
-                        "A comparable saved content hash was unavailable for at least one "
-                        "record. Normalized filename, exact size, modified time, and parent "
-                        "path match; repeated records are paired one-to-one per drive."
-                    )
+                    evidence = FILE_EVIDENCE_METADATA_LIKELY
                 elif possible_targets:
                     status = "possible"
                     reported_volumes = possible_targets
-                    evidence = (
-                        "Normalized filename and exact size match; parent path or modified "
-                        "time differs or is unavailable. Repeated records are paired "
-                        "one-to-one per drive for coverage."
-                    )
+                    evidence = FILE_EVIDENCE_NAME_SIZE_ONLY
                 elif file_id in hash_conflicts:
                     status = "ambiguous"
                     reported_volumes = []
-                    evidence = (
-                        "Comparable SHA-256 content hashes differ even though the filename "
-                        "and size metadata match. The records are not treated as copies."
-                    )
+                    evidence = FILE_EVIDENCE_HASH_CONFLICT
                 elif file_id in competing:
                     status = "ambiguous"
                     reported_volumes = []
-                    evidence = (
-                        "Several records on these drives share the same normalized filename "
-                        "and exact size. The saved metadata cannot identify which repeated "
-                        "item corresponds, so no arbitrary one-to-one copy is claimed."
-                    )
+                    evidence = FILE_EVIDENCE_COMPETING
                 elif str(member["existing_status"] or "") == "ambiguous":
                     status = "ambiguous"
                     reported_volumes = []
-                    evidence = (
-                        "Exact hashed content occurs too repetitively to map safely to an "
-                        "individual catalogue record. No arbitrary target is claimed."
-                    )
+                    evidence = FILE_EVIDENCE_REPETITIVE_HASH
                 elif ambiguous_group:
                     status = "ambiguous"
                     reported_volumes = []
                     evidence = (
-                        "The normalized filename-and-size combination is too common to "
-                        f"identify a useful copy: {group_records:,} records across "
+                        f"{FILE_EVIDENCE_TOO_COMMON_PREFIX} {group_records:,} records across "
                         f"{group_volumes:,} drives. Weak matches are excluded from folder "
                         "and drive-copy coverage; bounded exact path-and-time matches can "
                         "still be used."
@@ -2103,16 +2223,13 @@ class BackupAnalysisEngine:
             if total_files == 0:
                 if indexed_files > 0:
                     status = "excluded"
-                    evidence = (
-                        "This folder contains only known operating-system metadata, "
-                        "which is excluded from copy coverage."
-                    )
+                    evidence = FOLDER_EVIDENCE_EXCLUDED
                 elif health_by_volume.get(volume_id) in {"completed", "empty"}:
                     status = "empty"
-                    evidence = "The saved catalogue contains no files in this folder."
+                    evidence = FOLDER_EVIDENCE_EMPTY
                 else:
                     status = "unknown"
-                    evidence = "The folder is empty in the catalogue, but the latest successful scan is missing or reported access errors."
+                    evidence = FOLDER_EVIDENCE_UNKNOWN_SCAN
                 other_ids: list[int] = []
                 best_target = None
                 matched_files = matched_bytes = 0
@@ -2121,25 +2238,11 @@ class BackupAnalysisEngine:
             elif trusted_exact_targets:
                 status = "likely"
                 if hashed_files == total_files:
-                    evidence = (
-                        "A complete hash-aware structure matches on another drive: exact "
-                        "SHA-256 content hashes, descendant filenames, and the content-bearing "
-                        "folder layout all match. The folder name also matches. Known "
-                        "operating-system metadata is excluded."
-                    )
+                    evidence = FOLDER_EVIDENCE_TRUSTED_HASHED
                 else:
-                    evidence = (
-                        "A complete metadata structure matches on another drive: at least "
-                        "two content-file names and exact sizes plus the content-bearing "
-                        "folder layout. These legacy records do not contain saved hashes. "
-                        "The folder name also matches. Known operating-system metadata is "
-                        "excluded."
-                    )
+                    evidence = FOLDER_EVIDENCE_TRUSTED_LEGACY
                 if folder_id in ambiguous_structure_folders:
-                    evidence += (
-                        " Additional repeated structures were suppressed because they "
-                        "could not be paired without reusing a target folder."
-                    )
+                    evidence += FOLDER_EVIDENCE_SUPPRESSED_SUFFIX
                 other_ids = sorted(
                     set(folder_coverage)
                     | set(all_exact_targets)
@@ -2153,30 +2256,13 @@ class BackupAnalysisEngine:
             elif renamed_targets or untrusted_exact_targets:
                 status = "possible"
                 if mixed_hash_structure:
-                    evidence = (
-                        "The content-bearing structure matches, but only some descendant "
-                        "records have comparable saved hashes. Mixed hash and legacy "
-                        "evidence remains possible rather than being labelled complete."
-                    )
+                    evidence = FOLDER_EVIDENCE_MIXED_HASH
                 elif untrusted_exact_targets and renamed_targets:
-                    evidence = (
-                        "A content-bearing subtree matches structurally on other drives, "
-                        "but some folder names differ and at least one exact-name pair has "
-                        "an incomplete or error-bearing scan. This remains possible evidence."
-                    )
+                    evidence = FOLDER_EVIDENCE_UNTRUSTED_AND_RENAMED
                 elif untrusted_exact_targets:
-                    evidence = (
-                        "The saved folder name and content-bearing structure match, but at "
-                        "least one applied scan has access errors or no trustworthy "
-                        "denominator, so the result is not labelled complete."
-                    )
+                    evidence = FOLDER_EVIDENCE_UNTRUSTED_SCAN
                 else:
-                    evidence = (
-                        "The content-bearing subtree has the same descendant names, exact "
-                        "sizes, and layout, but the folder's own name differs. This is "
-                        "possible evidence, not a complete folder match. Known "
-                        "operating-system metadata is excluded."
-                    )
+                    evidence = FOLDER_EVIDENCE_RENAMED
                 possible_structure_targets = sorted(
                     set(renamed_targets) | set(untrusted_exact_targets)
                 )
@@ -2202,22 +2288,14 @@ class BackupAnalysisEngine:
                 status = "possible"
                 other_ids = sorted(folder_coverage)
                 scattered = int(union[0] >= total_files and matched_files < total_files)
-                evidence = (
-                    "Candidate descendant hash or filename-and-size matches were counted "
-                    "on the best single other drive; a complete hash-aware folder structure "
-                    "was not found."
-                )
+                evidence = FOLDER_EVIDENCE_COVERAGE
             elif (
                 fingerprints[folder_id] in ambiguous_structure_fingerprints
                 or folder_id in ambiguous_structure_folders
                 or ambiguous_descendants > 0
             ):
                 status = "ambiguous"
-                evidence = (
-                    "One or more descendant candidates are too common or compete with "
-                    "repeated records, so the saved metadata cannot identify a useful "
-                    "folder copy without creating misleading links."
-                )
+                evidence = FOLDER_EVIDENCE_AMBIGUOUS
                 other_ids = []
                 best_target = None
                 matched_files = matched_bytes = 0
@@ -2225,7 +2303,7 @@ class BackupAnalysisEngine:
                 scattered = 0
             else:
                 status = "single"
-                evidence = "No descendant metadata match was found on another drive in this catalogue."
+                evidence = FOLDER_EVIDENCE_SINGLE
                 other_ids = []
                 best_target = None
                 matched_files = matched_bytes = 0
@@ -2827,7 +2905,7 @@ class BackupAnalysisEngine:
                     verified_ids: tuple[int, ...] = ()
                 elif bool(item["missing"]):
                     status = "unknown"
-                    evidence = "This catalogue record is marked missing."
+                    evidence = ITEM_EVIDENCE_MISSING
                     other_ids = ()
                     strong_ids = ()
                     possible_ids = ()

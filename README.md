@@ -36,13 +36,18 @@ JVVV. There is no server or cloud component.
   available.
 - Analyse saved catalogue hashes and metadata for evidence that files and folders
   also exist on other registered drives, without reconnecting or rescanning them.
-- Show explicit **Hash verified**, **Strong metadata**, **Possible/Partial**,
-  **None found**, and
-  **Unknown/Outdated** copy-evidence states with the matching drive IDs and the
-  exact metadata used for each conclusion.
+- Show explicit copy-evidence states that say what matched rather than how
+  confident the tool feels: **Full match (hashed / no hashes)** for whole
+  folders; **Hash verified**, **Metadata match (no hash)**, and **Name and size
+  only** for files; **Not confirmed · <reason>** and **Partial** for folders
+  that are held back; **Content differs** for same-name files whose hashes
+  disagree; **No copy found**; and **Not analysed / Outdated / Can't tell**.
+  Each label carries the matching drive IDs, a plain-language "Why", and the
+  exact metadata used for the conclusion.
 - Report per-volume other-copy coverage, potential whole-drive copies, and the
   latest scan health. Successfully scanned empty drives are shown as
-  **Empty / N/A**, not as unprotected or unhealthy.
+  **N/A · empty** (and drives holding only system files as **N/A · system files
+  only**), not as unprotected or unhealthy.
 - Keep expected protected Windows metadata warnings (such as
   `System Volume Information`) visible in the scan report without treating
   them as missing user content.
@@ -140,16 +145,25 @@ the files have different names, paths, or timestamps. Re-run the analysis when
 the application marks its results as outdated after catalogue contents change.
 
 The labels are deliberately conservative and explain their evidence in the
-interface. When one of the two records has no comparable hash, **Strong
-metadata** requires the normalized filename, exact byte size, modified time,
-and parent path to agree; **Possible** means only normalized filename and exact
-size agree. Two comparable but different hashes are never treated as a metadata
-match. A folder is **Complete** only when a bounded, same-named, hash-aware
-structure containing at least two content files matches on one other drive and
-both scan denominators are trustworthy. Mixed hashed/legacy, renamed, or partial
-structures remain Possible. Overly repetitive hashes or metadata are shown as
-**Too common** rather than being guessed, and known operating-system bookkeeping
-is excluded from coverage.
+interface. When one of the two records has no comparable hash, **Metadata match
+(no hash)** requires the normalized filename, exact byte size, modified time,
+and parent path to agree; **Name and size only** means only normalized filename
+and exact size agree and is a lead, not a copy. Two comparable but different
+hashes are shown as **Content differs**, never as a match. A folder is a
+**Full match** only when a bounded, same-named, hash-aware structure containing
+at least two content files matches on one other drive and both scan
+denominators are trustworthy; the label adds **(hashed)** or **(no hashes)** so
+it is always clear whether file contents or only names and sizes were compared.
+Folders that match but are held back are labelled **Not confirmed** with the
+reason in the cell (a scan had errors, different folder name there, some files
+lack saved hashes, single-file folder, or files found one by one); folders with
+only part of their contents elsewhere are **Partial** with percentages that never
+round up, so 100% appears only when every file was found. Each folder is judged
+on its own and never rolled up from its subfolders, which is why a parent can be
+Not confirmed while every subfolder inside it is a Full match; the status strip
+above the file list states this for the open folder. Overly repetitive hashes or
+metadata are shown as **Too common** rather than being guessed, and known
+operating-system bookkeeping is excluded from coverage.
 
 While a scan is running, use **Cancel Scan** beside the progress bar to cancel
 it. Partial results are discarded, so the existing catalogue remains intact.

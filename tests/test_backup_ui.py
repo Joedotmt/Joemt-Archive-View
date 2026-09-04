@@ -36,7 +36,7 @@ def test_item_copy_evidence_uses_words_and_explains_metadata_limit():
     display = item_backup_display(status, {2: "AID-002 - Offsite"})
 
     assert display.state == "strong"
-    assert display.text == "Strong metadata · 1 other drive"
+    assert display.text == "Metadata match (no hash) · 1 other drive"
     assert "AID-002 - Offsite" in display.tooltip
     assert "same relative path" in display.tooltip
     assert BACKUP_METADATA_DISCLAIMER in display.tooltip
@@ -59,7 +59,7 @@ def test_partial_folder_says_best_single_drive_and_scattered_is_not_green():
     display = item_backup_display(status, {2: "AID-002", 3: "AID-003"})
 
     assert display.state == "possible"
-    assert display.text == "Possible · 50% files · 50% data"
+    assert display.text == "Partial · spread over 2 drives"
     assert "spread across drives" in display.tooltip
     assert "Best single matching drive: AID-002" in display.tooltip
     assert "Best single-drive file coverage: 50%" in display.tooltip
@@ -85,7 +85,7 @@ def test_common_and_system_metadata_states_are_explicitly_grey():
     assert "too common" in common.tooltip.casefold()
     assert (excluded.state, excluded.text) == (
         "unknown",
-        "N/A · system metadata",
+        "N/A · system files only",
     )
     assert "excluded" in excluded.tooltip.casefold()
 
@@ -105,9 +105,9 @@ def test_complete_folder_distinguishes_complete_and_partial_drives():
         {2: "AID-002", 3: "AID-003"},
     )
 
-    assert display.text == "Complete · 1 other drive"
-    assert "Complete structure drives: AID-002" in display.tooltip
-    assert "Possible or partial drives: AID-003" in display.tooltip
+    assert display.text == "Full match · 1 other drive"
+    assert "Full-match drives: AID-002" in display.tooltip
+    assert "Not confirmed or partial drives: AID-003" in display.tooltip
 
 
 def test_strong_file_distinguishes_strong_and_possible_only_drives():
@@ -125,9 +125,9 @@ def test_strong_file_distinguishes_strong_and_possible_only_drives():
         {2: "AID-002", 3: "AID-003"},
     )
 
-    assert display.text == "Strong metadata · 1 other drive"
-    assert "Strong metadata-only drives: AID-002" in display.tooltip
-    assert "Possible-only drives: AID-003" in display.tooltip
+    assert display.text == "Metadata match (no hash) · 1 other drive"
+    assert "Metadata-only drives (no hash): AID-002" in display.tooltip
+    assert "Name-and-size-only drives: AID-003" in display.tooltip
 
 
 def test_single_catalogue_copy_is_red_but_stale_evidence_is_grey():
@@ -140,8 +140,8 @@ def test_single_catalogue_copy_is_red_but_stale_evidence_is_grey():
         )
     )
 
-    assert (single.state, single.text) == ("none", "None found")
-    assert (stale.state, stale.text) == ("unknown", "Outdated")
+    assert (single.state, single.text) == ("none", "No copy found")
+    assert (stale.state, stale.text) == ("unknown", "Outdated · re-run analysis")
     assert backup_filter_matches(single, "attention")
     assert backup_filter_matches(stale, "unknown")
 
@@ -161,9 +161,9 @@ def test_stale_tooltip_qualifies_old_targets_and_reports_omitted_drives():
         references,
     )
 
-    assert display.text == "Outdated"
-    assert "Last-analysed strong metadata-only drives:" in display.tooltip
-    assert "Last-analysed possible-only drives:" in display.tooltip
+    assert display.text == "Outdated · re-run analysis"
+    assert "Last-analysed metadata-only drives (no hash):" in display.tooltip
+    assert "Last-analysed name-and-size-only drives:" in display.tooltip
     assert display.tooltip.count("(+1 more)") == 2
     assert "Last-analysed evidence:" in display.tooltip
 
@@ -187,7 +187,7 @@ def test_browser_other_copy_column_has_header_and_row_explanations():
         Qt.Orientation.Horizontal,
         Qt.ItemDataRole.ToolTipRole,
     )
-    assert model.data(model.index(0, 1)) == "None found"
+    assert model.data(model.index(0, 1)) == "No copy found"
     assert "No matching copy" in model.data(
         model.index(0, 1),
         Qt.ItemDataRole.ToolTipRole,
@@ -276,8 +276,8 @@ def test_hash_verified_file_is_distinct_from_metadata_only_targets():
 
     assert display.text == "Hash verified · 1 other drive"
     assert "Hash-verified drives: HASH" in display.tooltip
-    assert "Strong metadata-only drives: META" in display.tooltip
-    assert "Possible-only drives: POSSIBLE" in display.tooltip
+    assert "Metadata-only drives (no hash): META" in display.tooltip
+    assert "Name-and-size-only drives: POSSIBLE" in display.tooltip
 
 
 def test_browser_attention_filter_keeps_parent_navigation_entry():
@@ -512,8 +512,8 @@ def test_backup_report_marks_all_persisted_rows_outdated(monkeypatch):
     )
 
     assert dialog.volume_table.item(0, 6).text() == "Outdated"
-    assert dialog.volume_table.item(0, 8).text() == "Outdated"
-    assert dialog.mirror_table.item(0, 4).text() == "Outdated"
+    assert dialog.volume_table.item(0, 8).text() == "Outdated · re-run analysis"
+    assert dialog.mirror_table.item(0, 4).text() == "Outdated · re-run analysis"
     assert dialog.mirror_table.item(0, 5).text().startswith("OUTDATED")
     assert "last completed analysis" in dialog.analysis_summary_label.text()
     assert app is not None

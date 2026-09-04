@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 import os
 import re
 import sqlite3
@@ -35,7 +36,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPalette, QPixmap, QPolygon, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPalette, QPen, QPixmap, QPolygon, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -79,7 +80,12 @@ from PySide6.QtWidgets import (
 )
 
 from .config import APP_NAME
-from .backup_analysis import BackupAnalysisEngine
+from .backup_analysis import (
+    ITEM_EVIDENCE_MISSING,
+    BackupAnalysisEngine,
+    file_reason_key,
+    folder_reason_key,
+)
 from .catalogue_backup import (
     BACKUP_FILE_FILTER,
     BackupCancelled,
@@ -549,19 +555,35 @@ BACKUP_METADATA_DISCLAIMER = (
     "Hash-verified means full-file SHA-256 values recorded during scans match; "
     "metadata-only matches are not byte-for-byte verification."
 )
+BACKUP_FOLDER_RULE_SENTENCE = (
+    "Each folder is judged on its own, so subfolders can show Full match while "
+    "this folder does not."
+)
 BACKUP_COLUMN_HEADER_TOOLTIP = (
-    "Evidence that another catalogue volume contains the same item.\n"
-    "Green: matching SHA-256 or strong metadata evidence. Amber: possible or partial match. "
-    "Red: none found. Grey: not analysed, outdated, or unknown.\n\n"
+    "Whether another catalogue drive holds a copy of this item, judged from the "
+    "saved catalogue.\n"
+    "Green: Full match (the whole folder) or a matching file. Amber: not confirmed, "
+    "partial, name-and-size only, or content differs. Red: no copy found. Grey: not "
+    "analysed, outdated, or can't tell.\n"
+    "Green does not always mean hashes were compared: the label says whether the "
+    "match used saved hashes or only names and sizes.\n"
+    f"{BACKUP_FOLDER_RULE_SENTENCE}\n\n"
+    f"{BACKUP_METADATA_DISCLAIMER}"
+)
+BACKUP_VOLUME_COVERAGE_TOOLTIP = (
+    "The share of this drive's indexed files and bytes with a hash-verified or "
+    "metadata match (name, size, modified time and path) on another catalogue "
+    "drive. This is stricter than the per-folder figure, which also counts "
+    "name-and-size-only matches. Empty drives are N/A.\n\n"
     f"{BACKUP_METADATA_DISCLAIMER}"
 )
 BACKUP_FILTER_OPTIONS = (
     ("All items", "all"),
     ("Needs attention", "attention"),
-    ("No other copy found", "none"),
-    ("Possible or partial", "possible"),
-    ("Hash verified, strong, or complete", "strong"),
-    ("Unknown / not analysed", "unknown"),
+    ("No copy found", "none"),
+    ("Not confirmed, partial, name and size only, or content differs", "possible"),
+    ("Full match, hash verified, or metadata match", "strong"),
+    ("Not analysed, outdated, or can't tell", "unknown"),
 )
 
 
@@ -588,6 +610,11 @@ class BackupDisplay:
     text: str
     tooltip: str
     sort_rank: int
+    # Secondary sort key inside a colour band: 0.0 = nothing found, 1.0 = all
+    # found, so amber rows order thinnest-first.
+    coverage_fraction: float = 1.0
+    # Short engine reason key ('' when the saved evidence is not recognised).
+    reason: str = ""
 
 
 NOT_ANALYSED_BACKUP_DISPLAY = BackupDisplay(
@@ -632,6 +659,76 @@ def backup_evidence_label(label: str, stale: bool) -> str:
     return f"Last-analysed {label[:1].lower()}{label[1:]}"
 
 
+def coverage_percent_text(matched: Any, total: Any, percent: Any = None) -> str | None:
+    """Format coverage so "100%" is only ever printed for an exact full count.
+
+    Exact counts win; a stored percentage is the fallback when counts are not
+    available. Values are floored to one decimal, never rounded up, so a folder
+    missing one file reads 99.9%, not 100%.
+    """
+    try:
+        matched_value = None if matched is None else int(matched)
+        total_value = None if total is None else int(total)
+    except (TypeError, ValueError):
+        matched_value = total_value = None
+    if total_value and total_value > 0 and matched_value is not None:
+        if matched_value >= total_value:
+            return "100%"
+        value = matched_value * 100.0 / total_value
+    elif percent is not None:
+        try:
+            value = float(percent)
+        except (TypeError, ValueError):
+            return None
+        if value >= 100:
+            return "100%"
+    else:
+        return None
+    value = max(0.0, min(value, 99.9))
+    if 0 < value < 0.1:
+        return "<0.1%"
+    floored = math.floor(value * 10) / 10
+    if floored == int(floored):
+        return f"{int(floored)}%"
+    return f"{floored:.1f}%"
+
+
+# Folder reasons the engine records when a structure matched but is withheld
+# from Full match: (cell suffix, plain "why" sentence, what would confirm it).
+FOLDER_REASON_LABELS: dict[str, tuple[str, str, str | None]] = {
+    "mixed_hash": (
+        "some files lack saved hashes",
+        "The folder name, layout, file names and sizes all match on the other "
+        "drive, but only some files have saved hashes to compare, so the analysis "
+        "holds back from Full match.",
+        "A fresh scan of both drives that records hashes for every file.",
+    ),
+    "untrusted_scan": (
+        "a scan had errors",
+        "The folder name and structure match on the other drive, but the last scan "
+        "of one of the two drives reported access errors or did not finish, so its "
+        "listing may be incomplete.",
+        "A clean, complete re-scan of the drive whose scan had errors.",
+    ),
+    "untrusted_and_renamed": (
+        "scan had errors, name differs",
+        "The structure matches on more than one drive, but one copy is named "
+        "differently there and one scan had errors.",
+        "A clean, complete re-scan of the drive whose scan had errors.",
+    ),
+    "renamed": (
+        "different folder name there",
+        "The same files, sizes and layout exist on the other drive, but the folder "
+        "itself is named differently there.",
+        None,
+    ),
+}
+COVERAGE_ONE_WAY_CAVEAT = (
+    "Files were matched one by one, so this does not say whether the other "
+    "drive's folder also holds items that are not here."
+)
+
+
 def item_backup_display(
     status: Any,
     volume_references: dict[int, str] | None = None,
@@ -646,6 +743,7 @@ def item_backup_display(
     stale_reason = str(object_value(status, "stale_reason", "") or "").strip()
     raw_state = enum_value(object_value(status, "status", "unknown"))
     resolved_type = item_type or str(object_value(status, "item_type", "") or "")
+    is_folder = resolved_type == "folder"
     other_ids = object_value(status, "other_volume_ids", ()) or ()
     other_count = int(object_value(status, "other_drive_count", len(other_ids)) or 0)
     drive_refs = backup_drive_references(other_ids, references)
@@ -670,131 +768,276 @@ def item_backup_display(
     possible_refs = backup_drive_references(possible_ids or (), references)
     evidence = str(object_value(status, "evidence_text", "") or "").strip()
     analysed_at = object_value(status, "analysed_at")
+    reason = folder_reason_key(evidence) if is_folder else file_reason_key(evidence)
+
+    matched_files = object_value(status, "matched_files")
+    total_files = object_value(status, "total_files")
+    matched_bytes = object_value(status, "matched_bytes")
+    total_bytes = object_value(status, "total_bytes")
+    files_percent = object_value(status, "best_coverage_files_percent")
+    bytes_percent = object_value(status, "best_coverage_bytes_percent")
+    files_text = coverage_percent_text(matched_files, total_files, files_percent)
+    bytes_text = coverage_percent_text(matched_bytes, total_bytes, bytes_percent)
+    try:
+        total_count = int(total_files or 0)
+        matched_count = int(matched_files or 0)
+    except (TypeError, ValueError):
+        total_count = matched_count = 0
+    if total_count > 0:
+        coverage_fraction = min(1.0, matched_count / total_count)
+    elif files_percent is not None:
+        try:
+            coverage_fraction = max(0.0, min(1.0, float(files_percent) / 100.0))
+        except (TypeError, ValueError):
+            coverage_fraction = 1.0
+    else:
+        coverage_fraction = 1.0
+    scattered = bool(object_value(status, "scattered", False))
+    best_target_name = None
+    best_target_id = object_value(status, "best_target_volume_id")
+    if best_target_id is not None:
+        try:
+            best_target_name = references.get(
+                int(best_target_id), f"Volume {int(best_target_id)}"
+            )
+        except (TypeError, ValueError):
+            best_target_name = None
+    where = f" on {best_target_name}" if best_target_name else " on the best single drive"
+    confirm: str | None = None
+    show_coverage_lines = False
 
     if stale:
         lines = [
             "The saved backup analysis is out of date for this item.",
             stale_reason or "The catalogue changed after this item was analysed.",
+            "Re-run the backup analysis to refresh it.",
         ]
         state = "unknown"
-        text = "Outdated"
+        text = "Outdated · re-run analysis"
         rank = 2
     elif raw_state == "empty":
         state = "unknown"
         text = "N/A · empty"
         rank = 2
-        lines = [
-            "This folder contains no indexed files, so other-copy coverage is not applicable."
-        ]
+        lines = ["The catalogue has no files in this folder, so there is nothing to compare."]
     elif raw_state == "excluded":
         state = "unknown"
-        text = "N/A · system metadata"
+        text = "N/A · system files only"
         rank = 2
         lines = [
-            "Known operating-system bookkeeping is deliberately excluded from copy coverage."
+            "This folder holds only system files (Thumbs.db, .DS_Store and similar), "
+            "which are excluded from copy coverage."
         ]
     elif raw_state == "ambiguous":
-        state = "unknown"
-        text = "Too common"
-        rank = 2
-        lines = [
-            (
-                "This folder structure occurs too often to identify a useful copy."
-                if resolved_type == "folder"
-                else "This filename-and-size combination is too common to identify a useful copy."
-            )
-        ]
-    elif raw_state in {"strong", "complete", "likely", "matched"}:
-        state = "strong"
-        complete_count = (
-            len(strong_ids or ())
-            if has_target_breakdown
-            else other_count
-        )
-        if resolved_type == "folder":
-            text = f"Complete · {plural_other_drives(complete_count)}"
-        elif verified_refs:
-            text = f"Hash verified · {plural_other_drives(len(verified_refs))}"
-        else:
-            text = f"Strong metadata · {plural_other_drives(complete_count)}"
-        rank = 3
-        if resolved_type == "folder":
-            lines = ["Complete structural match on another drive."]
-        elif verified_refs:
+        if not is_folder and reason == "hash_conflict":
+            state = "conflict"
+            text = "Content differs · same name and size"
+            rank = 1
             lines = [
-                "The full-file SHA-256 recorded during scanning matches on another drive."
+                "A file with the same name and size exists on another drive, but the "
+                "saved SHA-256 hashes differ, so it is a different version or a damaged "
+                "copy, not a copy."
             ]
         else:
-            lines = ["Strong file metadata match on another drive; no comparable hash was available."]
+            state = "unknown"
+            text = "Too common"
+            rank = 2
+            lines = [
+                (
+                    "This folder structure repeats too often in the catalogue to tell "
+                    "which copy is which."
+                    if is_folder
+                    else "This name-and-size combination is too common in the catalogue "
+                    "to pin down a copy."
+                )
+            ]
+    elif raw_state in {"strong", "complete", "likely", "matched"}:
+        state = "strong"
+        rank = 3
+        complete_count = len(strong_ids or ()) if has_target_breakdown else other_count
+        if is_folder:
+            if reason == "trusted_hashed":
+                tier = " (hashed)"
+                first = (
+                    "The whole folder matches on another drive: same folder name, same "
+                    "layout, and every file's name, size and saved hash."
+                )
+            elif reason == "trusted_legacy":
+                tier = " (no hashes)"
+                first = (
+                    "The whole folder matches on another drive by folder name, layout, "
+                    "file names and sizes. These records have no saved hashes, so this is "
+                    "not a byte-for-byte check."
+                )
+            else:
+                tier = ""
+                first = (
+                    "The whole folder matches on another drive: same folder name, "
+                    "layout, file names and sizes."
+                )
+            text = f"Full match{tier} · {plural_other_drives(complete_count)}"
+        elif verified_refs:
+            text = f"Hash verified · {plural_other_drives(len(verified_refs))}"
+            first = "The full-file SHA-256 recorded during scanning matches on another drive."
+        else:
+            text = f"Metadata match (no hash) · {plural_other_drives(complete_count)}"
+            first = (
+                "Filename, exact size, modified time and parent path match on another "
+                "drive. No saved hash was available, so this is not a byte-for-byte check."
+            )
+        lines = [first]
     elif raw_state in {"possible", "partial", "probable", "scattered"}:
         state = "possible"
-        files_percent = object_value(status, "best_coverage_files_percent")
-        bytes_percent = object_value(status, "best_coverage_bytes_percent")
-        if resolved_type == "folder" and (
-            files_percent is not None or bytes_percent is not None
-        ):
-            parts = []
-            if files_percent is not None:
-                parts.append(f"{float(files_percent):.0f}% files")
-            if bytes_percent is not None:
-                parts.append(f"{float(bytes_percent):.0f}% data")
-            text = "Possible · " + " · ".join(parts)
-        else:
-            text = f"Possible · {plural_other_drives(other_count)}"
         rank = 1
-        lines = [
-            "This folder has possible or partial metadata evidence on another drive."
-            if resolved_type == "folder"
-            else "A possible metadata match is recorded on another drive."
-        ]
-        if bool(object_value(status, "scattered", False)):
-            lines.append(
-                "Matching files are spread across drives; no single drive has a complete folder copy."
-            )
-        best_target_id = object_value(status, "best_target_volume_id")
-        if best_target_id is not None:
-            try:
-                best_target = references.get(
-                    int(best_target_id), f"Volume {int(best_target_id)}"
-                )
-                lines.append(f"Best single matching drive: {best_target}.")
-            except (TypeError, ValueError):
-                pass
-        if files_percent is not None:
-            lines.append(f"Best single-drive file coverage: {float(files_percent):.0f}%.")
-        if bytes_percent is not None:
-            lines.append(f"Best single-drive byte coverage: {float(bytes_percent):.0f}%.")
+        if is_folder:
+            if reason in FOLDER_REASON_LABELS:
+                suffix, why, confirm = FOLDER_REASON_LABELS[reason]
+                text = f"Not confirmed · {suffix}"
+                lines = [
+                    (
+                        f"The folder matches{where}, but it is not confirmed as a Full match."
+                        if best_target_name
+                        else "The folder matches on another drive, but it is not confirmed "
+                        "as a Full match."
+                    ),
+                    f"Why: {why}",
+                ]
+            else:
+                # Judged file by file on the best single other drive.
+                show_coverage_lines = True
+                all_found = files_text == "100%" and bytes_text in (None, "100%")
+                if total_count == 1:
+                    text = "Not confirmed · single-file folder"
+                    lines = [
+                        f"The only file in this folder was found{where}, but one "
+                        "name-and-size match is too weak to confirm a whole folder.",
+                        "Why: Folders need at least two files before their structure can "
+                        "be matched as a unit. Check the file's own status instead.",
+                    ]
+                elif all_found:
+                    text = "Not confirmed · files found one by one"
+                    lines = [
+                        f"Every file in this folder was found{where}, counting "
+                        "name-and-size matches, but the folder as a whole could not be "
+                        "confirmed as the same folder there.",
+                        "Why: The other drive's folder may hold extra or different items "
+                        "or a different layout, or the same structure repeats too often "
+                        "to pair it safely.",
+                        COVERAGE_ONE_WAY_CAVEAT,
+                    ]
+                elif scattered:
+                    spread = (
+                        f"spread over {other_count} drives"
+                        if other_count >= 2
+                        else "spread across drives"
+                    )
+                    text = f"Partial · {spread}"
+                    lines = [
+                        "Together the other drives hold all of these files, but no single "
+                        f"drive holds the whole folder; the best one{where} has "
+                        f"{files_text or 'part'} of the files.",
+                    ]
+                else:
+                    parts = []
+                    if files_text:
+                        parts.append(f"{files_text} files")
+                    if bytes_text:
+                        parts.append(f"{bytes_text} data")
+                    text = (
+                        "Partial · " + " · ".join(parts)
+                        if parts
+                        else f"Partial · {plural_other_drives(other_count)}"
+                    )
+                    detail = (
+                        f" ({matched_count:,} of {total_count:,} files)"
+                        if total_count
+                        else ""
+                    )
+                    missing_count = max(0, total_count - matched_count)
+                    missing = (
+                        f" {missing_count:,} file{'' if missing_count == 1 else 's'} "
+                        f"{'was' if missing_count == 1 else 'were'} not found on it."
+                        if total_count
+                        else ""
+                    )
+                    lines = [
+                        f"The best single drive{where} holds {files_text or 'part'} of "
+                        f"this folder's files{detail}, counting name-and-size matches."
+                        f"{missing}"
+                    ]
+            if confirm:
+                lines.append(f"What would confirm it: {confirm}")
+            lines.append(BACKUP_FOLDER_RULE_SENTENCE)
+        else:
+            text = f"Name and size only · {plural_other_drives(other_count)}"
+            lines = [
+                "A file with the same name and size exists on another drive, but the "
+                "modified time or path differs. Treat it as a lead, not a confirmed copy."
+            ]
     elif raw_state in {"none", "no_match", "unprotected", "single", "single_copy"}:
         state = "none"
-        text = "None found"
+        text = "No copy found"
         rank = 0
+        coverage_fraction = 0.0
         lines = [
-            "No matching copy was found on another volume in this catalogue."
+            "No matching copy of this item was found on another drive in this catalogue."
         ]
     else:
         state = "unknown"
-        text = (
-            "Not analysed"
-            if raw_state in {"not_analysed", "not_analyzed", ""}
-            or (raw_state == "unknown" and analysed_at is None)
-            else "Unknown"
-        )
         rank = 2
-        lines = [
-            stale_reason
-            or "There is not enough current catalogue information to assess another copy."
-        ]
+        if raw_state in {"not_analysed", "not_analyzed", ""} or (
+            raw_state == "unknown" and analysed_at is None
+        ):
+            text = "Not analysed"
+            lines = ["Backup evidence has not been analysed for this item."]
+        elif evidence == ITEM_EVIDENCE_MISSING:
+            text = "Can't tell · record missing"
+            lines = [
+                "The last scan of this drive no longer found this item, so there is "
+                "nothing current to compare with other drives."
+            ]
+        else:
+            text = "Can't tell · scan incomplete"
+            lines = [
+                stale_reason
+                or "The catalogue does not hold enough current information to judge "
+                "this item: the last scan is missing or reported access errors."
+            ]
+
+    if is_folder and state == "possible":
+        if scattered:
+            lines.append(
+                "Matching files are spread across drives; no single drive has a "
+                "complete folder copy."
+            )
+        if best_target_name:
+            lines.append(f"Best single matching drive: {best_target_name}.")
+        if show_coverage_lines:
+            if files_text:
+                counts = f" ({matched_count:,} of {total_count:,} files)" if total_count else ""
+                lines.append(f"Best single-drive file coverage: {files_text}{counts}.")
+            if bytes_text:
+                sizes = ""
+                try:
+                    if int(total_bytes or 0) > 0:
+                        sizes = (
+                            f" ({format_size(int(matched_bytes or 0))} of "
+                            f"{format_size(int(total_bytes))})"
+                        )
+                except (TypeError, ValueError):
+                    sizes = ""
+                lines.append(f"Best single-drive byte coverage: {bytes_text}{sizes}.")
 
     if has_target_breakdown:
-        if resolved_type == "folder":
+        if is_folder:
             if strong_refs:
                 lines.append(
-                    f"{backup_evidence_label('Complete structure drives', stale)}: "
+                    f"{backup_evidence_label('Full-match drives', stale)}: "
                     f"{summarized_backup_drive_references(strong_refs)}."
                 )
             if possible_refs:
                 lines.append(
-                    f"{backup_evidence_label('Possible or partial drives', stale)}: "
+                    f"{backup_evidence_label('Not confirmed or partial drives', stale)}: "
                     f"{summarized_backup_drive_references(possible_refs)}."
                 )
         else:
@@ -805,12 +1048,12 @@ def item_backup_display(
                 )
             if strong_refs:
                 lines.append(
-                    f"{backup_evidence_label('Strong metadata-only drives', stale)}: "
+                    f"{backup_evidence_label('Metadata-only drives (no hash)', stale)}: "
                     f"{summarized_backup_drive_references(strong_refs)}."
                 )
             if possible_refs:
                 lines.append(
-                    f"{backup_evidence_label('Possible-only drives', stale)}: "
+                    f"{backup_evidence_label('Name-and-size-only drives', stale)}: "
                     f"{summarized_backup_drive_references(possible_refs)}."
                 )
     elif drive_refs:
@@ -824,7 +1067,7 @@ def item_backup_display(
     if analysed_at:
         lines.append(f"Analysed: {display_db_time(str(analysed_at))}.")
     lines.extend(["", BACKUP_METADATA_DISCLAIMER])
-    return BackupDisplay(state, text, "\n".join(lines), rank)
+    return BackupDisplay(state, text, "\n".join(lines), rank, coverage_fraction, reason)
 
 
 def backup_filter_matches(display: BackupDisplay, filter_key: str) -> bool:
@@ -835,7 +1078,7 @@ def backup_filter_matches(display: BackupDisplay, filter_key: str) -> bool:
     if filter_key == "attention":
         return display.state != "strong"
     if filter_key == "possible":
-        return display.state == "possible"
+        return display.state in {"possible", "conflict"}
     if filter_key == "strong":
         return display.state == "strong"
     if filter_key == "none":
@@ -843,6 +1086,61 @@ def backup_filter_matches(display: BackupDisplay, filter_key: str) -> bool:
     if filter_key == "unknown":
         return display.state == "unknown"
     return True
+
+
+def browser_status_strip_text(
+    folder_display: BackupDisplay | None,
+    items: list[Any],
+) -> str:
+    """One-line summary of the open folder's verdict and its direct children."""
+    folders = [
+        item
+        for item in items
+        if item.item_type == "folder" and not getattr(item, "is_parent_entry", False)
+    ]
+    files = [item for item in items if item.item_type == "file"]
+    children = folders + files
+    if not children and folder_display is None:
+        return ""
+    if children and all(item.backup.text == "Not analysed" for item in children):
+        return ""
+    parts: list[str] = []
+    if (
+        folder_display is not None
+        and not folder_display.text.startswith("N/A")
+        and folder_display.text != "Not analysed"
+    ):
+        parts.append(f"This folder: {folder_display.text}.")
+    # Only children with a verdict are tallied: Outdated / Can't tell / Not
+    # analysed rows would otherwise be counted as "0 match", which is false.
+    judged_folders = [item for item in folders if item.backup.state != "unknown"]
+    if judged_folders:
+        full = sum(1 for item in judged_folders if item.backup.state == "strong")
+        parts.append(f"Folders here: {full} of {len(judged_folders)} are a Full match.")
+    judged_files = [item for item in files if item.backup.state != "unknown"]
+    if judged_files:
+        none_items = [item for item in judged_files if item.backup.state == "none"]
+        if none_items:
+            names = ", ".join(item.name for item in none_items[:3])
+            more = f" (+{len(none_items) - 3} more)" if len(none_items) > 3 else ""
+            verb = "has" if len(none_items) == 1 else "have"
+            parts.append(
+                f"Files here: {len(none_items)} of {len(judged_files)} {verb} no copy "
+                f"found ({names}{more})."
+            )
+        else:
+            matched = sum(1 for item in judged_files if item.backup.state == "strong")
+            leads = len(judged_files) - matched
+            sentence = (
+                f"Files here: {matched} of {len(judged_files)} match on another drive"
+            )
+            if leads:
+                sentence += f"; {leads} {'is' if leads == 1 else 'are'} a name-and-size lead only"
+            parts.append(sentence + ".")
+    if not parts:
+        return ""
+    parts.append("Each folder is judged on its own, not added up from its contents.")
+    return " ".join(parts)
 
 
 def volume_backup_display(
@@ -935,7 +1233,7 @@ def volume_backup_display(
         )
         return BackupDisplay(
             "unknown",
-            "Outdated",
+            "Outdated · re-run analysis",
             (reason or "The catalogue changed after this volume was analysed.")
             + f"\n\n{BACKUP_METADATA_DISCLAIMER}",
             2,
@@ -956,7 +1254,7 @@ def volume_backup_display(
     ):
         return BackupDisplay(
             "unknown",
-            "N/A · system metadata",
+            "N/A · system files only",
             (
                 f"All {excluded_files:,} indexed files are known operating-system "
                 "bookkeeping and are excluded from copy coverage.\n\n"
@@ -1020,19 +1318,27 @@ def volume_backup_display(
     if state == "unknown" and ambiguous_files:
         text = f"Too common · {ambiguous_files:,} files"
     elif state == "possible" and files_value <= 0 and possible_files:
-        text = f"Possible · {possible_files:,} files"
+        text = f"Name and size only · {possible_files:,} files"
     else:
-        text = f"{files_value:.0f}% files"
+        files_label = (
+            coverage_percent_text(strong_files, coverage_files, files_value)
+            or f"{files_value:.0f}%"
+        )
+        text = f"{files_label} files"
         if bytes_value is not None:
-            text += f" · {bytes_value:.0f}% data"
+            bytes_label = (
+                coverage_percent_text(strong_bytes, coverage_bytes, bytes_value)
+                or f"{bytes_value:.0f}%"
+            )
+            text += f" · {bytes_label} data"
     tooltip = (
-        f"Hash-verified or strong metadata matches on another drive: {strong_files:,} of "
+        f"Hash verified or Metadata match (no hash) on another drive: {strong_files:,} of "
         f"{coverage_files:,} coverage-eligible files"
     )
     if coverage_bytes:
         tooltip += f", {format_size(strong_bytes)} of {format_size(coverage_bytes)}"
     if possible_files:
-        tooltip += f". Possible-only matches not counted as coverage: {possible_files:,} files"
+        tooltip += f". Name-and-size-only matches not counted as coverage: {possible_files:,} files"
     if ambiguous_files:
         tooltip += f". Too-common metadata excluded from matching: {ambiguous_files:,} files"
     if excluded_files:
@@ -1200,6 +1506,7 @@ class BackupStatusIconProvider:
     COLORS = {
         "strong": "#2e9b4b",
         "possible": "#d18a00",
+        "conflict": "#d18a00",
         "none": "#cf3f3f",
         "unknown": "#7b8794",
     }
@@ -1218,9 +1525,31 @@ class BackupStatusIconProvider:
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QColor("#39424c"))
-        painter.setBrush(QColor(self.COLORS[state]))
-        painter.drawEllipse(QRectF(3, 3, 10, 10))
+        colour = QColor(self.COLORS[state])
+        if state == "unknown":
+            # A hollow ring: "can't tell" must not read as a verdict.
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(colour, 2))
+            painter.drawEllipse(QRectF(3.5, 3.5, 9, 9))
+        else:
+            painter.setPen(QColor("#39424c"))
+            painter.setBrush(colour)
+            painter.drawEllipse(QRectF(3, 3, 10, 10))
+            # One glyph per state so colour is never the only channel.
+            glyph = QPen(QColor("white"), 1.6)
+            glyph.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(glyph)
+            if state == "strong":
+                painter.drawLine(QPoint(5, 8), QPoint(7, 10))
+                painter.drawLine(QPoint(7, 10), QPoint(11, 6))
+            elif state == "possible":
+                painter.drawLine(QPoint(5, 8), QPoint(11, 8))
+            elif state == "conflict":
+                painter.drawLine(QPoint(8, 5), QPoint(8, 8))
+                painter.drawPoint(QPoint(8, 11))
+            else:
+                painter.drawLine(QPoint(6, 6), QPoint(10, 10))
+                painter.drawLine(QPoint(10, 6), QPoint(6, 10))
         painter.end()
         icon = QIcon(pixmap)
         self.cache[state] = icon
@@ -1347,7 +1676,10 @@ class BrowserTableModel(StandardTableModel):
                 TableColumn(
                     "Other copies",
                     lambda item: "N/A" if item.is_parent_entry else item.backup.text,
-                    sort_key=lambda item: item.backup.sort_rank,
+                    sort_key=lambda item: (
+                        item.backup.sort_rank,
+                        item.backup.coverage_fraction,
+                    ),
                     decoration=lambda item: None
                     if item.is_parent_entry
                     else self.backup_icons.icon_for(item.backup),
@@ -1461,14 +1793,13 @@ class VolumeTableModel(StandardTableModel):
                 TableColumn(
                     "Other-copy coverage",
                     lambda item: item.backup.text,
-                    sort_key=lambda item: item.backup.sort_rank,
+                    sort_key=lambda item: (
+                        item.backup.sort_rank,
+                        item.backup.coverage_fraction,
+                    ),
                     decoration=lambda item: self.backup_icons.icon_for(item.backup),
                     tooltip=lambda item: item.backup.tooltip,
-                    header_tooltip=(
-                        "The share of this volume's indexed files and bytes with a hash-verified "
-                        "or strong metadata match on another catalogue drive. Empty volumes are N/A.\n\n"
-                        f"{BACKUP_METADATA_DISCLAIMER}"
-                    ),
+                    header_tooltip=BACKUP_VOLUME_COVERAGE_TOOLTIP,
                 ),
             ],
             parent,
@@ -1507,7 +1838,10 @@ class SearchResultsTableModel(StandardTableModel):
                 TableColumn(
                     "Other copies",
                     lambda item: item.backup.text,
-                    sort_key=lambda item: item.backup.sort_rank,
+                    sort_key=lambda item: (
+                        item.backup.sort_rank,
+                        item.backup.coverage_fraction,
+                    ),
                     decoration=lambda item: self.backup_icons.icon_for(item.backup),
                     tooltip=lambda item: item.backup.tooltip,
                     header_tooltip=BACKUP_COLUMN_HEADER_TOOLTIP,
@@ -1578,6 +1912,37 @@ class ResponsiveStatusDelegate(QStyledItemDelegate):
             option.text = ""
             option.displayAlignment = Qt.AlignmentFlag.AlignCenter
             option.decorationAlignment = Qt.AlignmentFlag.AlignCenter
+
+
+class OtherCopiesDelegate(QStyledItemDelegate):
+    """Shorten an Other-copies label instead of eliding its tail.
+
+    Labels lead with the verdict word, so when the column is too narrow for the
+    whole text we keep only the part before the first " · ", and when even that
+    does not fit, the dot alone. Qt's default ellipsis would cut off the caution.
+    """
+
+    @staticmethod
+    def short_text(text: str) -> str:
+        return text.split(" · ", 1)[0]
+
+    def initStyleOption(self, option, index: QModelIndex) -> None:  # type: ignore[override]
+        super().initStyleOption(option, index)
+        text = option.text or ""
+        width = option.rect.width()
+        if not text or width <= 0:
+            return
+        metrics = option.fontMetrics
+        padding = option.decorationSize.width() + 16
+        if width >= padding + metrics.horizontalAdvance(text):
+            return
+        short = self.short_text(text)
+        if width >= padding + metrics.horizontalAdvance(short):
+            option.text = short
+            return
+        option.text = ""
+        option.displayAlignment = Qt.AlignmentFlag.AlignCenter
+        option.decorationAlignment = Qt.AlignmentFlag.AlignCenter
 
 
 class VolumeFullDelegate(QStyledItemDelegate):
@@ -2386,7 +2751,8 @@ class BackupEvidenceDialog(QDialog):
         explanation = QLabel(
             "This compares records already saved in the catalogue. It does not reconnect "
             "or rescan drives or read file contents. Hash-verified means SHA-256 values "
-            "recorded during scans match; other strong matches use metadata only."
+            "recorded during scans match; Metadata match (no hash) means name, size, "
+            "modified time and path agree without a hash."
         )
         explanation.setObjectName("offlineNotice")
         explanation.setWordWrap(True)
@@ -2404,33 +2770,45 @@ class BackupEvidenceDialog(QDialog):
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         legend = QLabel(
-            "Green — SHA-256 match, strong metadata match, or complete folder structure\n"
-            "Amber — possible file match or partial folder on the best single drive\n"
-            "Red — no other catalogue match found\n"
-            "Grey — not analysed, outdated, too common, excluded system metadata, "
-            "or insufficient scan information"
+            "Green (tick) — Full match for a whole folder; Hash verified or Metadata "
+            "match (no hash) for a file\n"
+            "Amber (dash) — Not confirmed, Partial, or Name and size only\n"
+            "Amber (!) — Content differs: same name and size, but saved hashes disagree\n"
+            "Red (cross) — No copy found\n"
+            "Grey (ring) — Not analysed, Outdated, Too common, N/A system files, or "
+            "Can't tell"
         )
         legend.setWordWrap(True)
         rules = QLabel(
             "What the labels mean:\n"
+            "• Full match (hashed): the folder name, layout, every file's name and size, "
+            "and the saved SHA-256 hashes all match on one other drive, and both drives' "
+            "scans completed without errors.\n"
+            "• Full match (no hashes): the same comparison, but these records were scanned "
+            "before hashing existed, so only names, sizes and layout were compared, not "
+            "file contents.\n"
+            "• Not confirmed: the folder matched but is deliberately held back, and the "
+            "label says why: a scan had errors, the folder is named differently there, "
+            "some files lack saved hashes, it is a single-file folder, or the files were "
+            "found one by one without the folder matching as a unit.\n"
+            "• Partial: the best single other drive holds only part of this folder's "
+            "files. Percentages never round up; 100% appears only when every file was "
+            "found.\n"
             "• Hash verified: the full-file SHA-256 values recorded during scans are "
             "identical. Names, paths, and timestamps may differ.\n"
-            "• Strong metadata: when a comparable hash is unavailable, normalized "
-            "filename, exact byte size, non-empty exact modified time, and the same "
-            "normalized parent path match.\n"
-            "• Possible file: normalized filename and exact byte size on another "
-            "drive, but path or modified time differs or is unavailable.\n"
+            "• Metadata match (no hash): filename, exact size, modified time and parent "
+            "path match; no comparable hash was available.\n"
+            "• Name and size only: a lead, not a copy. The path or modified time differs "
+            "or is missing.\n"
+            "• Content differs: same name and size, but the saved hashes differ, so it is "
+            "a different version or a damaged copy.\n"
             "• Too common: repetitive hashes or weak name-and-size evidence are suppressed "
-            "when they span "
-            "more than 8 drives, 64 records, or 256 projected file-to-drive links. "
-            "Exact path-and-time subgroups use separate bounded limits (32 drives, "
-            "512 records, or 4,096 links), so even strong evidence cannot expand "
-            "without limit.\n"
-            "• Complete folder: the folder name and a content-bearing subtree with at "
-            "least two files match one other drive by descendant names, layout, and "
-            "SHA-256 wherever hashes are present, and both applied scans have trustworthy "
-            "denominators. Mixed hashed/legacy, one-file, renamed, overly common, "
-            "error-bearing, or partial subtrees stay amber or grey.\n"
+            "when they span more than 8 drives, 64 records, or 256 projected "
+            "file-to-drive links. Exact path-and-time subgroups use separate bounded "
+            "limits (32 drives, 512 records, or 4,096 links).\n"
+            f"• {BACKUP_FOLDER_RULE_SENTENCE} A parent stays amber when a loose file or "
+            "a subfolder directly inside it differs between the drives, or when the "
+            "other drive holds extra items there.\n"
             "• Known OS bookkeeping such as .DS_Store, Thumbs.db, desktop.ini, "
             "$RECYCLE.BIN, and System Volume Information is shown but excluded from "
             "coverage."
@@ -2456,8 +2834,8 @@ class BackupEvidenceDialog(QDialog):
             [
                 "Drive",
                 "Indexed files",
-                "Hash verified / strong metadata",
-                "Possible",
+                "Hash verified / Metadata match",
+                "Name and size only",
                 "Too common",
                 "OS metadata",
                 "File coverage",
@@ -2492,7 +2870,8 @@ class BackupEvidenceDialog(QDialog):
         volume_page = QWidget()
         volume_layout = QVBoxLayout(volume_page)
         volume_note = QLabel(
-            "Coverage counts hash-verified or strong metadata matches on a different drive. "
+            "Coverage counts Hash verified and Metadata match (no hash) files on a "
+            "different drive; percentages never round up. "
             "Empty successfully scanned drives are N/A."
         )
         volume_note.setWordWrap(True)
@@ -2636,10 +3015,10 @@ class BackupEvidenceDialog(QDialog):
             ]
         else:
             summary_parts = [
-                f"The last completed analysis found hash-verified or strong metadata "
-                f"evidence on another "
+                f"The last completed analysis found Hash verified or Metadata match "
+                f"(no hash) evidence on another "
                 f"drive for {strong_files:,} of {total_files:,} indexed file records.",
-                f"Possible: {possible_files:,}. Too common to use: "
+                f"Name and size only: {possible_files:,}. Too common to use: "
                 f"{ambiguous_files:,}. Excluded OS metadata: {excluded_files:,}.",
             ]
         if stale_reason:
@@ -2685,7 +3064,7 @@ class BackupEvidenceDialog(QDialog):
             stale = analysis_stale or bool(object_value(summary, "is_stale", False))
             health = enum_value(object_value(summary, "health_status", ""))
             if stale:
-                status_text = "Outdated"
+                status_text = "Outdated · re-run analysis"
                 file_text = "Outdated"
                 byte_text = "Outdated"
             elif total_files == 0 and health in {"empty", "healthy_empty", "completed_empty"}:
@@ -2707,7 +3086,7 @@ class BackupEvidenceDialog(QDialog):
                 file_text = "Unknown"
                 byte_text = "Unknown"
             elif summary_status == "excluded":
-                status_text = "N/A · system metadata"
+                status_text = "N/A · system files only"
                 file_text = "N/A"
                 byte_text = "N/A"
             elif total_files > 0 and not bool(
@@ -2722,8 +3101,24 @@ class BackupEvidenceDialog(QDialog):
                 byte_text = "Not analysed"
             else:
                 status_text = "Current"
-                file_text = f"{float(files_percent):.0f}%"
-                byte_text = f"{float(bytes_percent):.0f}%" if bytes_percent is not None else "N/A"
+                file_text = (
+                    coverage_percent_text(
+                        strong_files,
+                        object_value(summary, "coverage_files", None),
+                        files_percent,
+                    )
+                    or "N/A"
+                )
+                byte_text = (
+                    coverage_percent_text(
+                        object_value(summary, "likely_bytes", None),
+                        object_value(summary, "coverage_bytes", None),
+                        bytes_percent,
+                    )
+                    or "N/A"
+                    if bytes_percent is not None
+                    else "N/A"
+                )
             rows.append(
                 [
                     volume_references.get(volume_id, f"Volume {volume_id}"),
@@ -2767,11 +3162,11 @@ class BackupEvidenceDialog(QDialog):
                 [
                     volume_references.get(first_id, f"Volume {first_id}"),
                     volume_references.get(second_id, f"Volume {second_id}"),
-                    f"{float(a_on_b):.0f}%" if a_on_b is not None else "N/A",
-                    f"{float(b_on_a):.0f}%" if b_on_a is not None else "N/A",
-                    "Outdated"
+                    coverage_percent_text(None, None, a_on_b) or "N/A",
+                    coverage_percent_text(None, None, b_on_a) or "N/A",
+                    "Outdated · re-run analysis"
                     if analysis_stale
-                    else ("Complete structural match" if complete else "Partial overlap"),
+                    else ("Full match" if complete else "Partial overlap"),
                     reason,
                 ]
             )
@@ -4470,10 +4865,10 @@ class MainWindow(QMainWindow):
         coverage_row = 3
         coverage_label = QLabel("Other-copy coverage")
         coverage_label.setObjectName("detailKey")
-        coverage_label.setToolTip(BACKUP_COLUMN_HEADER_TOOLTIP)
+        coverage_label.setToolTip(BACKUP_VOLUME_COVERAGE_TOOLTIP)
         grid.addWidget(coverage_label, coverage_row, 0)
         coverage_value = self._detail_value_label("backup_coverage")
-        coverage_value.setToolTip(BACKUP_COLUMN_HEADER_TOOLTIP)
+        coverage_value.setToolTip(BACKUP_VOLUME_COVERAGE_TOOLTIP)
         grid.addWidget(coverage_value, coverage_row, 1, 1, 5)
 
         full_row = 4
@@ -4532,13 +4927,24 @@ class MainWindow(QMainWindow):
         for label, key in BACKUP_FILTER_OPTIONS:
             self.browser_backup_filter_combo.addItem(label, key)
         self.browser_backup_filter_combo.setToolTip(
-            "Filter by catalogue-metadata copy evidence. 'Needs attention' includes "
-            "possible, partial, none found, outdated, and unknown items."
+            "Filter by other-copy status. 'Needs attention' includes not confirmed, "
+            "partial, name-and-size only, content differs, no copy found, outdated, "
+            "and can't-tell items."
         )
         self.browser_backup_help_button = QPushButton("How matching works")
         self.browser_backup_help_button.setToolTip(
             "Explain what the coloured copy-evidence indicators mean"
         )
+        # Always-visible answer to "why is the parent amber when its children
+        # are green": the open folder's own verdict plus a tally of what is
+        # directly inside it. Tooltips alone are hover-only.
+        self.browser_status_strip = QLabel("")
+        self.browser_status_strip.setObjectName("browserStatusStrip")
+        self.browser_status_strip.setWordWrap(True)
+        self.browser_status_strip.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.browser_status_strip.setVisible(False)
 
         backup_filter_row = QHBoxLayout()
         backup_filter_row.setContentsMargins(0, 0, 0, 0)
@@ -4552,13 +4958,14 @@ class MainWindow(QMainWindow):
         self.file_table.setObjectName("fileTable")
         self.file_table.setModel(self.browser_model)
         self.configure_table_view(self.file_table)
+        self.file_table.setItemDelegateForColumn(1, OtherCopiesDelegate(self.file_table))
         self.file_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.file_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         QTimer.singleShot(
             0,
             lambda: self.apply_table_default_columns(
                 self.file_table,
-                {1: 165, 2: 140, 3: 95, 4: 155, 5: 280, 6: 90},
+                {1: 230, 2: 140, 3: 95, 4: 155, 5: 280, 6: 90},
             ),
         )
 
@@ -4580,6 +4987,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.offline_label)
         layout.addLayout(path_row)
         layout.addLayout(backup_filter_row)
+        layout.addWidget(self.browser_status_strip)
         layout.addWidget(browser_splitter, 1)
         return widget
 
@@ -4745,12 +5153,13 @@ class MainWindow(QMainWindow):
             self.search_connection_delegate,
         )
         self.search_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.search_table.setItemDelegateForColumn(1, OtherCopiesDelegate(self.search_table))
         self.search_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         QTimer.singleShot(
             0,
             lambda: self.apply_table_default_columns(
                 self.search_table,
-                {1: 165, 2: 80, 3: 150, 4: 85, 5: 280, 6: 95, 7: 155, 8: 120},
+                {1: 230, 2: 80, 3: 150, 4: 85, 5: 280, 6: 95, 7: 155, 8: 120},
             ),
         )
 
@@ -7195,6 +7604,7 @@ class MainWindow(QMainWindow):
         self.current_folder_id = None
         self.current_path_label.setText("/")
         self.up_button.setEnabled(False)
+        MainWindow.update_browser_status_strip(self, None, [], None, {})
 
     def set_browser_notice(self, message: str) -> None:
         self.offline_label.setText(message)
@@ -7252,6 +7662,7 @@ class MainWindow(QMainWindow):
             self.browser_model.set_items([])
             self.current_path_label.setText("/")
             self.up_button.setEnabled(False)
+            MainWindow.update_browser_status_strip(self, None, [], None, {})
             return
 
         items: list[BrowserItem] = []
@@ -7337,13 +7748,38 @@ class MainWindow(QMainWindow):
 
         self.current_directory_items = items
         MainWindow.apply_browser_backup_filter(self)
+        MainWindow.update_browser_status_strip(self, folder, items, engine, volume_references)
         self.current_path_label.setText(relative_path_for_display(folder["relative_path"]))
         self.up_button.setEnabled(folder["parent_id"] is not None)
         self.apply_table_default_columns(
             self.file_table,
-            {1: 165, 2: 140, 3: 95, 4: 155, 5: 280, 6: 90},
+            {1: 230, 2: 140, 3: 95, 4: 155, 5: 280, 6: 90},
             only_if_empty=True,
         )
+
+    def update_browser_status_strip(
+        self,
+        folder: Any,
+        items: list[BrowserItem],
+        engine: Any,
+        volume_references: dict[int, str],
+    ) -> None:
+        strip = getattr(self, "browser_status_strip", None)
+        if strip is None:
+            return
+        folder_display: BackupDisplay | None = None
+        if engine is not None:
+            try:
+                folder_display = item_backup_display(
+                    engine.folder_status(int(folder["id"])),
+                    volume_references,
+                    item_type="folder",
+                )
+            except Exception:
+                folder_display = None
+        text = browser_status_strip_text(folder_display, items)
+        strip.setText(text)
+        strip.setVisible(bool(text))
 
     def browser_backup_filter_key(self) -> str:
         combo = getattr(self, "browser_backup_filter_combo", None)
@@ -7830,15 +8266,22 @@ class MainWindow(QMainWindow):
             getattr(self, "backup_volume_references", {}),
         )
         stale_status = bool(object_value(status, "is_stale", False))
+        properties.append(("Other-copy status", display.text))
+        if item_type == "folder" and display.reason in FOLDER_REASON_LABELS:
+            properties.append(
+                (
+                    backup_evidence_label("Why", stale_status),
+                    FOLDER_REASON_LABELS[display.reason][1],
+                )
+            )
         properties.extend(
             [
-                ("Other-copy status", display.text),
                 (
                     backup_evidence_label("Matching catalogue drives", stale_status),
                     ", ".join(other_refs) if other_refs else "None listed",
                 ),
                 (
-                    backup_evidence_label("Match evidence", stale_status),
+                    backup_evidence_label("Engine evidence", stale_status),
                     str(object_value(status, "evidence_text", "") or "Unavailable"),
                 ),
             ]
@@ -7873,14 +8316,14 @@ class MainWindow(QMainWindow):
             if strong_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Strong metadata-only drives", stale_status),
+                        backup_evidence_label("Metadata-only drives (no hash)", stale_status),
                         ", ".join(strong_refs),
                     )
                 )
             if possible_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Possible-only drives", stale_status),
+                        backup_evidence_label("Name-and-size-only drives", stale_status),
                         ", ".join(possible_refs),
                     )
                 )
@@ -7896,30 +8339,45 @@ class MainWindow(QMainWindow):
             if strong_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Complete structure drives", stale_status),
+                        backup_evidence_label("Full-match drives", stale_status),
                         ", ".join(strong_refs),
                     )
                 )
             if possible_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Possible or partial drives", stale_status),
+                        backup_evidence_label("Not confirmed or partial drives", stale_status),
                         ", ".join(possible_refs),
                     )
                 )
-            files_percent = object_value(status, "best_coverage_files_percent")
-            bytes_percent = object_value(status, "best_coverage_bytes_percent")
-            if files_percent is not None or bytes_percent is not None:
-                parts = []
-                if files_percent is not None:
-                    parts.append(f"{float(files_percent):.0f}% of files")
-                if bytes_percent is not None:
-                    parts.append(f"{float(bytes_percent):.0f}% of bytes")
+            files_text = coverage_percent_text(
+                object_value(status, "matched_files"),
+                object_value(status, "total_files"),
+                object_value(status, "best_coverage_files_percent"),
+            )
+            bytes_text = coverage_percent_text(
+                object_value(status, "matched_bytes"),
+                object_value(status, "total_bytes"),
+                object_value(status, "best_coverage_bytes_percent"),
+            )
+            if display.reason in FOLDER_REASON_LABELS:
+                # The engine records 100/100 for these by construction, so a
+                # percentage would only repeat the confusion the label removes.
                 properties.append(
                     (
-                        backup_evidence_label(
-                            "Best single-drive folder coverage", stale_status
-                        ),
+                        backup_evidence_label("Whole-folder structure", stale_status),
+                        "Matches on another drive; see Why for what holds it back.",
+                    )
+                )
+            elif files_text is not None or bytes_text is not None:
+                parts = []
+                if files_text is not None:
+                    parts.append(f"{files_text} of files")
+                if bytes_text is not None:
+                    parts.append(f"{bytes_text} of bytes")
+                properties.append(
+                    (
+                        backup_evidence_label("Found on best single drive", stale_status),
                         ", ".join(parts),
                     )
                 )
