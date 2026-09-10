@@ -1,21 +1,35 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import heapq
 from itertools import chain, groupby
 import json
+from operator import itemgetter
 import re
 import sqlite3
 import unicodedata
-from typing import Any, Callable, Iterable, NamedTuple, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Iterator, NamedTuple, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .database import Database
 
 
-RULES_VERSION = 3
+RULES_VERSION = 4
+# Two records are the "same file" by metadata when name and size agree and the
+# saved modified times are within this window, or differ by exactly one hour
+# (FAT/exFAT drives store local time, so DST copies land an hour apart).
+MODIFIED_TIME_TOLERANCE_SECONDS = 2
+MODIFIED_TIME_HOUR_OFFSET_SECONDS = 3600
+# Huge identical-content or generic-name groups store at most this many drive
+# ids per record; the true drive count travels in the evidence text.
+MAX_STORED_OTHER_VOLUME_IDS = 64
+# A folder persists at most this many per-drive match rows: structure matches
+# and drives holding strong evidence first. Weak-only drives are listed only
+# when no drive holds strong evidence, and then only the best one.
+MAX_STORED_FOLDER_DRIVE_MATCHES = 32
 CONTENT_HASH_LENGTHS = {
     "sha256": 32,
 }
@@ -110,9 +124,8 @@ FILE_EVIDENCE_METADATA_LIKELY = (
     "path match; repeated records are paired one-to-one per drive."
 )
 FILE_EVIDENCE_NAME_SIZE_ONLY = (
-    "Normalized filename and exact size match; parent path or modified "
-    "time differs or is unavailable. Repeated records are paired "
-    "one-to-one per drive for coverage."
+    "A file with the same name and size exists on another drive, but its modified "
+    "time differs or is missing, so it is a lead rather than a confirmed copy."
 )
 FILE_EVIDENCE_HASH_CONFLICT = (
     "Comparable SHA-256 content hashes differ even though the filename "
@@ -133,10 +146,104 @@ FILE_EVIDENCE_TOO_COMMON_PREFIX = (
 )
 ITEM_EVIDENCE_MISSING = "This catalogue record is marked missing."
 
+# Rules version 4: an item's label describes what exists on other drives, by
+# strength of evidence. One-to-one pairing is kept only for coverage arithmetic.
+FOLDER_EVIDENCE_FULL_MATCH_HASHED = (
+    "The whole folder matches on another drive: same folder name, same layout, "
+    "and every file's name, size and saved SHA-256 hash."
+)
+FOLDER_EVIDENCE_FULL_MATCH_PARTLY_HASHED = (
+    "The whole folder matches on another drive by folder name, layout, file names "
+    "and sizes; the files that have saved hashes match too, but not every file "
+    "has one."
+)
+FOLDER_EVIDENCE_FULL_MATCH_LEGACY = (
+    "The whole folder matches on another drive by folder name, layout, file names "
+    "and sizes. These records have no saved hashes, so contents were not compared."
+)
+FOLDER_EVIDENCE_SUFFIX_SCAN_ERRORS = (
+    " A scan of one of the two drives reported access errors, so its listing may "
+    "be incomplete."
+)
+FOLDER_EVIDENCE_SUFFIX_RENAMED = " The folder is named differently on that drive."
+FOLDER_EVIDENCE_ALL_FILES_HASHED = (
+    "Every file in this folder has a hash-verified copy on one other drive; the "
+    "folder layout there differs or could not be matched as a unit."
+)
+FOLDER_EVIDENCE_ALL_FILES_FOUND = (
+    "Every file in this folder was found on one other drive by name, size and "
+    "modified time; the folder layout there differs or could not be matched as a "
+    "unit. Contents were not compared."
+)
+FOLDER_EVIDENCE_ALL_FILES_WEAK = (
+    "Every file in this folder has a same-name, same-size file on one other drive, "
+    "but modified times differ or are missing, so these are leads rather than "
+    "confirmed copies."
+)
+FOLDER_EVIDENCE_PARTIAL = (
+    "Only part of this folder was found on the best single other drive, counting "
+    "files that match by name, size and modified time."
+)
+FOLDER_EVIDENCE_STRUCTURE_REPEATS_PREFIX = (
+    "This folder structure repeats too often to pair copies safely:"
+)
+# Per-drive folder match rows whose evidence starts with this text hold the
+# whole folder as a structure (exact or renamed). Drives that merely hold every
+# file loose, by name, size and time, never start with it, so a "Full match"
+# folder counts only real whole-folder copies as strong drives.
+FOLDER_MATCH_EVIDENCE_WHOLE_PREFIX = "Whole folder matches here"
+_FULL_MATCH_REASON_KEYS = frozenset(
+    {"full_match_hashed", "full_match_partly_hashed", "full_match_legacy"}
+)
+FILE_EVIDENCE_TIME_MATCH = (
+    "A file with the same name, size and modified time (within 2 seconds, or an "
+    "exact one-hour clock offset) exists on another drive. Contents were not "
+    "compared."
+)
+FILE_EVIDENCE_GENERIC_PREFIX = "This name and size is generic across the catalogue:"
+FILE_EVIDENCE_CONFLICT_NOTE = (
+    " A same-name, same-size file with different content (hash mismatch) exists "
+    "on another drive."
+)
+FILE_EVIDENCE_REPEATED_CONTENT_NOTE = (
+    " This exact content occurs on many drives, so individual copies were not "
+    "paired for coverage."
+)
+
+_FOLDER_SUFFIXES = (
+    FOLDER_EVIDENCE_SUPPRESSED_SUFFIX,
+    FOLDER_EVIDENCE_SUFFIX_SCAN_ERRORS,
+    FOLDER_EVIDENCE_SUFFIX_RENAMED,
+)
+_FOLDER_SUFFIX_FLAGS = {
+    FOLDER_EVIDENCE_SUPPRESSED_SUFFIX: "suppressed",
+    FOLDER_EVIDENCE_SUFFIX_SCAN_ERRORS: "scan_errors",
+    FOLDER_EVIDENCE_SUFFIX_RENAMED: "renamed",
+}
+_FILE_NOTES = (
+    FILE_EVIDENCE_PAIRED_SUFFIX,
+    FILE_EVIDENCE_HASH_VERIFIED_EXTRA_DRIVES,
+    FILE_EVIDENCE_CONFLICT_NOTE,
+    FILE_EVIDENCE_REPEATED_CONTENT_NOTE,
+)
+_FILE_NOTE_FLAGS = {
+    FILE_EVIDENCE_HASH_VERIFIED_EXTRA_DRIVES: "extra_drives",
+    FILE_EVIDENCE_CONFLICT_NOTE: "conflict",
+    FILE_EVIDENCE_REPEATED_CONTENT_NOTE: "repeated_content",
+}
 _FOLDER_REASON_KEYS = {
     FOLDER_EVIDENCE_EXCLUDED: "excluded",
     FOLDER_EVIDENCE_EMPTY: "empty",
     FOLDER_EVIDENCE_UNKNOWN_SCAN: "unknown_scan",
+    FOLDER_EVIDENCE_FULL_MATCH_HASHED: "full_match_hashed",
+    FOLDER_EVIDENCE_FULL_MATCH_PARTLY_HASHED: "full_match_partly_hashed",
+    FOLDER_EVIDENCE_FULL_MATCH_LEGACY: "full_match_legacy",
+    FOLDER_EVIDENCE_ALL_FILES_HASHED: "all_files_hashed",
+    FOLDER_EVIDENCE_ALL_FILES_FOUND: "all_files_found",
+    FOLDER_EVIDENCE_ALL_FILES_WEAK: "all_files_weak",
+    FOLDER_EVIDENCE_PARTIAL: "partial",
+    FOLDER_EVIDENCE_SINGLE: "single",
+    # Rules-version 3 texts; still recognised so an outdated run reads sanely.
     FOLDER_EVIDENCE_TRUSTED_HASHED: "trusted_hashed",
     FOLDER_EVIDENCE_TRUSTED_LEGACY: "trusted_legacy",
     FOLDER_EVIDENCE_MIXED_HASH: "mixed_hash",
@@ -145,15 +252,30 @@ _FOLDER_REASON_KEYS = {
     FOLDER_EVIDENCE_RENAMED: "renamed",
     FOLDER_EVIDENCE_COVERAGE: "coverage",
     FOLDER_EVIDENCE_AMBIGUOUS: "ambiguous",
-    FOLDER_EVIDENCE_SINGLE: "single",
 }
 _FILE_REASON_KEYS = {
-    FILE_EVIDENCE_METADATA_LIKELY: "metadata_likely",
+    FILE_EVIDENCE_TIME_MATCH: "time_match",
     FILE_EVIDENCE_NAME_SIZE_ONLY: "name_size_only",
     FILE_EVIDENCE_HASH_CONFLICT: "hash_conflict",
+    # Rules-version 3 texts.
+    FILE_EVIDENCE_METADATA_LIKELY: "metadata_likely",
     FILE_EVIDENCE_COMPETING: "competing",
     FILE_EVIDENCE_REPETITIVE_HASH: "repetitive_hash",
 }
+_COUNTS_PATTERN = re.compile(r"([\d,]+) (?:records|folders) across ([\d,]+) drives")
+
+
+def _strip_known_suffixes(text: str, suffixes: tuple[str, ...]) -> tuple[str, frozenset[str]]:
+    flags: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if text.endswith(suffix):
+                text = text[: -len(suffix)]
+                flags.add(suffix)
+                changed = True
+    return text, frozenset(flags)
 
 
 def folder_reason_key(evidence_text: str | None) -> str:
@@ -161,9 +283,17 @@ def folder_reason_key(evidence_text: str | None) -> str:
     text = str(evidence_text or "").strip()
     if not text:
         return ""
-    if text.endswith(FOLDER_EVIDENCE_SUPPRESSED_SUFFIX):
-        text = text[: -len(FOLDER_EVIDENCE_SUPPRESSED_SUFFIX)]
+    text, _ = _strip_known_suffixes(text, _FOLDER_SUFFIXES)
+    if text.startswith(FOLDER_EVIDENCE_STRUCTURE_REPEATS_PREFIX):
+        return "structure_repeats"
     return _FOLDER_REASON_KEYS.get(text, "")
+
+
+def folder_evidence_flags(evidence_text: str | None) -> frozenset[str]:
+    """Return the qualifier flags appended to folder evidence: scan_errors, renamed, suppressed."""
+    text = str(evidence_text or "").strip()
+    _, suffixes = _strip_known_suffixes(text, _FOLDER_SUFFIXES)
+    return frozenset(_FOLDER_SUFFIX_FLAGS[suffix] for suffix in suffixes)
 
 
 def file_reason_key(evidence_text: str | None) -> str:
@@ -171,11 +301,109 @@ def file_reason_key(evidence_text: str | None) -> str:
     text = str(evidence_text or "").strip()
     if not text:
         return ""
+    text, _ = _strip_known_suffixes(text, _FILE_NOTES)
     if text.startswith(FILE_EVIDENCE_HASH_VERIFIED):
         return "hash_verified"
+    if text.startswith(FILE_EVIDENCE_GENERIC_PREFIX):
+        return "generic"
     if text.startswith(FILE_EVIDENCE_TOO_COMMON_PREFIX):
         return "too_common"
     return _FILE_REASON_KEYS.get(text, "")
+
+
+def file_evidence_flags(evidence_text: str | None) -> frozenset[str]:
+    """Return the note flags appended to file evidence: conflict, extra_drives, repeated_content.
+
+    Notes are matched anywhere in the text: the repeated-content note is
+    followed by its record/drive counts sentence, so it is not always the tail.
+    """
+    text = str(evidence_text or "")
+    return frozenset(flag for note, flag in _FILE_NOTE_FLAGS.items() if note in text)
+
+
+def evidence_counts(evidence_text: str | None) -> tuple[int, int] | None:
+    """Return (records, drives) embedded in generic/repeating evidence, if any."""
+    match = _COUNTS_PATTERN.search(str(evidence_text or ""))
+    if match is None:
+        return None
+    return int(match.group(1).replace(",", "")), int(match.group(2).replace(",", ""))
+
+
+def _parse_modified_time(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+_MODIFIED_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
+# The scanner saves "2026-08-19T09:00:00.000000+0000": 31 characters, UTC.
+_CANONICAL_MODIFIED_TIME_LENGTH = 31
+
+
+def _canonical_modified_time(value: Any) -> str | None:
+    """Rewrite a saved modified time as UTC in the scanner's own format.
+
+    Generic groups are swept in saved-text order, so equal instants written
+    with different offsets or formats ('+00:00', 'Z', no microseconds) must
+    sort together. Text the scanner already wrote passes straight through;
+    unparseable text is kept as it is and never matches by time.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if (
+        len(text) == _CANONICAL_MODIFIED_TIME_LENGTH
+        and text.endswith("+0000")
+        and text[10] == "T"
+        and text[19] == "."
+    ):
+        return text
+    parsed = _parse_modified_time(text)
+    if parsed is None:
+        return text
+    return parsed.astimezone(timezone.utc).strftime(_MODIFIED_TIME_FORMAT)
+
+
+def _instants_match(
+    first_text: str,
+    first_instant: datetime | None,
+    second_text: str,
+    second_instant: datetime | None,
+) -> bool:
+    """modified_times_match on already-parsed values, so groups parse each row once."""
+    if first_instant is None or second_instant is None:
+        # Two empty or unreadable values never match just by being equal text.
+        return False
+    if first_text == second_text:
+        return True
+    delta = abs((first_instant - second_instant).total_seconds())
+    return (
+        delta <= MODIFIED_TIME_TOLERANCE_SECONDS
+        or abs(delta - MODIFIED_TIME_HOUR_OFFSET_SECONDS) <= MODIFIED_TIME_TOLERANCE_SECONDS
+    )
+
+
+def modified_times_match(first: Any, second: Any) -> bool:
+    """Same-file test for saved modified times: within 2 s, or exactly 1 h apart."""
+    if first is None or second is None:
+        return False
+    return _instants_match(
+        str(first),
+        _parse_modified_time(first),
+        str(second),
+        _parse_modified_time(second),
+    )
 
 
 ANALYSIS_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -439,9 +667,12 @@ ANALYSIS_SCHEMA_SQL: tuple[str, ...] = (
 class AnalysisOptions:
     batch_size: int = 10_000
     mirror_candidate_threshold_percent: float = 50.0
-    max_candidate_volumes_per_key: int = 8
-    max_candidate_records_per_key: int = 64
-    max_candidate_edges_per_key: int = 256
+    # A project file kept on up to 32 of the catalogue's drives is still judged
+    # with full tiers (time tolerance, conflicts); only groups beyond these
+    # bounds take the cheaper "generic name" path.
+    max_candidate_volumes_per_key: int = 32
+    max_candidate_records_per_key: int = 256
+    max_candidate_edges_per_key: int = 4_096
     max_strong_volumes_per_signature: int = 32
     max_strong_records_per_signature: int = 512
     max_strong_edges_per_signature: int = 4_096
@@ -605,6 +836,68 @@ class _FolderInfo(NamedTuple):
     depth: int
 
 
+class _FileRecord(NamedTuple):
+    """One same-name, same-size candidate, parsed once for pairwise comparison."""
+
+    file_id: int
+    volume_id: int
+    parent_path_key: bytes
+    modified_at: str
+    modified_instant: datetime | None
+    content_hash: tuple[str, bytes] | None
+    size_bytes: int
+
+
+# Per-(folder, target drive) coverage slots, accumulated up the folder tree.
+_ALL_FILES, _STRONG_FILES, _STRONG_BYTES, _VERIFIED_FILES = range(4)
+
+# Every (file, other drive) existence row, whichever pass recorded it: per
+# record for bounded groups, per (key, saved time text, own drive) for generic
+# groups without hashes, per (hash, own drive) for over-bound hash groups. The
+# three sources are disjoint by construction: the metadata pass never repeats a
+# drive the hash pass already wrote, and a generic record that carries a hash
+# falls back to per-record rows. No file is therefore counted twice per drive.
+def _file_target_rows_sql(*, with_depth: bool) -> str:
+    """The three existence sources as one row set.
+
+    with_depth adds the file's folder depth (looked up by primary key inside
+    each arm, which is far cheaper than joining the grouped result), so the
+    folder pass can read coverage deepest-first straight from the cursor.
+    """
+    depth_column = ", wfo.depth" if with_depth else ""
+    depth_join = (
+        "\n    JOIN backup_work_folders wfo ON wfo.folder_id = wf.folder_id" if with_depth else ""
+    )
+    return f"""
+    SELECT wf.folder_id, wf.file_id, wf.size_bytes, t.target_volume_id,
+           (t.status = 'likely') AS likely, t.verified AS verified{depth_column}
+    FROM backup_stage_file_targets t
+    JOIN backup_work_files wf ON wf.file_id = t.file_id{depth_join}
+    UNION ALL
+    SELECT wf.folder_id, wf.file_id, wf.size_bytes, kt.target_volume_id,
+           (kt.status = 'likely') AS likely, kt.verified AS verified{depth_column}
+    FROM backup_stage_key_targets kt
+    JOIN backup_work_files wf
+      ON wf.file_key = kt.file_key
+     AND wf.volume_id = kt.source_volume_id
+     AND COALESCE(wf.modified_at, '') = kt.time_signature{depth_join}
+    WHERE wf.evidence_eligible = 1 AND wf.content_hash IS NULL
+    UNION ALL
+    SELECT wf.folder_id, wf.file_id, wf.size_bytes, ht.target_volume_id,
+           1 AS likely, 1 AS verified{depth_column}
+    FROM backup_stage_hash_targets ht
+    JOIN backup_work_files wf
+      ON wf.content_hash_algorithm = ht.content_hash_algorithm
+     AND wf.content_hash = ht.content_hash
+     AND wf.volume_id = ht.source_volume_id{depth_join}
+    WHERE wf.evidence_eligible = 1 AND wf.content_hash IS NOT NULL
+"""
+
+
+_FILE_TARGET_ROWS_SQL = _file_target_rows_sql(with_depth=False)
+_FILE_TARGET_ROWS_WITH_DEPTH_SQL = _file_target_rows_sql(with_depth=True)
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f%z")
 
@@ -693,6 +986,34 @@ def _parse_ids(value: str | None) -> tuple[int, ...]:
         return ()
 
 
+def _capped_ids(values: Iterable[int]) -> list[int]:
+    """Sorted unique drive ids, truncated to the stored cap for huge groups."""
+    return sorted({int(value) for value in values})[:MAX_STORED_OTHER_VOLUME_IDS]
+
+
+def _capped_ids_preferring(preferred: Iterable[int], others: Iterable[int]) -> list[int]:
+    """Sorted unique drive ids within the cap, keeping every preferred id first.
+
+    When a huge group must be truncated, the drives holding stronger evidence
+    survive and the weaker ones are dropped.
+    """
+    kept = _capped_ids(preferred)
+    kept.extend(
+        _capped_ids(set(others) - set(kept))[: MAX_STORED_OTHER_VOLUME_IDS - len(kept)]
+    )
+    return sorted(kept)
+
+
+def _saved_hashes_equal(
+    first: tuple[str, bytes] | None,
+    second: tuple[str, bytes] | None,
+) -> bool | None:
+    """True/False when both records carry comparable hashes; None when they cannot be compared."""
+    if first is None or second is None or first[0] != second[0]:
+        return None
+    return first[1] == second[1]
+
+
 def _percent(part: int, whole: int) -> float | None:
     if whole <= 0:
         return None
@@ -722,6 +1043,21 @@ def _is_copy_metadata_noise(name: str | None, relative_path: str | None) -> bool
         if part
     ]
     return bool(parts and parts[0].casefold() in IGNORED_SYSTEM_SCAN_ROOTS)
+
+
+def _other_drive_count(item_type: str, evidence: str, other_ids: Sequence[int]) -> int:
+    """True count of other drives; huge groups store capped ids but keep counts in the text."""
+    counted = (
+        file_reason_key(evidence) == "generic"
+        or FILE_EVIDENCE_REPEATED_CONTENT_NOTE in evidence
+        if item_type == "file"
+        else folder_reason_key(evidence) == "structure_repeats"
+    )
+    counts = evidence_counts(evidence) if counted else None
+    if counts is None:
+        return len(other_ids)
+    # The counts sentence includes the item's own drive.
+    return max(len(other_ids), counts[1] - 1)
 
 
 def _add_pair_count(
@@ -862,6 +1198,8 @@ class BackupAnalysisEngine:
             "backup_work_folders",
             "backup_stage_file_results",
             "backup_stage_file_targets",
+            "backup_stage_key_targets",
+            "backup_stage_hash_targets",
             "backup_stage_folder_results",
             "backup_stage_folder_matches",
             "backup_stage_volume_results",
@@ -908,6 +1246,35 @@ class BackupAnalysisEngine:
                 PRIMARY KEY (file_id, target_volume_id)
             ) WITHOUT ROWID
             """,
+            # Generic name+size groups record existence once per (key, saved
+            # modified-time text, own drive) instead of once per record; the
+            # rows join back to backup_work_files for folder coverage.
+            """
+            CREATE TEMP TABLE backup_stage_key_targets (
+                file_key BLOB NOT NULL,
+                time_signature TEXT NOT NULL,
+                source_volume_id INTEGER NOT NULL,
+                target_volume_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                verified INTEGER NOT NULL,
+                PRIMARY KEY (file_key, time_signature, source_volume_id, target_volume_id)
+            ) WITHOUT ROWID
+            """,
+            # Identical content on more drives than the hash pairing bounds
+            # allow: one existence row per (hash, own drive, other drive).
+            """
+            CREATE TEMP TABLE backup_stage_hash_targets (
+                content_hash_algorithm TEXT NOT NULL,
+                content_hash BLOB NOT NULL,
+                source_volume_id INTEGER NOT NULL,
+                target_volume_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                verified INTEGER NOT NULL,
+                PRIMARY KEY (
+                    content_hash_algorithm, content_hash, source_volume_id, target_volume_id
+                )
+            ) WITHOUT ROWID
+            """,
             """
             CREATE TEMP TABLE backup_work_folders (
                 folder_id INTEGER PRIMARY KEY,
@@ -915,7 +1282,8 @@ class BackupAnalysisEngine:
                 parent_id INTEGER,
                 fingerprint BLOB NOT NULL,
                 recursive_file_count INTEGER NOT NULL,
-                recursive_size_bytes INTEGER NOT NULL
+                recursive_size_bytes INTEGER NOT NULL,
+                depth INTEGER NOT NULL
             )
             """,
             """
@@ -1217,7 +1585,7 @@ class BackupAnalysisEngine:
                         row["name"], int(row["size_bytes"] or 0), saved_hash
                     ),
                     _path_key(row["relative_path"]),
-                    row["modified_at"],
+                    _canonical_modified_time(row["modified_at"]),
                     int(row["size_bytes"] or 0),
                     int(evidence_eligible),
                     saved_hash[1] if saved_hash is not None else None,
@@ -1268,24 +1636,43 @@ class BackupAnalysisEngine:
             )
         self._emit(progress_callback, "index_files", total, total, "Saved file metadata indexed")
 
+    def _group_volume_ids(self, where: str, params: tuple[Any, ...]) -> set[int]:
+        """Distinct drives holding one candidate group; bounded by the drive count, not by records."""
+        return {
+            int(row[0])
+            for row in self.connection.execute(
+                "SELECT DISTINCT volume_id FROM backup_work_files "
+                f"WHERE evidence_eligible = 1 AND {where}",
+                params,
+            )
+        }
+
     def _compare_hashes(
         self,
         total: int,
         progress_callback: ProgressCallback | None,
         cancel_callback: CancelCallback | None,
     ) -> dict[tuple[int, int], list[int]]:
-        """Stage bounded, one-to-one exact-content matches before metadata."""
+        """Record exact-content existence per drive; pair one-to-one only for coverage arithmetic."""
         pair_counts: dict[tuple[int, int], list[int]] = defaultdict(lambda: [0, 0, 0])
         result_batch: list[tuple[Any, ...]] = []
         target_batch: list[tuple[Any, ...]] = []
+        hash_target_batch: list[tuple[Any, ...]] = []
         processed = 0
 
         def flush(force: bool = False) -> None:
             if not force and (
                 len(result_batch) < self.options.batch_size
                 and len(target_batch) < self.options.batch_size * 4
+                and len(hash_target_batch) < self.options.batch_size * 4
             ):
                 return
+            if hash_target_batch:
+                self.connection.executemany(
+                    "INSERT OR REPLACE INTO backup_stage_hash_targets VALUES (?, ?, ?, ?, 'likely', 1)",
+                    hash_target_batch,
+                )
+                hash_target_batch.clear()
             if result_batch:
                 self.connection.executemany(
                     "INSERT OR REPLACE INTO backup_stage_file_results VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1305,11 +1692,14 @@ class BackupAnalysisEngine:
                 )
                 target_batch.clear()
 
-        def pair_rows(
-            rows: list[sqlite3.Row],
-        ) -> tuple[dict[int, set[int]], set[int]]:
-            assignments: dict[int, set[int]] = defaultdict(set)
-            competing_files: set[int] = set()
+        def count_pairs(rows: list[sqlite3.Row]) -> None:
+            """Pair identical-content records one-to-one per drive pair.
+
+            Same name and parent path pair first, then whatever is left, so
+            drive-pair percentages (mirror candidates) never count one target
+            record twice. Pairing decides nothing else: item and folder
+            verdicts follow existence, which stage() records separately.
+            """
             by_volume: dict[int, list[sqlite3.Row]] = defaultdict(list)
             for row in rows:
                 by_volume[int(row["volume_id"])].append(row)
@@ -1321,22 +1711,8 @@ class BackupAnalysisEngine:
                 source_row: sqlite3.Row,
                 target_row: sqlite3.Row,
             ) -> None:
-                source_file_id = int(source_row["file_id"])
-                target_file_id = int(target_row["file_id"])
-                assignments[source_file_id].add(target)
-                assignments[target_file_id].add(source)
-                _add_pair_count(
-                    pair_counts,
-                    source,
-                    target,
-                    int(source_row["size_bytes"] or 0),
-                )
-                _add_pair_count(
-                    pair_counts,
-                    target,
-                    source,
-                    int(target_row["size_bytes"] or 0),
-                )
+                _add_pair_count(pair_counts, source, target, int(source_row["size_bytes"] or 0))
+                _add_pair_count(pair_counts, target, source, int(target_row["size_bytes"] or 0))
 
             for source_index, source in enumerate(volume_ids):
                 for target in volume_ids[source_index + 1 :]:
@@ -1356,11 +1732,9 @@ class BackupAnalysisEngine:
                     used_source: set[int] = set()
                     used_target: set[int] = set()
                     for context in source_by_context.keys() & target_by_context.keys():
-                        context_source = source_by_context[context]
-                        context_target = target_by_context[context]
-                        if len(context_source) != len(context_target):
-                            continue
-                        for source_row, target_row in zip(context_source, context_target):
+                        for source_row, target_row in zip(
+                            source_by_context[context], target_by_context[context]
+                        ):
                             used_source.add(int(source_row["file_id"]))
                             used_target.add(int(target_row["file_id"]))
                             assign(source, target, source_row, target_row)
@@ -1371,59 +1745,37 @@ class BackupAnalysisEngine:
                     remaining_target = [
                         row for row in target_rows if int(row["file_id"]) not in used_target
                     ]
-                    if len(remaining_source) == len(remaining_target):
-                        for source_row, target_row in zip(remaining_source, remaining_target):
-                            assign(source, target, source_row, target_row)
-                    elif remaining_source and remaining_target:
-                        competing_files.update(
-                            int(row["file_id"])
-                            for row in (*remaining_source, *remaining_target)
-                        )
-            return assignments, competing_files
+                    for source_row, target_row in zip(remaining_source, remaining_target):
+                        assign(source, target, source_row, target_row)
 
         def stage(
             rows: Iterable[sqlite3.Row],
-            assignments: dict[int, set[int]],
+            group_volume_ids: set[int],
             *,
-            ambiguous_group: bool,
+            over_bound: bool,
             group_records: int,
             group_volumes: int,
-            competing_files: set[int] | None = None,
         ) -> None:
             nonlocal processed
-            competing = competing_files or set()
+            # Over-bound groups write existence once per own drive, not per
+            # record; the rows join back to every record of that hash there.
+            staged_sources: set[int] = set()
             for member in rows:
                 file_id = int(member["file_id"])
                 source_volume = int(member["volume_id"])
-                verified_targets = sorted(assignments.get(file_id, ()))
-                if verified_targets:
-                    status = "likely"
-                    evidence = (
-                        "An exact SHA-256 content hash matches on another drive. "
-                        "Repeated identical-content records are paired one-to-one per drive."
+                other_volumes = _capped_ids(group_volume_ids - {source_volume})
+                evidence = FILE_EVIDENCE_HASH_VERIFIED
+                if over_bound:
+                    evidence += (
+                        FILE_EVIDENCE_REPEATED_CONTENT_NOTE
+                        + f" {group_records:,} records across {group_volumes:,} drives."
                     )
-                elif file_id in competing:
-                    status = "ambiguous"
-                    evidence = (
-                        "The exact SHA-256 content occurs repeatedly with unequal copy "
-                        "counts. No arbitrary individual-file pairing is claimed."
-                    )
-                elif ambiguous_group:
-                    status = "ambiguous"
-                    evidence = (
-                        "This exact SHA-256 content is too repetitive to map safely to "
-                        f"individual catalogue records: {group_records:,} records across "
-                        f"{group_volumes:,} drives. Individual links are suppressed rather "
-                        "than reusing target records."
-                    )
-                else:
-                    continue
-                ids_json = _json_ids(verified_targets)
+                ids_json = _json_ids(other_volumes)
                 result_batch.append(
                     (
                         file_id,
                         source_volume,
-                        status,
+                        "likely",
                         ids_json,
                         evidence,
                         ids_json,
@@ -1431,7 +1783,19 @@ class BackupAnalysisEngine:
                         ids_json,
                     )
                 )
-                target_batch.extend((file_id, target) for target in verified_targets)
+                # Every drive holding this content is a verified target, so
+                # folder coverage follows existence rather than pairing.
+                if over_bound:
+                    if source_volume not in staged_sources:
+                        staged_sources.add(source_volume)
+                        algorithm = str(member["content_hash_algorithm"])
+                        digest = bytes(member["content_hash"])
+                        hash_target_batch.extend(
+                            (algorithm, digest, source_volume, target)
+                            for target in sorted(group_volume_ids - {source_volume})
+                        )
+                else:
+                    target_batch.extend((file_id, target) for target in other_volumes)
                 processed += 1
                 flush()
 
@@ -1458,7 +1822,7 @@ class BackupAnalysisEngine:
                      wf.file_key, wf.parent_path_key, wf.volume_id, wf.file_id
             """
         )
-        for _key, hash_rows in groupby(
+        for key, hash_rows in groupby(
             members_cursor,
             key=lambda row: (
                 str(row["content_hash_algorithm"]),
@@ -1470,30 +1834,34 @@ class BackupAnalysisEngine:
             group_records = int(first["record_count"])
             group_volumes = int(first["volume_count"])
             candidate_edges = group_records * (group_volumes - 1)
-            ambiguous_group = (
+            over_bound = (
                 group_volumes > self.options.max_hash_volumes_per_signature
                 or group_records > self.options.max_hash_records_per_signature
                 or candidate_edges > self.options.max_hash_edges_per_signature
             )
             all_rows = chain((first,), hash_rows)
-            if ambiguous_group:
+            if over_bound:
+                # Existence only: the drive set is small even when the record
+                # list is enormous, and pairing is skipped for performance.
+                group_volume_ids = self._group_volume_ids(
+                    "content_hash_algorithm = ? AND content_hash = ?", key
+                )
                 stage(
                     all_rows,
-                    {},
-                    ambiguous_group=True,
+                    group_volume_ids,
+                    over_bound=True,
                     group_records=group_records,
                     group_volumes=group_volumes,
                 )
             else:
                 rows = list(all_rows)
-                assignments, competing = pair_rows(rows)
+                count_pairs(rows)
                 stage(
                     rows,
-                    assignments,
-                    ambiguous_group=False,
+                    {int(row["volume_id"]) for row in rows},
+                    over_bound=False,
                     group_records=group_records,
                     group_volumes=group_volumes,
-                    competing_files=competing,
                 )
             self._emit(
                 progress_callback,
@@ -1523,11 +1891,11 @@ class BackupAnalysisEngine:
                 GROUP BY file_key
                 HAVING COUNT(DISTINCT volume_id) > 1
             )
-            SELECT wf.file_key, wf.file_id, wf.volume_id, wf.folder_id,
-                   wf.parent_path_key, wf.modified_at, wf.size_bytes,
+            SELECT wf.file_key, wf.file_id, wf.volume_id, wf.parent_path_key,
+                   wf.modified_at, wf.size_bytes,
                    wf.content_hash, wf.content_hash_algorithm,
-                   existing.status AS existing_status,
                    existing.verified_volume_ids AS existing_verified_volume_ids,
+                   existing.evidence_text AS existing_evidence,
                    candidates.record_count, candidates.volume_count
             FROM backup_work_files wf
             JOIN candidate_keys candidates ON candidates.file_key = wf.file_key
@@ -1540,14 +1908,22 @@ class BackupAnalysisEngine:
         )
         result_batch: list[tuple[Any, ...]] = []
         target_batch: list[tuple[Any, ...]] = []
+        key_target_batch: list[tuple[Any, ...]] = []
         processed = 0
 
         def flush_batches(force: bool = False) -> None:
             if not force and (
                 len(result_batch) < self.options.batch_size
                 and len(target_batch) < self.options.batch_size * 4
+                and len(key_target_batch) < self.options.batch_size * 4
             ):
                 return
+            if key_target_batch:
+                self.connection.executemany(
+                    "INSERT OR REPLACE INTO backup_stage_key_targets VALUES (?, ?, ?, ?, ?, ?)",
+                    key_target_batch,
+                )
+                key_target_batch.clear()
             if result_batch:
                 self.connection.executemany(
                     "INSERT OR REPLACE INTO backup_stage_file_results VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1573,221 +1949,479 @@ class BackupAnalysisEngine:
                 )
                 target_batch.clear()
 
-        def pair_rows(
-            rows: list[sqlite3.Row],
-            *,
-            allow_weak: bool,
-        ) -> tuple[dict[int, dict[int, str]], set[int], set[int]]:
-            """Assign at most one candidate per source/target drive pair.
+        def as_record(row: sqlite3.Row) -> _FileRecord:
+            modified_at = str(row["modified_at"] or "")
+            saved_hash = (
+                (str(row["content_hash_algorithm"]), bytes(row["content_hash"]))
+                if row["content_hash"] is not None
+                else None
+            )
+            return _FileRecord(
+                int(row["file_id"]),
+                int(row["volume_id"]),
+                bytes(row["parent_path_key"]),
+                modified_at,
+                _parse_modified_time(modified_at) if modified_at else None,
+                saved_hash,
+                int(row["size_bytes"] or 0),
+            )
 
-            A filename may occur repeatedly on one drive. Pairing by multiplicity
-            prevents two source records from both claiming the same lone target
-            record in folder and whole-drive percentages.
+        def times_match(first: _FileRecord, second: _FileRecord) -> bool:
+            if not first.modified_at or not second.modified_at:
+                return False
+            return _instants_match(
+                first.modified_at,
+                first.modified_instant,
+                second.modified_at,
+                second.modified_instant,
+            )
+
+        def time_delta(first: _FileRecord, second: _FileRecord) -> float:
+            if (
+                first.modified_at == second.modified_at
+                or first.modified_instant is None
+                or second.modified_instant is None
+            ):
+                return 0.0
+            return abs((first.modified_instant - second.modified_instant).total_seconds())
+
+        def within_tolerance(first: _FileRecord, second: _FileRecord) -> bool:
+            """Generic groups: within 2 s only; the one-hour rule would chain unrelated copies."""
+            if first.modified_instant is None or second.modified_instant is None:
+                return False
+            if first.modified_at == second.modified_at:
+                return True
+            return (
+                abs((first.modified_instant - second.modified_instant).total_seconds())
+                <= MODIFIED_TIME_TOLERANCE_SECONDS
+            )
+
+        def existence(
+            records: list[_FileRecord],
+        ) -> dict[int, tuple[set[int], set[int], set[int]]]:
+            """Per record: other drives with an equal hash, a time match, or only differing hashes."""
+            by_volume: dict[int, list[_FileRecord]] = defaultdict(list)
+            for record in records:
+                by_volume[record.volume_id].append(record)
+            found: dict[int, tuple[set[int], set[int], set[int]]] = {}
+            for record in records:
+                verified: set[int] = set()
+                strong: set[int] = set()
+                conflict: set[int] = set()
+                for volume, others in by_volume.items():
+                    if volume == record.volume_id:
+                        continue
+                    best = 0
+                    for other in others:
+                        equal = _saved_hashes_equal(record.content_hash, other.content_hash)
+                        if equal is True:
+                            best = 3
+                            break
+                        if equal is False:
+                            continue
+                        best = max(best, 2 if times_match(record, other) else 1)
+                    if best == 3:
+                        verified.add(volume)
+                    elif best == 2:
+                        strong.add(volume)
+                    elif best == 0:
+                        conflict.add(volume)
+                found[record.file_id] = (verified, strong, conflict)
+            return found
+
+        def pair_drive(
+            source_records: list[_FileRecord],
+            target_records: list[_FileRecord],
+            match: Callable[[_FileRecord, _FileRecord], bool],
+        ) -> list[tuple[_FileRecord, _FileRecord, str]]:
+            """One-to-one coverage pairs between two drives.
+
+            Time matches (per `match`) pair first (closest times, then same
+            parent path); leftovers pair arbitrarily as 'possible'. Differing
+            comparable hashes never pair. Equal hashes are consumed as 'hash'
+            because the hash pass already staged and counted them.
             """
-            assignments: dict[int, dict[int, str]] = defaultdict(dict)
-            competing_files: set[int] = set()
-            hash_conflict_files: set[int] = set()
-            by_volume: dict[int, list[sqlite3.Row]] = defaultdict(list)
-            for row in rows:
-                by_volume[int(row["volume_id"])].append(row)
+            candidates: list[tuple[int, float, int, int, int, _FileRecord, _FileRecord]] = []
+            for source in source_records:
+                for target in target_records:
+                    equal = _saved_hashes_equal(source.content_hash, target.content_hash)
+                    if equal is False:
+                        continue
+                    if equal is True:
+                        candidates.append((0, 0.0, 0, source.file_id, target.file_id, source, target))
+                    elif match(source, target):
+                        candidates.append(
+                            (
+                                1,
+                                time_delta(source, target),
+                                int(source.parent_path_key != target.parent_path_key),
+                                source.file_id,
+                                target.file_id,
+                                source,
+                                target,
+                            )
+                        )
+            candidates.sort(key=lambda item: item[:5])
+            used_source: set[int] = set()
+            used_target: set[int] = set()
+            pairs: list[tuple[_FileRecord, _FileRecord, str]] = []
+            for rank, _delta, _moved, _source_id, _target_id, source, target in candidates:
+                if source.file_id in used_source or target.file_id in used_target:
+                    continue
+                used_source.add(source.file_id)
+                used_target.add(target.file_id)
+                pairs.append((source, target, "hash" if rank == 0 else "likely"))
+            remaining_target = [
+                target for target in target_records if target.file_id not in used_target
+            ]
+            for source in source_records:
+                if source.file_id in used_source:
+                    continue
+                for index, target in enumerate(remaining_target):
+                    equal = _saved_hashes_equal(source.content_hash, target.content_hash)
+                    if equal is False:
+                        continue
+                    pairs.append((source, remaining_target.pop(index), "hash" if equal else "possible"))
+                    break
+            return pairs
+
+        def count_pairs(
+            records: list[_FileRecord],
+            match: Callable[[_FileRecord, _FileRecord], bool] = times_match,
+        ) -> None:
+            """Drive-pair overlap for mirror candidates; decides no item or folder verdict.
+
+            Only strong pairs count: time-matched here, hash-equal in the hash
+            pass (skipped here so they are not counted twice). Records that
+            agree on name and size alone never make two drives look alike.
+            """
+            by_volume: dict[int, list[_FileRecord]] = defaultdict(list)
+            for record in records:
+                by_volume[record.volume_id].append(record)
             volume_ids = sorted(by_volume)
-            size_bytes = int(rows[0]["size_bytes"] or 0) if rows else 0
-
-            def comparable_hashes(
-                first: sqlite3.Row,
-                second: sqlite3.Row,
-            ) -> tuple[bool, bool]:
-                if first["content_hash"] is None or second["content_hash"] is None:
-                    return False, False
-                if str(first["content_hash_algorithm"]) != str(
-                    second["content_hash_algorithm"]
-                ):
-                    return False, False
-                return True, bytes(first["content_hash"]) == bytes(second["content_hash"])
-
             for source_index, source in enumerate(volume_ids):
                 for target in volume_ids[source_index + 1 :]:
-                    source_rows = by_volume[source]
-                    target_rows = by_volume[target]
-                    source_by_signature: dict[tuple[str, bytes], list[sqlite3.Row]] = defaultdict(list)
-                    target_by_signature: dict[tuple[str, bytes], list[sqlite3.Row]] = defaultdict(list)
-                    for row in source_rows:
-                        if row["modified_at"]:
-                            source_by_signature[
-                                (str(row["modified_at"]), bytes(row["parent_path_key"]))
-                            ].append(row)
-                    for row in target_rows:
-                        if row["modified_at"]:
-                            target_by_signature[
-                                (str(row["modified_at"]), bytes(row["parent_path_key"]))
-                            ].append(row)
-
-                    used_source: set[int] = set()
-                    used_target: set[int] = set()
-                    matched = 0
-                    for signature in source_by_signature.keys() & target_by_signature.keys():
-                        signature_source = source_by_signature[signature]
-                        signature_target = target_by_signature[signature]
-                        if len(signature_source) != len(signature_target):
-                            competing_files.update(
-                                int(row["file_id"])
-                                for row in (*signature_source, *signature_target)
-                            )
+                    for source_record, target_record, status in pair_drive(
+                        by_volume[source], by_volume[target], match
+                    ):
+                        if status != "likely":
                             continue
-                        for source_row, target_row in zip(
-                            signature_source,
-                            signature_target,
-                        ):
-                            source_file_id = int(source_row["file_id"])
-                            target_file_id = int(target_row["file_id"])
-                            used_source.add(source_file_id)
-                            used_target.add(target_file_id)
-                            comparable, hashes_equal = comparable_hashes(
-                                source_row, target_row
-                            )
-                            if comparable:
-                                if not hashes_equal:
-                                    hash_conflict_files.update(
-                                        (source_file_id, target_file_id)
-                                    )
-                                # Equal comparable hashes were handled by the
-                                # preferred hash pass; unequal ones are a veto.
-                                continue
-                            assignments[source_file_id][target] = "likely"
-                            assignments[target_file_id][source] = "likely"
-                            matched += 1
+                        _add_pair_count(pair_counts, source, target, source_record.size_bytes)
+                        _add_pair_count(pair_counts, target, source, target_record.size_bytes)
 
-                    if allow_weak:
-                        remaining_source = [
-                            row for row in source_rows if int(row["file_id"]) not in used_source
-                        ]
-                        remaining_target = [
-                            row for row in target_rows if int(row["file_id"]) not in used_target
-                        ]
-                        if len(remaining_source) == len(remaining_target) == 1:
-                            source_row = remaining_source[0]
-                            target_row = remaining_target[0]
-                            source_file_id = int(source_row["file_id"])
-                            target_file_id = int(target_row["file_id"])
-                            comparable, hashes_equal = comparable_hashes(
-                                source_row, target_row
-                            )
-                            if comparable:
-                                if not hashes_equal:
-                                    hash_conflict_files.update(
-                                        (source_file_id, target_file_id)
-                                    )
-                                continue
-                            assignments[source_file_id][target] = "possible"
-                            assignments[target_file_id][source] = "possible"
-                            matched += 1
-                        elif remaining_source and remaining_target:
-                            # Weak name+size evidence cannot choose a truthful
-                            # one-to-one correspondence between repeated rows.
-                            # Suppress the arbitrary pair instead of making one
-                            # sibling amber and another red.
-                            competing_files.update(
-                                int(row["file_id"])
-                                for row in (*remaining_source, *remaining_target)
-                            )
+        def count_bucket_pairs(records: list[_FileRecord]) -> None:
+            """Drive-pair overlap for one generic time bucket.
 
-                    for _ in range(matched):
-                        _add_pair_count(pair_counts, source, target, size_bytes)
-                        _add_pair_count(pair_counts, target, source, size_bytes)
-            return assignments, competing_files, hash_conflict_files
+            Every record here shares the name and size; with no saved hashes
+            two copies pair whenever their times lie within the tolerance, so
+            a two-pointer walk over each drive's time-sorted records finds the
+            one-to-one pairing without comparing every record with every
+            other (500 copies on two drives would otherwise mean 250,000
+            comparisons). A bucket holding a saved hash takes the full pairing
+            so conflicting content never pairs.
+            """
+            if any(record.content_hash is not None for record in records):
+                count_pairs(records, within_tolerance)
+                return
+            by_volume: dict[int, list[_FileRecord]] = defaultdict(list)
+            for record in records:
+                if record.modified_instant is not None:
+                    by_volume[record.volume_id].append(record)
+            for volume_records in by_volume.values():
+                volume_records.sort(key=lambda record: record.modified_instant)
+            volume_ids = sorted(by_volume)
+            for source_index, source in enumerate(volume_ids):
+                source_records = by_volume[source]
+                for target in volume_ids[source_index + 1 :]:
+                    target_records = by_volume[target]
+                    source_at = target_at = 0
+                    while source_at < len(source_records) and target_at < len(target_records):
+                        first = source_records[source_at]
+                        second = target_records[target_at]
+                        delta = (first.modified_instant - second.modified_instant).total_seconds()
+                        if abs(delta) <= MODIFIED_TIME_TOLERANCE_SECONDS:
+                            _add_pair_count(pair_counts, source, target, first.size_bytes)
+                            _add_pair_count(pair_counts, target, source, second.size_bytes)
+                            source_at += 1
+                            target_at += 1
+                        elif delta < 0:
+                            source_at += 1
+                        else:
+                            target_at += 1
 
-        def stage_rows(
-            rows: Iterable[sqlite3.Row],
-            assignments: dict[int, dict[int, str]],
+        hash_covered_cache: dict[tuple[str, bytes, int], frozenset[int]] = {}
+
+        def hash_covered_targets(algorithm: str, digest: bytes, own_volume: int) -> frozenset[int]:
+            """Drives the hash pass already wrote for this (hash, own drive) as existence rows."""
+            cache_key = (algorithm, digest, own_volume)
+            covered = hash_covered_cache.get(cache_key)
+            if covered is None:
+                covered = frozenset(
+                    int(row[0])
+                    for row in self.connection.execute(
+                        """
+                        SELECT target_volume_id FROM backup_stage_hash_targets
+                        WHERE content_hash_algorithm = ? AND content_hash = ?
+                          AND source_volume_id = ?
+                        """,
+                        cache_key,
+                    )
+                )
+                hash_covered_cache[cache_key] = covered
+            return covered
+
+        def stage_member(
+            member: sqlite3.Row,
             *,
-            ambiguous_group: bool,
+            group_volume_ids: set[int],
+            verified: set[int],
+            strong: set[int],
+            conflict: set[int],
+            generic_group: bool,
             group_records: int,
             group_volumes: int,
-            competing_files: set[int] | None = None,
-            hash_conflict_files: set[int] | None = None,
+            key_targets: set[tuple[str, int]] | None = None,
         ) -> None:
-            nonlocal processed
-            competing = competing_files or set()
-            hash_conflicts = hash_conflict_files or set()
-            for member in rows:
-                file_id = int(member["file_id"])
-                source_volume = int(member["volume_id"])
-                targets = assignments.get(file_id, {})
-                verified_targets = set(
-                    _parse_ids(member["existing_verified_volume_ids"])
-                )
-                metadata_likely_targets = {
-                    volume_id
-                    for volume_id, match_status in targets.items()
-                    if match_status == "likely"
-                }
-                likely_targets = sorted(verified_targets | metadata_likely_targets)
-                possible_targets = sorted(
-                    volume_id
-                    for volume_id, match_status in targets.items()
-                    if match_status == "possible" and volume_id not in likely_targets
-                )
-                if verified_targets:
-                    status = "likely"
-                    reported_volumes = sorted(set(likely_targets) | set(possible_targets))
-                    evidence = FILE_EVIDENCE_HASH_VERIFIED
-                    if metadata_likely_targets - verified_targets or possible_targets:
-                        evidence += FILE_EVIDENCE_HASH_VERIFIED_EXTRA_DRIVES
-                    evidence += FILE_EVIDENCE_PAIRED_SUFFIX
-                elif likely_targets:
-                    status = "likely"
-                    reported_volumes = sorted(set(likely_targets) | set(possible_targets))
-                    evidence = FILE_EVIDENCE_METADATA_LIKELY
-                elif possible_targets:
-                    status = "possible"
-                    reported_volumes = possible_targets
-                    evidence = FILE_EVIDENCE_NAME_SIZE_ONLY
-                elif file_id in hash_conflicts:
-                    status = "ambiguous"
-                    reported_volumes = []
-                    evidence = FILE_EVIDENCE_HASH_CONFLICT
-                elif file_id in competing:
-                    status = "ambiguous"
-                    reported_volumes = []
-                    evidence = FILE_EVIDENCE_COMPETING
-                elif str(member["existing_status"] or "") == "ambiguous":
-                    status = "ambiguous"
-                    reported_volumes = []
-                    evidence = FILE_EVIDENCE_REPETITIVE_HASH
-                elif ambiguous_group:
-                    status = "ambiguous"
-                    reported_volumes = []
-                    evidence = (
-                        f"{FILE_EVIDENCE_TOO_COMMON_PREFIX} {group_records:,} records across "
-                        f"{group_volumes:,} drives. Weak matches are excluded from folder "
-                        "and drive-copy coverage; bounded exact path-and-time matches can "
-                        "still be used."
-                    )
-                else:
-                    status = "single"
-                    reported_volumes = []
-                    evidence = (
-                        "Other records share this filename and size, but no unused "
-                        "one-to-one candidate remained on another drive."
-                    )
-                result_batch.append(
-                    (
-                        file_id,
-                        source_volume,
-                        status,
-                        _json_ids(reported_volumes),
-                        evidence,
-                        _json_ids(likely_targets),
-                        _json_ids(possible_targets),
-                        _json_ids(verified_targets),
-                    )
-                )
-                for target_volume, target_status in sorted(targets.items()):
-                    target_batch.append((file_id, target_volume, target_status, 0))
-                processed += 1
-                flush_batches()
+            """Stage one record's verdict and its folder-coverage targets.
 
-        for _file_key, member_rows in groupby(
+            key_targets (generic groups only) collects the (modified-time text,
+            own drive) combinations already written to backup_stage_key_targets,
+            so existence is recorded once per combination rather than per record.
+            """
+            nonlocal processed
+            file_id = int(member["file_id"])
+            own_volume = int(member["volume_id"])
+            verified = (verified | set(_parse_ids(member["existing_verified_volume_ids"]))) - {own_volume}
+            strong = (strong | verified) - {own_volume}
+            # A drive whose same-name records all differ by hash is never a
+            # lead, but it is still noted even when it holds a verified copy
+            # under another name. The group spans more than one drive, so
+            # every other drive is strong, possible or a conflict.
+            possible = group_volume_ids - strong - conflict - {own_volume}
+            existing_evidence = str(member["existing_evidence"] or "")
+            if verified:
+                status = "likely"
+                evidence = FILE_EVIDENCE_HASH_VERIFIED
+                if (strong - verified) or possible:
+                    evidence += FILE_EVIDENCE_HASH_VERIFIED_EXTRA_DRIVES
+                if FILE_EVIDENCE_REPEATED_CONTENT_NOTE in existing_evidence:
+                    evidence += existing_evidence[
+                        existing_evidence.index(FILE_EVIDENCE_REPEATED_CONTENT_NOTE) :
+                    ]
+            elif generic_group:
+                status = "likely" if strong else "possible"
+                evidence = (
+                    FILE_EVIDENCE_GENERIC_PREFIX
+                    + f" {group_records:,} records across {group_volumes:,} drives."
+                )
+            elif strong:
+                status = "likely"
+                evidence = FILE_EVIDENCE_TIME_MATCH
+            elif possible:
+                status = "possible"
+                evidence = FILE_EVIDENCE_NAME_SIZE_ONLY
+            else:
+                status = "ambiguous"
+                evidence = FILE_EVIDENCE_HASH_CONFLICT
+            if conflict and status != "ambiguous":
+                evidence += FILE_EVIDENCE_CONFLICT_NOTE
+            result_batch.append(
+                (
+                    file_id,
+                    own_volume,
+                    status,
+                    _json_ids(_capped_ids_preferring(strong, possible)),
+                    evidence,
+                    _json_ids(_capped_ids(strong)),
+                    _json_ids(_capped_ids(possible)),
+                    _json_ids(_capped_ids(verified)),
+                )
+            )
+            # Folder coverage follows existence: one target row per other drive
+            # that holds this file, strongest evidence first when a huge group
+            # has to be capped. Verified drives were already written by the
+            # hash pass (per record, or per hash for over-bound groups), so
+            # they are not repeated here and no file is counted twice.
+            likely_targets = _capped_ids(strong - verified)
+            possible_targets = _capped_ids(possible)[
+                : MAX_STORED_OTHER_VOLUME_IDS - len(likely_targets)
+            ]
+            if (
+                member["content_hash"] is not None
+                and FILE_EVIDENCE_REPEATED_CONTENT_NOTE in existing_evidence
+            ):
+                # An over-bound hash group stored its verified drive ids capped,
+                # but wrote an existence row per (hash, own drive) for EVERY
+                # drive holding the content. A drive beyond the cap therefore
+                # looks unverified here while already being covered; writing
+                # it again would count this file twice on that drive.
+                hash_covered = hash_covered_targets(
+                    str(member["content_hash_algorithm"]),
+                    bytes(member["content_hash"]),
+                    own_volume,
+                )
+                likely_targets = [target for target in likely_targets if target not in hash_covered]
+                possible_targets = [
+                    target for target in possible_targets if target not in hash_covered
+                ]
+            if key_targets is not None and member["content_hash"] is None:
+                # Generic group without a saved hash: every record sharing this
+                # key, time text and drive has the same other drives, so the
+                # existence rows are written once and joined back by key.
+                signature = str(member["modified_at"] or "")
+                if (signature, own_volume) not in key_targets:
+                    key_targets.add((signature, own_volume))
+                    file_key = bytes(member["file_key"])
+                    key_target_batch.extend(
+                        (file_key, signature, own_volume, target, "likely", 0)
+                        for target in likely_targets
+                    )
+                    key_target_batch.extend(
+                        (file_key, signature, own_volume, target, "possible", 0)
+                        for target in possible_targets
+                    )
+            else:
+                target_batch.extend(
+                    (file_id, target, "likely", 0) for target in likely_targets
+                )
+                target_batch.extend(
+                    (file_id, target, "possible", 0) for target in possible_targets
+                )
+            processed += 1
+            flush_batches()
+
+        def stage_generic(
+            rows: list[sqlite3.Row],
+            strong_per_row: list[set[int]],
+            group_volume_ids: set[int],
+            group_records: int,
+            group_volumes: int,
+            key_targets: set[tuple[str, int]],
+        ) -> None:
+            for row, strong_volumes in zip(rows, strong_per_row):
+                stage_member(
+                    row,
+                    group_volume_ids=group_volume_ids,
+                    verified=set(),
+                    strong=strong_volumes,
+                    conflict=set(),
+                    generic_group=True,
+                    group_records=group_records,
+                    group_volumes=group_volumes,
+                    key_targets=key_targets,
+                )
+
+        def bucket_strong_per_row(
+            bucket: list[sqlite3.Row],
+            instants: list[datetime],
+        ) -> list[set[int]]:
+            """Per record: other drives holding a copy within the tolerance window.
+
+            A chained bucket only bounds the work; two records ten seconds
+            apart in one chain are not the same file. The bucket is walked in
+            time order with a sliding window, so each record sees exactly the
+            drives whose copies lie within MODIFIED_TIME_TOLERANCE_SECONDS.
+            """
+            order = sorted(range(len(bucket)), key=instants.__getitem__)
+            volumes = [int(bucket[index]["volume_id"]) for index in order]
+            times = [instants[index] for index in order]
+            strong: list[set[int]] = [set() for _ in bucket]
+            window: Counter[int] = Counter()
+            window_volumes: set[int] = set()
+            left = right = 0
+            for position, own_index in enumerate(order):
+                instant = times[position]
+                while (instant - times[left]).total_seconds() > MODIFIED_TIME_TOLERANCE_SECONDS:
+                    volume = volumes[left]
+                    window[volume] -= 1
+                    if window[volume] == 0:
+                        del window[volume]
+                        window_volumes = set(window)
+                    left += 1
+                while (
+                    right < len(times)
+                    and (times[right] - instant).total_seconds() <= MODIFIED_TIME_TOLERANCE_SECONDS
+                ):
+                    volume = volumes[right]
+                    if volume not in window:
+                        window_volumes = set(window) | {volume}
+                    window[volume] += 1
+                    right += 1
+                strong[own_index] = window_volumes - {volumes[position]}
+            return strong
+
+        def time_buckets(
+            rows: Iterable[sqlite3.Row],
+        ) -> Iterator[tuple[list[sqlite3.Row], list[set[int]]]]:
+            """Sweep a generic group, in saved-time order, into tolerance buckets.
+
+            Consecutive records whose modified times are within
+            MODIFIED_TIME_TOLERANCE_SECONDS of each other chain into one bucket
+            (FAT drives round to 2 s); the chain only bounds the work. Yields
+            (rows, strong_per_row): for each record the other drives holding a
+            copy within the tolerance of THAT record, and an empty set for a
+            record with no readable time or when too many copies share the
+            time for any of them to count as strong. The record bound applies
+            per drive, so a two-drive mirror of many identical generic files
+            keeps its evidence while the drive and edge bounds still cap the
+            work. The one-hour FAT/DST rule is NOT applied in generic groups:
+            for a name this common it would chain unrelated copies across an
+            hour.
+            """
+            bucket: list[sqlite3.Row] = []
+            bucket_instants: list[datetime] = []
+            bucket_volumes: Counter[int] = Counter()
+            last_instant: datetime | None = None
+            too_common = False
+
+            def bucket_strong() -> list[set[int]]:
+                if len(bucket_volumes) > 1:
+                    return bucket_strong_per_row(bucket, bucket_instants)
+                return [set() for _ in bucket]
+
+            for row in rows:
+                modified_at = str(row["modified_at"] or "")
+                instant = _parse_modified_time(modified_at) if modified_at else None
+                if instant is None:
+                    # An empty or unreadable time is never strong evidence.
+                    yield [row], [set()]
+                    continue
+                if (
+                    last_instant is not None
+                    and abs((instant - last_instant).total_seconds())
+                    > MODIFIED_TIME_TOLERANCE_SECONDS
+                ):
+                    if bucket:
+                        yield bucket, bucket_strong()
+                        bucket = []
+                        bucket_instants = []
+                        bucket_volumes = Counter()
+                    too_common = False
+                last_instant = instant
+                if too_common:
+                    yield [row], [set()]
+                    continue
+                volume = int(row["volume_id"])
+                bucket.append(row)
+                bucket_instants.append(instant)
+                bucket_volumes[volume] += 1
+                bucket_edges = len(bucket) * max(0, len(bucket_volumes) - 1)
+                if (
+                    len(bucket_volumes) > self.options.max_strong_volumes_per_signature
+                    or bucket_volumes[volume] > self.options.max_strong_records_per_signature
+                    or bucket_edges > self.options.max_strong_edges_per_signature
+                ):
+                    # Too many copies share this time to call any of them
+                    # strong; the rest of the chain is treated the same way.
+                    yield bucket, [set() for _ in bucket]
+                    bucket = []
+                    bucket_instants = []
+                    bucket_volumes = Counter()
+                    too_common = True
+            if bucket:
+                yield bucket, bucket_strong()
+
+        for file_key, member_rows in groupby(
             candidate_members,
             key=lambda row: bytes(row["file_key"]),
         ):
@@ -1796,89 +2430,53 @@ class BackupAnalysisEngine:
             group_records = int(first_member["record_count"])
             group_volumes = int(first_member["volume_count"])
             candidate_edges = group_records * (group_volumes - 1)
-            ambiguous_group = (
+            generic_group = (
                 group_volumes > self.options.max_candidate_volumes_per_key
                 or group_records > self.options.max_candidate_records_per_key
                 or candidate_edges > self.options.max_candidate_edges_per_key
             )
             all_members = chain((first_member,), member_rows)
-            if not ambiguous_group:
+            if not generic_group:
                 members = list(all_members)
-                assignments, competing_files, hash_conflict_files = pair_rows(
-                    members, allow_weak=True
-                )
-                stage_rows(
-                    members,
-                    assignments,
-                    ambiguous_group=False,
-                    group_records=group_records,
-                    group_volumes=group_volumes,
-                    competing_files=competing_files,
-                    hash_conflict_files=hash_conflict_files,
-                )
+                records = [as_record(row) for row in members]
+                group_volume_ids = {record.volume_id for record in records}
+                count_pairs(records)
+                found = existence(records)
+                for member, record in zip(members, records):
+                    verified, strong, conflict = found[record.file_id]
+                    stage_member(
+                        member,
+                        group_volume_ids=group_volume_ids,
+                        verified=verified,
+                        strong=strong,
+                        conflict=conflict,
+                        generic_group=False,
+                        group_records=group_records,
+                        group_volumes=group_volumes,
+                    )
             else:
-                # The cursor is ordered by strong signature. Buffer only a
-                # bounded signature subgroup; a huge common key never becomes
-                # one huge Python list or an unbounded target-edge expansion.
-                for signature, signature_rows in groupby(
-                    all_members,
-                    key=lambda row: (
-                        str(row["modified_at"]) if row["modified_at"] else "",
-                        bytes(row["parent_path_key"]),
-                    ),
-                ):
-                    buffered_rows: list[sqlite3.Row] = []
-                    buffered_volumes: set[int] = set()
-                    signature_too_common = not bool(signature[0])
-                    for signature_row in signature_rows:
-                        if signature_too_common:
-                            stage_rows(
-                                (signature_row,),
-                                {},
-                                ambiguous_group=True,
-                                group_records=group_records,
-                                group_volumes=group_volumes,
-                            )
-                            continue
-                        buffered_rows.append(signature_row)
-                        buffered_volumes.add(int(signature_row["volume_id"]))
-                        buffered_edges = len(buffered_rows) * max(
-                            0, len(buffered_volumes) - 1
-                        )
-                        if (
-                            len(buffered_volumes)
-                            > self.options.max_strong_volumes_per_signature
-                            or len(buffered_rows)
-                            > self.options.max_strong_records_per_signature
-                            or buffered_edges
-                            > self.options.max_strong_edges_per_signature
-                        ):
-                            stage_rows(
-                                buffered_rows,
-                                {},
-                                ambiguous_group=True,
-                                group_records=group_records,
-                                group_volumes=group_volumes,
-                            )
-                            buffered_rows.clear()
-                            buffered_volumes.clear()
-                            signature_too_common = True
-                    if buffered_rows:
-                        if len(buffered_volumes) > 1:
-                            assignments, competing_files, hash_conflict_files = pair_rows(
-                                buffered_rows, allow_weak=False
-                            )
-                        else:
-                            assignments, competing_files, hash_conflict_files = {}, set(), set()
-                        stage_rows(
-                            buffered_rows,
-                            assignments,
-                            ambiguous_group=True,
-                            group_records=group_records,
-                            group_volumes=group_volumes,
-                            competing_files=competing_files,
-                            hash_conflict_files=hash_conflict_files,
-                        )
+                # A generic name and size is never paired for coverage
+                # (performance). The cursor is ordered by saved modified time,
+                # so a bounded time bucket can be swept out to supply the strong
+                # drives; a huge common key never becomes one huge Python list.
+                group_volume_ids = self._group_volume_ids("file_key = ?", (file_key,))
+                key_targets: set[tuple[str, int]] = set()
+                for bucket_rows, strong_per_row in time_buckets(all_members):
+                    stage_generic(
+                        bucket_rows,
+                        strong_per_row,
+                        group_volume_ids,
+                        group_records,
+                        group_volumes,
+                        key_targets,
+                    )
+                    if any(strong_per_row):
+                        # The bounded strong bucket is paired one-to-one purely
+                        # for drive-pair overlap (mirror candidates); it never
+                        # adds targets, which existence above already covers.
+                        # Only records within the tolerance of each other pair.
+                        count_bucket_pairs([as_record(row) for row in bucket_rows])
+            hash_covered_cache.clear()
             self._emit(
                 progress_callback,
                 "compare_files",
@@ -1889,6 +2487,15 @@ class BackupAnalysisEngine:
         flush_batches(force=True)
         self._emit(progress_callback, "compare_files", total, total, "Saved file metadata compared")
         return pair_counts
+
+    @staticmethod
+    def _pending_coverage_map() -> dict[int, dict[int, list[int]]]:
+        """Folder coverage awaiting children, keyed by parent folder id.
+
+        Only parents whose subtrees are still being judged live here; tests
+        replace this hook with a recording dict to pin that bound.
+        """
+        return {}
 
     def _compare_folders(
         self,
@@ -1971,10 +2578,11 @@ class BackupAnalysisEngine:
 
         fingerprints: dict[int, bytes] = {}
         evidence_totals: dict[int, tuple[int, int, int]] = {}
+        # Deepest first so children are judged before their parents; ties by
+        # folder id so the coverage cursor below can be read in lockstep.
         ordered_ids = sorted(
             info,
-            key=lambda folder_id: info[folder_id].depth,
-            reverse=True,
+            key=lambda folder_id: (-info[folder_id].depth, folder_id),
         )
         work_batch: list[tuple[Any, ...]] = []
         for processed, folder_id in enumerate(ordered_ids, start=1):
@@ -2013,11 +2621,12 @@ class BackupAnalysisEngine:
                     fingerprint,
                     evidence_files,
                     evidence_bytes,
+                    folder_info.depth,
                 )
             )
             if len(work_batch) >= self.options.batch_size:
                 self.connection.executemany(
-                    "INSERT INTO backup_work_folders VALUES (?, ?, ?, ?, ?, ?)", work_batch
+                    "INSERT INTO backup_work_folders VALUES (?, ?, ?, ?, ?, ?, ?)", work_batch
                 )
                 work_batch.clear()
                 self._emit(
@@ -2029,7 +2638,7 @@ class BackupAnalysisEngine:
                 )
         if work_batch:
             self.connection.executemany(
-                "INSERT INTO backup_work_folders VALUES (?, ?, ?, ?, ?, ?)", work_batch
+                "INSERT INTO backup_work_folders VALUES (?, ?, ?, ?, ?, ?, ?)", work_batch
             )
         self.connection.execute(
             "CREATE INDEX temp.idx_backup_work_folder_fingerprint "
@@ -2038,6 +2647,10 @@ class BackupAnalysisEngine:
 
         exact_matches: dict[int, set[int]] = defaultdict(set)
         renamed_structure_matches: dict[int, set[int]] = defaultdict(set)
+        # Fingerprint groups that cannot be paired as a unit: over the bounds,
+        # or a folder name repeated unequally between two drives. Their
+        # (records, drives, drive ids) feed the "structure repeats" verdict.
+        structure_groups: dict[bytes, tuple[int, int, frozenset[int]]] = {}
         ambiguous_structure_fingerprints: set[bytes] = set()
         ambiguous_structure_folders: set[int] = set()
         fingerprint_members = self.connection.execute(
@@ -2072,15 +2685,21 @@ class BackupAnalysisEngine:
             ):
                 ambiguous_structure_fingerprints.add(fingerprint)
                 # Consume the cursor group without retaining its potentially
-                # enormous membership list.
-                for _ in member_rows:
-                    pass
+                # enormous membership list; only the small drive set is kept.
+                group_volume_ids = {int(first_member["volume_id"])}
+                group_volume_ids.update(int(row["volume_id"]) for row in member_rows)
+                structure_groups[fingerprint] = (
+                    folder_records,
+                    folder_volumes,
+                    frozenset(group_volume_ids),
+                )
                 continue
             group = list(chain((first_member,), member_rows))
             by_volume: dict[int, list[sqlite3.Row]] = defaultdict(list)
             for row in group:
                 by_volume[int(row["volume_id"])].append(row)
             volume_ids = sorted(by_volume)
+            unpaired_folders: set[int] = set()
             for source_index, source in enumerate(volume_ids):
                 for target in volume_ids[source_index + 1 :]:
                     source_rows = by_volume[source]
@@ -2112,7 +2731,7 @@ class BackupAnalysisEngine:
                             int(row["folder_id"]) for row in named_target
                         )
                         if len(named_source) != len(named_target):
-                            ambiguous_structure_folders.update(named_ids)
+                            unpaired_folders.update(named_ids)
                             continue
                         for source_row, target_row in zip(
                             named_source,
@@ -2139,87 +2758,124 @@ class BackupAnalysisEngine:
                         renamed_structure_matches[source_folder].add(target)
                         renamed_structure_matches[target_folder].add(source)
                     elif remaining_source and remaining_target:
-                        ambiguous_structure_folders.update(
+                        unpaired_folders.update(
                             int(row["folder_id"])
                             for row in (*remaining_source, *remaining_target)
                         )
+            if unpaired_folders:
+                ambiguous_structure_folders.update(unpaired_folders)
+                structure_groups[fingerprint] = (
+                    folder_records,
+                    folder_volumes,
+                    frozenset(volume_ids),
+                )
 
         # Fingerprints intentionally omit the folder's own display name, so a
-        # complete project tree can be recognized after its top-level folder is
-        # renamed. That is strong folder evidence, but it must not silently
-        # promote a relocated individual file. A file is likely only when its
-        # own non-NULL modified time and normalized parent path also match.
-
-        coverage: dict[int, dict[int, list[int]]] = defaultdict(dict)
-        union_counts: dict[int, list[int]] = {}
-        for row in self.connection.execute(
-            """
-            SELECT wf.folder_id, t.target_volume_id,
-                   COUNT(*) AS matched_files, COALESCE(SUM(wf.size_bytes), 0) AS matched_bytes
-            FROM backup_stage_file_targets t
-            JOIN backup_work_files wf ON wf.file_id = t.file_id
-            WHERE wf.folder_id IS NOT NULL
-            GROUP BY wf.folder_id, t.target_volume_id
-            """
-        ):
-            coverage[int(row["folder_id"])][int(row["target_volume_id"])] = [
-                int(row["matched_files"]),
-                int(row["matched_bytes"]),
-            ]
-        for row in self.connection.execute(
-            """
-            SELECT wf.folder_id, COUNT(*) AS matched_files, COALESCE(SUM(wf.size_bytes), 0) AS matched_bytes
-            FROM backup_stage_file_results r
-            JOIN backup_work_files wf ON wf.file_id = r.file_id
-            WHERE wf.folder_id IS NOT NULL
-              AND wf.evidence_eligible = 1
-              AND r.status IN ('likely', 'possible')
-            GROUP BY wf.folder_id
-            """
-        ):
-            union_counts[int(row["folder_id"])] = [
-                int(row["matched_files"]),
-                int(row["matched_bytes"]),
-            ]
-        ambiguous_counts: dict[int, int] = {
-            int(row["folder_id"]): int(row["ambiguous_files"])
-            for row in self.connection.execute(
+        # complete project tree is still recognised after its top-level folder
+        # is renamed; that shows up as an explicit "renamed" qualifier.
+        #
+        # Coverage below comes from the staged existence rows (one per other
+        # drive that holds each file, not pairing), so a folder can never be
+        # red while its files are green. Each (folder, target drive) slot counts
+        # every file found there, the files found by hash or time ("strong")
+        # with their bytes, and the hash-verified ones; parents accumulate all
+        # four values from their children.
+        #
+        # The cursor is read lazily, in the same (depth desc, folder id) order
+        # as the folder loop, so `coverage` only ever holds parents awaiting
+        # their remaining children instead of every folder of the catalogue.
+        # Every folder in the cursor is in ordered_ids (the depth join only
+        # succeeds for indexed folders) and both are sorted the same way, so
+        # the two are read in lockstep; the check after the loop makes any
+        # desynchronisation fail loudly instead of publishing wrong verdicts.
+        direct_coverage_groups = groupby(
+            self.connection.execute(
+                f"""
+                SELECT folder_id, target_volume_id,
+                       COUNT(*) AS all_files,
+                       COALESCE(SUM(likely), 0) AS strong_files,
+                       COALESCE(SUM(CASE WHEN likely THEN size_bytes ELSE 0 END), 0)
+                           AS strong_bytes,
+                       COALESCE(SUM(verified), 0) AS verified_files
+                FROM ({_FILE_TARGET_ROWS_WITH_DEPTH_SQL})
+                GROUP BY depth, folder_id, target_volume_id
+                ORDER BY depth DESC, folder_id, target_volume_id
                 """
-                SELECT wf.folder_id, COUNT(*) AS ambiguous_files
-                FROM backup_stage_file_results r
-                JOIN backup_work_files wf ON wf.file_id = r.file_id
-                WHERE wf.folder_id IS NOT NULL
-                  AND wf.evidence_eligible = 1
-                  AND r.status = 'ambiguous'
-                GROUP BY wf.folder_id
+            ),
+            key=itemgetter(0),
+        )
+        pending_direct = next(direct_coverage_groups, None)
+        coverage: dict[int, dict[int, list[int]]] = self._pending_coverage_map()
+
+        def take_direct_coverage(folder_id: int, into: dict[int, list[int]]) -> None:
+            """Merge this folder's own (folder, drive) rows from the cursor into `into`."""
+            nonlocal pending_direct
+            if pending_direct is None or pending_direct[0] != folder_id:
+                return
+            for row in pending_direct[1]:
+                # Columns: folder_id, target_volume_id, then the four slots.
+                # COUNT/SUM over integer columns come back as ints.
+                target = row[1]
+                values = list(row[2:])
+                aggregate = into.get(target)
+                if aggregate is None:
+                    into[target] = values
+                else:
+                    for index, value in enumerate(values):
+                        aggregate[index] += value
+            pending_direct = next(direct_coverage_groups, None)
+
+        # Files with a strong match on at least one drive, for "scattered".
+        union_strong: dict[int, int] = {
+            int(row["folder_id"]): int(row["matched_files"])
+            for row in self.connection.execute(
+                f"""
+                SELECT folder_id, COUNT(*) AS matched_files
+                FROM (
+                    SELECT DISTINCT folder_id, file_id
+                    FROM ({_FILE_TARGET_ROWS_SQL})
+                    WHERE likely AND folder_id IS NOT NULL
+                )
+                GROUP BY folder_id
                 """
             )
         }
 
         health_by_volume = {record.volume_id: record.health_status for record in self.scan_records()}
+
+        def clean_scan_first(target: int) -> tuple[bool, int]:
+            return health_by_volume.get(target) != "completed", target
+
+        def reported_access_errors(*volume_ids: int | None) -> bool:
+            """Errors stay explicit: an incomplete listing on either side is flagged, never hidden."""
+            return any(
+                health_by_volume.get(candidate) == "completed_with_errors"
+                for candidate in volume_ids
+                if candidate is not None
+            )
+
         stage_rows: list[tuple[Any, ...]] = []
         stage_matches: list[tuple[Any, ...]] = []
         for processed, folder_id in enumerate(ordered_ids, start=1):
             folder_info = info[folder_id]
             volume_id = folder_info.volume_id
             total_files, total_bytes, hashed_files = evidence_totals[folder_id]
-            mixed_hash_structure = 0 < hashed_files < total_files
             indexed_files = folder_info.indexed_files
-            folder_coverage = coverage.get(folder_id, {})
-            union = union_counts.get(folder_id, [0, 0])
-            ambiguous_descendants = ambiguous_counts.get(folder_id, 0)
-            all_exact_targets = sorted(exact_matches.get(folder_id, ()))
-            trusted_exact_targets = [
+            # Children (deeper folders) have already accumulated into this
+            # slot; the folder's own file rows are merged in from the cursor.
+            folder_coverage = coverage.pop(folder_id, {})
+            take_direct_coverage(folder_id, folder_coverage)
+            strong_coverage_targets = {
                 target
-                for target in all_exact_targets
-                if not mixed_hash_structure
-                and health_by_volume.get(volume_id) == "completed"
-                and health_by_volume.get(target) == "completed"
-            ]
-            untrusted_exact_targets = sorted(
-                set(all_exact_targets) - set(trusted_exact_targets)
-            )
+                for target, values in folder_coverage.items()
+                if values[_STRONG_FILES] > 0
+            }
+            union = union_strong.get(folder_id, 0)
+            all_exact_targets = sorted(exact_matches.get(folder_id, ()))
             renamed_targets = sorted(renamed_structure_matches.get(folder_id, ()))
+            structure_targets = set(all_exact_targets) | set(renamed_targets)
+            fingerprint = fingerprints[folder_id]
+            scattered = 0
             if total_files == 0:
                 if indexed_files > 0:
                     status = "excluded"
@@ -2234,73 +2890,79 @@ class BackupAnalysisEngine:
                 best_target = None
                 matched_files = matched_bytes = 0
                 files_percent = bytes_percent = None
-                scattered = 0
-            elif trusted_exact_targets:
+            elif all_exact_targets or renamed_targets:
+                # The whole structure exists elsewhere. Qualifiers stay explicit
+                # instead of downgrading the verdict.
                 status = "likely"
                 if hashed_files == total_files:
-                    evidence = FOLDER_EVIDENCE_TRUSTED_HASHED
+                    evidence = FOLDER_EVIDENCE_FULL_MATCH_HASHED
+                elif hashed_files > 0:
+                    evidence = FOLDER_EVIDENCE_FULL_MATCH_PARTLY_HASHED
                 else:
-                    evidence = FOLDER_EVIDENCE_TRUSTED_LEGACY
+                    evidence = FOLDER_EVIDENCE_FULL_MATCH_LEGACY
+                if all_exact_targets:
+                    best_target = min(all_exact_targets, key=clean_scan_first)
+                else:
+                    best_target = min(renamed_targets, key=clean_scan_first)
+                if reported_access_errors(volume_id, best_target):
+                    evidence += FOLDER_EVIDENCE_SUFFIX_SCAN_ERRORS
+                if not all_exact_targets:
+                    evidence += FOLDER_EVIDENCE_SUFFIX_RENAMED
                 if folder_id in ambiguous_structure_folders:
                     evidence += FOLDER_EVIDENCE_SUPPRESSED_SUFFIX
-                other_ids = sorted(
-                    set(folder_coverage)
-                    | set(all_exact_targets)
-                    | set(renamed_targets)
+                other_ids = _capped_ids_preferring(
+                    structure_targets | strong_coverage_targets, folder_coverage
                 )
-                best_target = trusted_exact_targets[0]
                 matched_files = total_files
                 matched_bytes = total_bytes
                 files_percent = bytes_percent = 100.0
-                scattered = 0
-            elif renamed_targets or untrusted_exact_targets:
-                status = "possible"
-                if mixed_hash_structure:
-                    evidence = FOLDER_EVIDENCE_MIXED_HASH
-                elif untrusted_exact_targets and renamed_targets:
-                    evidence = FOLDER_EVIDENCE_UNTRUSTED_AND_RENAMED
-                elif untrusted_exact_targets:
-                    evidence = FOLDER_EVIDENCE_UNTRUSTED_SCAN
-                else:
-                    evidence = FOLDER_EVIDENCE_RENAMED
-                possible_structure_targets = sorted(
-                    set(renamed_targets) | set(untrusted_exact_targets)
-                )
-                other_ids = sorted(set(folder_coverage) | set(possible_structure_targets))
-                best_target = possible_structure_targets[0]
-                matched_files = total_files
-                matched_bytes = total_bytes
-                files_percent = bytes_percent = 100.0
-                scattered = 0
             elif folder_coverage:
-                def coverage_score(item: tuple[int, list[int]]) -> tuple[float, float, int]:
-                    target, values = item
-                    return (
-                        (_percent(values[0], total_files) or 0.0) + (_percent(values[1], total_bytes) or 0.0),
-                        _percent(values[0], total_files) or 0.0,
-                        -target,
-                    )
-
-                best_target, best_values = max(folder_coverage.items(), key=coverage_score)
-                matched_files, matched_bytes = best_values
+                best_target, best = max(
+                    folder_coverage.items(),
+                    key=lambda item: (
+                        item[1][_STRONG_FILES],
+                        item[1][_VERIFIED_FILES],
+                        item[1][_ALL_FILES],
+                        item[1][_STRONG_BYTES],
+                        -item[0],
+                    ),
+                )
+                matched_files = best[_STRONG_FILES]
+                matched_bytes = best[_STRONG_BYTES]
+                if best[_VERIFIED_FILES] >= total_files:
+                    status = "likely"
+                    evidence = FOLDER_EVIDENCE_ALL_FILES_HASHED
+                elif best[_STRONG_FILES] >= total_files:
+                    status = "likely"
+                    evidence = FOLDER_EVIDENCE_ALL_FILES_FOUND
+                elif best[_ALL_FILES] >= total_files:
+                    status = "possible"
+                    evidence = FOLDER_EVIDENCE_ALL_FILES_WEAK
+                else:
+                    status = "possible"
+                    evidence = FOLDER_EVIDENCE_PARTIAL
+                    scattered = int(union >= total_files and matched_files < total_files)
+                if reported_access_errors(volume_id, best_target):
+                    evidence += FOLDER_EVIDENCE_SUFFIX_SCAN_ERRORS
                 files_percent = _percent(matched_files, total_files)
                 bytes_percent = _percent(matched_bytes, total_bytes)
-                status = "possible"
-                other_ids = sorted(folder_coverage)
-                scattered = int(union[0] >= total_files and matched_files < total_files)
-                evidence = FOLDER_EVIDENCE_COVERAGE
+                other_ids = _capped_ids_preferring(strong_coverage_targets, folder_coverage)
             elif (
-                fingerprints[folder_id] in ambiguous_structure_fingerprints
+                fingerprint in ambiguous_structure_fingerprints
                 or folder_id in ambiguous_structure_folders
-                or ambiguous_descendants > 0
             ):
-                status = "ambiguous"
-                evidence = FOLDER_EVIDENCE_AMBIGUOUS
-                other_ids = []
+                status = "possible"
+                records, drives, group_volume_ids = structure_groups.get(
+                    fingerprint, (0, 0, frozenset())
+                )
+                evidence = (
+                    FOLDER_EVIDENCE_STRUCTURE_REPEATS_PREFIX
+                    + f" {records:,} folders across {drives:,} drives."
+                )
+                other_ids = _capped_ids(group_volume_ids - {volume_id})
                 best_target = None
                 matched_files = matched_bytes = 0
                 files_percent = bytes_percent = None
-                scattered = 0
             else:
                 status = "single"
                 evidence = FOLDER_EVIDENCE_SINGLE
@@ -2308,7 +2970,6 @@ class BackupAnalysisEngine:
                 best_target = None
                 matched_files = matched_bytes = 0
                 files_percent = bytes_percent = 0.0
-                scattered = 0
 
             stage_rows.append(
                 (
@@ -2327,46 +2988,79 @@ class BackupAnalysisEngine:
                     scattered,
                 )
             )
-            for target in sorted(
-                set(folder_coverage) | set(all_exact_targets) | set(renamed_targets)
-            ):
-                values = folder_coverage.get(target, [0, 0])
-                target_status = (
-                    "likely" if target in trusted_exact_targets else "possible"
-                )
-                full_structure = target in all_exact_targets or target in renamed_targets
-                target_evidence = (
-                    (
-                        "Complete subtree hashes and structure match: exact SHA-256 content, "
-                        "descendant names, and folder layout."
-                        if hashed_files == total_files
-                        else "Complete legacy subtree metadata matches: descendant names, "
-                        "exact sizes, and folder layout."
+            # Persisted per-drive rows: every structure match and every drive
+            # holding strong evidence. Weak-only drives are listed only when no
+            # drive holds strong evidence, and then only the best one; the cap
+            # keeps the drives with the most strong coverage.
+            persisted_targets = structure_targets | strong_coverage_targets
+            if best_target is not None:
+                persisted_targets.add(best_target)
+            no_coverage = [0] * 4
+            ranked_targets = heapq.nsmallest(
+                MAX_STORED_FOLDER_DRIVE_MATCHES,
+                (
+                    (target, folder_coverage.get(target, no_coverage))
+                    for target in persisted_targets
+                ),
+                key=lambda item: (
+                    item[0] not in structure_targets,
+                    -item[1][_STRONG_FILES],
+                    -item[1][_VERIFIED_FILES],
+                    -item[1][_ALL_FILES],
+                    -item[1][_STRONG_BYTES],
+                    item[0],
+                ),
+            )
+            # Structure matches without a hash for every file carry the
+            # same hedge as the folder verdict.
+            structure_hedge = "" if hashed_files == total_files else " (contents not compared)"
+            for target, values in ranked_targets:
+                target_files = values[_STRONG_FILES]
+                target_bytes = values[_STRONG_BYTES]
+                if target in all_exact_targets:
+                    target_status = "likely"
+                    target_files, target_bytes = total_files, total_bytes
+                    target_evidence = f"{FOLDER_MATCH_EVIDENCE_WHOLE_PREFIX}{structure_hedge}."
+                elif target in renamed_targets:
+                    target_status = "likely"
+                    target_files, target_bytes = total_files, total_bytes
+                    target_evidence = (
+                        f"{FOLDER_MATCH_EVIDENCE_WHOLE_PREFIX} under a different folder name"
+                        f"{structure_hedge}."
                     )
-                    if target_status == "likely"
-                    else (
-                        "The saved structure matches, but hash coverage is mixed, so it is "
-                        "not labelled complete."
-                        if mixed_hash_structure and target in untrusted_exact_targets
-                        else "The saved structure and folder name match, but scan health is "
-                        "not trustworthy enough to label it complete."
-                        if target in untrusted_exact_targets
-                        else (
-                            "The content-bearing subtree matches, but the folder name differs."
-                            if target in renamed_targets
-                            else "Some descendant filename-and-size metadata appears on "
-                            "this drive, but a complete matching folder structure was not found."
-                        )
+                elif values[_VERIFIED_FILES] >= total_files:
+                    target_status = "likely"
+                    target_evidence = "Every file here is hash-verified."
+                elif values[_STRONG_FILES] >= total_files:
+                    target_status = "likely"
+                    target_evidence = "Every file found here by name, size and time."
+                elif values[_ALL_FILES] >= total_files:
+                    target_status = "possible"
+                    target_evidence = (
+                        "Files found here by name and size only."
+                        if target_files == 0
+                        else f"Every file is here by name and size; {target_files:,} of "
+                        f"{total_files:,} also match by modified time."
                     )
-                )
+                else:
+                    target_status = "possible"
+                    target_evidence = (
+                        f"Part of this folder is here ({target_files:,} of {total_files:,} "
+                        "files by name, size and time"
+                    )
+                    if values[_ALL_FILES] > target_files:
+                        # Weak matches (name and size only) are not coverage,
+                        # but the drive row says how many more files it holds.
+                        target_evidence += f"; {values[_ALL_FILES]:,} by name and size"
+                    target_evidence += ")."
                 stage_matches.append(
                     (
                         folder_id,
                         target,
                         target_status,
-                        total_files if full_structure else values[0],
+                        target_files,
                         total_files,
-                        total_bytes if full_structure else values[1],
+                        target_bytes,
                         total_bytes,
                         target_evidence,
                     )
@@ -2374,20 +3068,19 @@ class BackupAnalysisEngine:
 
             parent_id = folder_info.parent_id
             if parent_id is not None:
-                parent_map = coverage.setdefault(parent_id, {})
-                for target, values in folder_coverage.items():
-                    aggregate = parent_map.setdefault(target, [0, 0])
-                    aggregate[0] += values[0]
-                    aggregate[1] += values[1]
-                parent_union = union_counts.setdefault(parent_id, [0, 0])
-                parent_union[0] += union[0]
-                parent_union[1] += union[1]
-                ambiguous_counts[parent_id] = (
-                    ambiguous_counts.get(parent_id, 0) + ambiguous_descendants
-                )
-            coverage.pop(folder_id, None)
-            union_counts.pop(folder_id, None)
-            ambiguous_counts.pop(folder_id, None)
+                if folder_coverage:
+                    parent_map = coverage.setdefault(parent_id, {})
+                    for target, values in folder_coverage.items():
+                        aggregate = parent_map.get(target)
+                        if aggregate is None:
+                            # The child's slot is never read again; hand the
+                            # list itself up instead of copying it.
+                            parent_map[target] = values
+                        else:
+                            for index, value in enumerate(values):
+                                aggregate[index] += value
+                union_strong[parent_id] = union_strong.get(parent_id, 0) + union
+            union_strong.pop(folder_id, None)
 
             if (
                 len(stage_rows) >= self.options.batch_size
@@ -2410,6 +3103,11 @@ class BackupAnalysisEngine:
                     progress_total,
                     f"Calculating folder coverage… {processed:,}/{total:,}",
                 )
+        if pending_direct is not None:
+            raise RuntimeError(
+                "Folder coverage rows were left unread; the coverage cursor and the "
+                "folder order disagree."
+            )
         if stage_rows:
             self.connection.executemany(
                 "INSERT INTO backup_stage_folder_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2670,8 +3368,8 @@ class BackupAnalysisEngine:
                     )
                 elif max(source_percent, target_percent) >= self.options.mirror_candidate_threshold_percent:
                     evidence = (
-                        "A large share of normalized filename-and-size records overlaps; "
-                        "review paths and timestamps before declaring a mirror."
+                        "A large share of files matches by name, size and modified time "
+                        "(or by saved content hash); review paths before declaring a mirror."
                     )
                 else:
                     evidence = (
@@ -2865,9 +3563,8 @@ class BackupAnalysisEngine:
                 )
             }
             stored: dict[int, sqlite3.Row] = {}
-            folder_match_statuses: dict[int, dict[str, list[int]]] = defaultdict(
-                lambda: {"likely": [], "possible": []}
-            )
+            # Per folder: (target drive, row status, row evidence), in drive order.
+            folder_match_rows: dict[int, list[tuple[int, str, str]]] = defaultdict(list)
             if state.active_run_id is not None:
                 stored = {
                     int(row[id_column]): row
@@ -2879,7 +3576,7 @@ class BackupAnalysisEngine:
                 if item_type == "folder":
                     for match in self.connection.execute(
                         f"""
-                        SELECT folder_id, target_volume_id, status
+                        SELECT folder_id, target_volume_id, status, evidence_text
                         FROM backup_folder_drive_matches
                         WHERE run_id = ? AND folder_id IN ({placeholders})
                         ORDER BY folder_id, target_volume_id
@@ -2888,9 +3585,13 @@ class BackupAnalysisEngine:
                     ):
                         match_status = str(match["status"])
                         if match_status in {"likely", "possible"}:
-                            folder_match_statuses[int(match["folder_id"])][
-                                match_status
-                            ].append(int(match["target_volume_id"]))
+                            folder_match_rows[int(match["folder_id"])].append(
+                                (
+                                    int(match["target_volume_id"]),
+                                    match_status,
+                                    str(match["evidence_text"] or ""),
+                                )
+                            )
             for item_id in chunk:
                 item = existing.get(item_id)
                 if item is None:
@@ -2941,10 +3642,27 @@ class BackupAnalysisEngine:
                     )
                 kwargs: dict[str, Any] = {}
                 if item_type == "folder" and row is not None and not bool(item["missing"]):
-                    target_statuses = folder_match_statuses[item_id]
+                    match_rows = folder_match_rows.get(item_id, ())
+                    # A "Full match" folder counts as strong only the drives
+                    # holding the whole folder as a structure. A drive that
+                    # merely holds every file loose stays a coverage lead in
+                    # other_volume_ids rather than inflating the full-match count.
+                    whole_only = folder_reason_key(evidence) in _FULL_MATCH_REASON_KEYS
                     kwargs = {
-                        "strong_volume_ids": tuple(target_statuses["likely"]),
-                        "possible_volume_ids": tuple(target_statuses["possible"]),
+                        "strong_volume_ids": tuple(
+                            target
+                            for target, match_status, match_evidence in match_rows
+                            if match_status == "likely"
+                            and (
+                                not whole_only
+                                or match_evidence.startswith(FOLDER_MATCH_EVIDENCE_WHOLE_PREFIX)
+                            )
+                        ),
+                        "possible_volume_ids": tuple(
+                            target
+                            for target, match_status, _match_evidence in match_rows
+                            if match_status == "possible"
+                        ),
                         "best_target_volume_id": row["best_target_volume_id"],
                         "matched_files": int(row["matched_files"] or 0),
                         "total_files": int(row["total_files"] or 0),
@@ -2965,7 +3683,7 @@ class BackupAnalysisEngine:
                     item_id=item_id,
                     status=status,
                     other_volume_ids=other_ids,
-                    other_drive_count=len(other_ids),
+                    other_drive_count=_other_drive_count(item_type, evidence, other_ids),
                     evidence_text=evidence,
                     analysed_at=state.analysed_at,
                     is_stale=state.is_stale,
@@ -3002,8 +3720,7 @@ class BackupAnalysisEngine:
             MatchLocation(
                 volume_id,
                 "likely",
-                "Normalized filename, exact size, modified time, and parent path match; "
-                "a comparable saved hash was unavailable.",
+                "Same name, size and modified time; contents were not compared.",
                 is_stale=status.is_stale,
                 analysed_at=status.analysed_at,
             )
@@ -3014,8 +3731,8 @@ class BackupAnalysisEngine:
             MatchLocation(
                 volume_id,
                 "possible",
-                "Normalized filename and exact size match; path or modified time differs, "
-                "and a comparable saved hash was unavailable.",
+                "Same name and size only; modified time differs or is unavailable, "
+                "and no comparable saved hash matched.",
                 is_stale=status.is_stale,
                 analysed_at=status.analysed_at,
             )
@@ -3153,8 +3870,8 @@ class BackupAnalysisEngine:
                     stored_evidence
                     if "manual mirror relationship" not in stored_evidence.casefold()
                     else (
-                        "A large share of normalized filename-and-size records overlaps; "
-                        "review paths and timestamps before declaring a mirror."
+                        "A large share of files matches by name, size and modified time "
+                        "(or by saved content hash); review paths before declaring a mirror."
                     )
                 )
             else:

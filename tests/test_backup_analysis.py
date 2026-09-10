@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 import builtins
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path, PurePosixPath
 import sqlite3
 
 import pytest
 
-from jvvv.backup_analysis import AnalysisOptions, BackupAnalysisEngine
+import jvvv.backup_analysis as backup_analysis
+from jvvv.backup_analysis import (
+    FILE_EVIDENCE_PAIRED_SUFFIX,
+    FOLDER_MATCH_EVIDENCE_WHOLE_PREFIX,
+    MAX_STORED_OTHER_VOLUME_IDS,
+    AnalysisOptions,
+    BackupAnalysisEngine,
+    _canonical_modified_time,
+    evidence_counts,
+    file_evidence_flags,
+    file_reason_key,
+    folder_evidence_flags,
+    folder_reason_key,
+    modified_times_match,
+)
 from jvvv.app import BackupAnalysisWorker
 from jvvv.database import Database
 
@@ -15,6 +30,9 @@ from jvvv.database import Database
 SCANNED_AT = "2026-08-20T10:00:00.000000+0000"
 LATER_SCAN = "2026-08-21T10:00:00.000000+0000"
 MODIFIED_AT = "2026-08-19T09:00:00.000000+0000"
+MODIFIED_PLUS_2S = "2026-08-19T09:00:02.000000+0000"
+MODIFIED_PLUS_3S = "2026-08-19T09:00:03.000000+0000"
+MODIFIED_PLUS_1H = "2026-08-19T10:00:00.000000+0000"
 HASH_A = b"a" * 32
 HASH_B = b"b" * 32
 
@@ -114,7 +132,7 @@ def status_text(value) -> str:
     return str(raw or "").strip().casefold()
 
 
-def test_analysis_distinguishes_strong_possible_and_same_drive_only_matches(tmp_path):
+def test_analysis_distinguishes_strong_weak_and_same_drive_only_matches(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
         first_volume_id, first_files, first_folders = add_catalogued_volume(
@@ -125,6 +143,7 @@ def test_analysis_distinguishes_strong_possible_and_same_drive_only_matches(tmp_
             files={
                 "Project/report.psd": (100, MODIFIED_AT),
                 "Loose/clip.mov": (200, MODIFIED_AT),
+                "Loose/retimed.mov": (400, MODIFIED_AT),
                 "Loose/source-only.txt": (25, MODIFIED_AT),
                 "Duplicate A/local.bin": (300, MODIFIED_AT),
                 "Duplicate B/local.bin": (300, MODIFIED_AT),
@@ -138,6 +157,7 @@ def test_analysis_distinguishes_strong_possible_and_same_drive_only_matches(tmp_
             files={
                 "Project/report.psd": (100, MODIFIED_AT),
                 "Elsewhere/clip.mov": (200, MODIFIED_AT),
+                "Elsewhere/retimed.mov": (400, LATER_SCAN),
             },
         )
 
@@ -154,19 +174,29 @@ def test_analysis_distinguishes_strong_possible_and_same_drive_only_matches(tmp_
             for match in engine.file_matches(first_files["Project/report.psd"])
         } == {second_volume_id}
 
+        # A relocated file with the same name, size and time still exists elsewhere.
         relocated = engine.file_status(first_files["Loose/clip.mov"])
-        assert relocated.status == "possible"
+        assert relocated.status == "likely"
+        assert file_reason_key(relocated.evidence_text) == "time_match"
         assert {
             match.target_volume_id
             for match in engine.file_matches(first_files["Loose/clip.mov"])
         } == {second_volume_id}
 
+        # Name and size alone, with a different modified time, is only a lead.
+        retimed = engine.file_status(first_files["Loose/retimed.mov"])
+        assert retimed.status == "possible"
+        assert file_reason_key(retimed.evidence_text) == "name_size_only"
+        assert retimed.possible_volume_ids == (second_volume_id,)
+
+        assert engine.file_status(first_files["Loose/source-only.txt"]).status == "single"
         # Repeated metadata on one physical catalogue volume is not a backup copy.
         assert engine.file_status(first_files["Duplicate A/local.bin"]).status == "single"
         assert engine.file_status(first_files["Duplicate B/local.bin"]).status == "single"
 
         project = engine.folder_status(first_folders["Project"])
-        assert project.status == "possible"
+        assert project.status == "likely"
+        assert folder_reason_key(project.evidence_text) == "all_files_found"
         assert {
             match.target_volume_id
             for match in engine.folder_matches(first_folders["Project"])
@@ -302,7 +332,8 @@ def test_metadata_fallback_remains_explicit_when_one_hash_is_missing(tmp_path):
         assert status.status == "likely"
         assert status.strong_volume_ids == (target_id,)
         assert status.verified_volume_ids == ()
-        assert "hash was unavailable" in status.evidence_text.casefold()
+        assert file_reason_key(status.evidence_text) == "time_match"
+        assert "contents were not compared" in status.evidence_text.casefold()
     finally:
         db.close()
 
@@ -344,11 +375,14 @@ def test_hash_match_is_not_downgraded_by_common_metadata_guard(tmp_path):
         assert status.status == "likely"
         assert status.verified_volume_ids == (verified_id,)
         assert set(status.strong_volume_ids) == {verified_id, metadata_id}
+        # The hash is authoritative: a generic name never hides a verified copy.
+        assert file_reason_key(status.evidence_text) == "hash_verified"
+        assert file_evidence_flags(status.evidence_text) == {"extra_drives"}
     finally:
         db.close()
 
 
-def test_hash_aware_folder_structure_blocks_conflicts_and_mixed_hash_completion(tmp_path):
+def test_swapped_hashes_block_the_structure_match_but_every_file_still_verifies(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
         _, source_files, source_folders = add_catalogued_volume(
@@ -394,15 +428,22 @@ def test_hash_aware_folder_structure_blocks_conflicts_and_mixed_hash_completion(
         assert engine.analyse().status == "completed"
         folder = engine.folder_status(source_folders["Project"])
 
-        assert folder.status == "possible"
-        assert folder.best_target_volume_id == legacy_id
+        # No drive matches the folder as a unit (hashes are part of the layout
+        # fingerprint), yet every file exists elsewhere: hash-verified on the
+        # swapped drive, by name, size and time on the legacy drive.
+        assert folder.status == "likely"
+        assert folder_reason_key(folder.evidence_text) == "all_files_hashed"
+        assert folder.best_target_volume_id == conflicting_id
         assert folder.best_coverage_files_percent == 100.0
-        assert folder.strong_volume_ids == ()
-        assert all(
-            engine.file_status(file_id).verified_volume_ids == (conflicting_id,)
-            for file_id in source_files.values()
-        )
-        assert "hash-aware" in folder.evidence_text.casefold()
+        assert set(folder.strong_volume_ids) == {legacy_id, conflicting_id}
+        for file_id in source_files.values():
+            status = engine.file_status(file_id)
+            assert status.status == "likely"
+            assert status.verified_volume_ids == (conflicting_id,)
+            assert status.strong_volume_ids == (legacy_id, conflicting_id)
+            assert status.possible_volume_ids == ()
+            # The same-name record with different content is noted, not hidden.
+            assert "conflict" in file_evidence_flags(status.evidence_text)
     finally:
         db.close()
 
@@ -445,13 +486,14 @@ def test_fully_hashed_matching_folder_can_be_complete(tmp_path):
 
         assert folder.status == "likely"
         assert folder.strong_volume_ids == (target_id,)
-        assert "hash-aware structure" in folder.evidence_text.casefold()
-        assert "exact sha-256" in folder.evidence_text.casefold()
+        assert folder_reason_key(folder.evidence_text) == "full_match_hashed"
+        assert folder_evidence_flags(folder.evidence_text) == frozenset()
+        assert folder.best_coverage_files_percent == 100.0
     finally:
         db.close()
 
 
-def test_partially_hashed_matching_structure_remains_possible(tmp_path):
+def test_partially_hashed_matching_structure_is_a_full_match_partly_hashed(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
         files = {
@@ -479,21 +521,26 @@ def test_partially_hashed_matching_structure_remains_possible(tmp_path):
         assert engine.analyse().status == "completed"
         folder = engine.folder_status(source_folders["Project"])
 
-        assert folder.status == "possible"
-        assert folder.possible_volume_ids == (target_id,)
-        assert folder.strong_volume_ids == ()
+        assert folder.status == "likely"
+        assert folder.strong_volume_ids == (target_id,)
+        assert folder.possible_volume_ids == ()
         assert folder.best_coverage_files_percent == 100.0
-        assert "mixed hash and legacy" in folder.evidence_text.casefold()
+        assert folder_reason_key(folder.evidence_text) == "full_match_partly_hashed"
+        matches = engine.folder_matches(source_folders["Project"])
+        assert [match.evidence_text for match in matches] == [
+            "Whole folder matches here (contents not compared)."
+        ]
     finally:
         db.close()
 
 
-def test_overly_common_exact_hash_is_bounded_and_ambiguous(tmp_path):
+def test_overly_common_exact_hash_is_bounded_but_still_verified(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
         file_ids = []
+        folder_ids = []
         for index in range(3):
-            _, files, _ = add_catalogued_volume(
+            _, files, folders = add_catalogued_volume(
                 db,
                 tmp_path,
                 name=f"Archive {index}",
@@ -502,6 +549,7 @@ def test_overly_common_exact_hash_is_bounded_and_ambiguous(tmp_path):
                 content_hashes={f"Different-{index}/copy-{index}.bin": HASH_A},
             )
             file_ids.extend(files.values())
+            folder_ids.append(folders[f"Different-{index}"])
 
         engine = BackupAnalysisEngine(
             db,
@@ -509,12 +557,28 @@ def test_overly_common_exact_hash_is_bounded_and_ambiguous(tmp_path):
         )
         assert engine.analyse().status == "completed"
 
+        # Existence is still recorded for every member; only the one-to-one
+        # coverage pairing is skipped, and the evidence says so.
         for file_id in file_ids:
             status = engine.file_status(file_id)
-            assert status.status == "ambiguous"
-            assert status.verified_volume_ids == ()
-            assert engine.file_matches(file_id) == []
-            assert "too repetitive" in status.evidence_text.casefold()
+            assert status.status == "likely"
+            assert len(status.verified_volume_ids) == 2
+            assert status.strong_volume_ids == status.verified_volume_ids
+            assert status.other_drive_count == 2
+            assert len(engine.file_matches(file_id)) == 2
+            assert file_reason_key(status.evidence_text) == "hash_verified"
+            assert "repeated_content" in file_evidence_flags(status.evidence_text)
+            assert evidence_counts(status.evidence_text) == (3, 3)
+        # Folder coverage still sees the content on both other drives, even
+        # though existence was recorded once per hash and drive, not per record.
+        for folder_id in folder_ids:
+            folder = engine.folder_status(folder_id)
+            assert folder.status == "likely"
+            assert folder_reason_key(folder.evidence_text) == "all_files_hashed"
+            assert folder.matched_files == folder.total_files == 1
+            assert len(folder.strong_volume_ids) == 2
+        # Nothing was paired, so no drive pair reaches the mirror threshold.
+        assert engine.mirror_candidates() == []
     finally:
         db.close()
 
@@ -588,7 +652,7 @@ def test_file_status_keeps_strong_and_possible_target_drives_separate(tmp_path):
             tmp_path,
             name="Possible target",
             drive_id="AID-003",
-            files={"Elsewhere/report.psd": (100, MODIFIED_AT)},
+            files={"Elsewhere/report.psd": (100, LATER_SCAN)},
         )
 
         engine = BackupAnalysisEngine(db)
@@ -597,6 +661,7 @@ def test_file_status_keeps_strong_and_possible_target_drives_separate(tmp_path):
         matches = engine.file_matches(source_files["Project/report.psd"])
 
         assert status.status == "likely"
+        assert status.other_drive_count == 2
         assert set(status.other_volume_ids) == {strong_id, possible_id}
         assert status.strong_volume_ids == (strong_id,)
         assert status.possible_volume_ids == (possible_id,)
@@ -1503,7 +1568,7 @@ def test_manual_mirror_added_after_analysis_is_still_reported(tmp_path):
         db.close()
 
 
-def test_too_common_name_and_size_is_ambiguous_instead_of_false_backup(tmp_path):
+def test_generic_name_and_size_is_a_lead_with_counts_not_a_false_backup(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
         file_ids = []
@@ -1530,15 +1595,69 @@ def test_too_common_name_and_size_is_ambiguous_instead_of_false_backup(tmp_path)
         )
         summary = engine.analyse()
 
-        assert summary.ambiguous_files == 3
-        for file_id in file_ids:
+        assert summary.possible_files == 3
+        assert summary.ambiguous_files == 0
+        for file_id, volume_id in zip(file_ids, volume_ids):
             status = engine.file_status(file_id)
-            assert status.status == "ambiguous"
-            assert status.other_volume_ids == ()
-            assert engine.file_matches(file_id) == []
+            assert status.status == "possible"
+            assert set(status.other_volume_ids) == set(volume_ids) - {volume_id}
+            assert status.other_drive_count == 2
+            assert status.strong_volume_ids == ()
+            assert file_reason_key(status.evidence_text) == "generic"
+            assert evidence_counts(status.evidence_text) == (3, 3)
+            assert {match.status for match in engine.file_matches(file_id)} == {"possible"}
         summaries = {row.volume_id: row for row in engine.volume_summaries()}
-        assert all(summaries[volume_id].ambiguous_files == 1 for volume_id in volume_ids)
+        assert all(summaries[volume_id].possible_files == 1 for volume_id in volume_ids)
+        # Generic groups are never paired, so they add nothing to drive coverage.
         assert engine.mirror_candidates() == []
+    finally:
+        db.close()
+
+
+def test_generic_group_with_shared_time_is_likely_and_counts_survive_the_id_cap(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        drives = MAX_STORED_OTHER_VOLUME_IDS + 2
+        file_ids = []
+        for index in range(drives):
+            _, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={f"Folder-{index}/common.bin": (4096, MODIFIED_AT)},
+            )
+            file_ids.append(files[f"Folder-{index}/common.bin"])
+
+        # With the default strong-subgroup bounds this many drives sharing one
+        # modified time are too common to call strong: the lead stays possible.
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(file_ids[0])
+        assert status.status == "possible"
+        assert status.strong_volume_ids == ()
+        assert file_reason_key(status.evidence_text) == "generic"
+        assert evidence_counts(status.evidence_text) == (drives, drives)
+        assert len(status.other_volume_ids) == MAX_STORED_OTHER_VOLUME_IDS
+        assert status.other_drive_count == drives - 1
+
+        # Within the bounds the shared time makes every copy strong; stored ids
+        # stay capped while the true drive count travels in the evidence.
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(
+                max_strong_volumes_per_signature=drives,
+                max_strong_edges_per_signature=drives * drives,
+            ),
+        )
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(file_ids[0])
+        assert status.status == "likely"
+        assert file_reason_key(status.evidence_text) == "generic"
+        assert evidence_counts(status.evidence_text) == (drives, drives)
+        assert len(status.other_volume_ids) == MAX_STORED_OTHER_VOLUME_IDS
+        assert len(status.strong_volume_ids) == MAX_STORED_OTHER_VOLUME_IDS
+        assert status.other_drive_count == drives - 1
     finally:
         db.close()
 
@@ -1664,7 +1783,7 @@ def test_folder_depth_accepts_backslash_catalogue_paths(tmp_path):
         db.close()
 
 
-def test_renamed_complete_subtree_is_possible_not_green(tmp_path):
+def test_renamed_complete_subtree_is_a_full_match_flagged_renamed(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
         _, _, source_folders = add_catalogued_volume(
@@ -1693,12 +1812,19 @@ def test_renamed_complete_subtree_is_possible_not_green(tmp_path):
         status = engine.folder_status(source_folders["Original"])
         matches = engine.folder_matches(source_folders["Original"])
 
-        assert status.status == "possible"
+        assert status.status == "likely"
+        assert folder_reason_key(status.evidence_text) == "full_match_legacy"
+        assert folder_evidence_flags(status.evidence_text) == {"renamed"}
         assert status.best_coverage_files_percent == 100.0
+        assert status.best_target_volume_id == target_id
         assert status.other_volume_ids == (target_id,)
+        assert status.strong_volume_ids == (target_id,)
         assert len(matches) == 1
-        assert matches[0].status == "possible"
-        assert "folder name differs" in matches[0].evidence_text
+        assert matches[0].status == "likely"
+        assert matches[0].matched_files == matches[0].total_files == 2
+        assert matches[0].evidence_text == (
+            "Whole folder matches here under a different folder name (contents not compared)."
+        )
     finally:
         db.close()
 
@@ -1744,10 +1870,10 @@ def test_exact_folder_match_is_retained_when_file_key_is_ambiguous(tmp_path):
         db.close()
 
 
-def test_repeated_file_candidates_are_suppressed_instead_of_arbitrarily_paired(tmp_path):
+def test_repeated_records_get_identical_labels_and_drive_pairing_counts_once(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
-        _, source_files, source_folders = add_catalogued_volume(
+        source_id, source_files, source_folders = add_catalogued_volume(
             db,
             tmp_path,
             name="Source",
@@ -1757,7 +1883,7 @@ def test_repeated_file_candidates_are_suppressed_instead_of_arbitrarily_paired(t
                 "Project/Second/same.bin": (100, MODIFIED_AT),
             },
         )
-        _, _, _ = add_catalogued_volume(
+        target_id, _, _ = add_catalogued_volume(
             db,
             tmp_path,
             name="Target",
@@ -1767,25 +1893,88 @@ def test_repeated_file_candidates_are_suppressed_instead_of_arbitrarily_paired(t
 
         engine = BackupAnalysisEngine(db)
         assert engine.analyse().status == "completed"
-        source_statuses = [
-            engine.file_status(file_id).status for file_id in source_files.values()
-        ]
+        first = engine.file_status(source_files["Project/First/same.bin"])
+        second = engine.file_status(source_files["Project/Second/same.bin"])
         project = engine.folder_status(source_folders["Project"])
 
-        assert source_statuses == ["ambiguous", "ambiguous"]
-        assert project.status == "ambiguous"
-        assert project.best_target_volume_id is None
-        assert project.matched_files == 0
-        assert project.total_files == 2
-        assert project.best_coverage_files_percent is None
+        # Both copies exist on the target by name, size and time: same label.
+        assert first.status == second.status == "likely"
+        assert first.strong_volume_ids == second.strong_volume_ids == (target_id,)
+        assert first.evidence_text == second.evidence_text
+        assert FILE_EVIDENCE_PAIRED_SUFFIX not in first.evidence_text
+        # The folder follows what exists elsewhere: every file is on the target.
+        assert project.status == "likely"
+        assert folder_reason_key(project.evidence_text) == "all_files_found"
+        assert project.best_target_volume_id == target_id
+        assert project.matched_files == project.total_files == 2
+        assert project.best_coverage_files_percent == 100.0
+        assert project.scattered is False
+        # Only the drive-pair overlap counts the lone target record once.
+        candidate = next(
+            row
+            for row in engine.mirror_candidates()
+            if {row.source_volume_id, row.target_volume_id} == {source_id, target_id}
+        )
+        assert candidate.matched_files == 1
+        assert candidate.complete_structure is False
     finally:
         db.close()
 
 
-def test_valid_unique_pair_survives_competing_duplicates_on_a_third_drive(tmp_path):
+def test_two_copies_on_one_drive_and_six_single_copies_elsewhere_match_identically(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
-        _, source_files, _ = add_catalogued_volume(
+        _, source_files, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="AID-140",
+            drive_id="AID-140",
+            files={
+                "Project/Renders/clip.mov": (5_000, MODIFIED_AT),
+                "Project/Delivery/clip.mov": (5_000, MODIFIED_AT),
+            },
+        )
+        other_ids = []
+        for index in range(6):
+            volume_id, _, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Backup {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={f"Clips-{index}/clip.mov": (5_000, MODIFIED_AT)},
+            )
+            other_ids.append(volume_id)
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        renders = engine.file_status(source_files["Project/Renders/clip.mov"])
+        delivery = engine.file_status(source_files["Project/Delivery/clip.mov"])
+
+        assert renders.status == delivery.status == "likely"
+        assert renders.strong_volume_ids == delivery.strong_volume_ids == tuple(sorted(other_ids))
+        assert renders.possible_volume_ids == delivery.possible_volume_ids == ()
+        assert renders.other_drive_count == delivery.other_drive_count == 6
+        assert renders.evidence_text == delivery.evidence_text
+        assert file_reason_key(renders.evidence_text) == "time_match"
+
+        # Folder verdicts follow existence too: every file in Renders, Delivery
+        # and Project is on each of the six drives, however pairing went.
+        for path in ("Project/Renders", "Project/Delivery", "Project"):
+            folder = engine.folder_status(source_folders[path])
+            assert folder.status == "likely", path
+            assert folder_reason_key(folder.evidence_text) == "all_files_found", path
+            assert folder.matched_files == folder.total_files
+            assert folder.best_coverage_files_percent == 100.0
+            assert set(folder.strong_volume_ids) == set(other_ids)
+            assert folder.possible_volume_ids == ()
+    finally:
+        db.close()
+
+
+def test_duplicates_on_one_drive_do_not_hide_copies_on_other_drives(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        source_id, source_files, _ = add_catalogued_volume(
             db,
             tmp_path,
             name="Duplicated",
@@ -1813,24 +2002,26 @@ def test_valid_unique_pair_survives_competing_duplicates_on_a_third_drive(tmp_pa
         engine = BackupAnalysisEngine(db)
         assert engine.analyse().status == "completed"
 
-        assert all(
-            engine.file_status(file_id).status == "ambiguous"
-            for file_id in source_files.values()
-        )
+        for file_id in source_files.values():
+            duplicated = engine.file_status(file_id)
+            assert duplicated.status == "likely"
+            assert duplicated.strong_volume_ids == (second_id, third_id)
         second = engine.file_status(second_files["B/same.bin"])
         third = engine.file_status(third_files["C/same.bin"])
-        assert second.status == third.status == "possible"
-        assert second.other_volume_ids == (third_id,)
-        assert third.other_volume_ids == (second_id,)
-        assert engine.folder_status(second_folders["B"]).status == "possible"
+        assert second.status == third.status == "likely"
+        assert second.strong_volume_ids == (source_id, third_id)
+        assert third.strong_volume_ids == (source_id, second_id)
+        folder = engine.folder_status(second_folders["B"])
+        assert folder.status == "likely"
+        assert folder_reason_key(folder.evidence_text) == "all_files_found"
     finally:
         db.close()
 
 
-def test_unequal_casefolded_strong_duplicates_are_not_arbitrarily_paired(tmp_path):
+def test_unequal_casefolded_duplicates_pair_once_but_all_exist_elsewhere(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
-        _, source_files, source_folders = add_catalogued_volume(
+        source_id, source_files, source_folders = add_catalogued_volume(
             db,
             tmp_path,
             name="Case-sensitive source",
@@ -1840,7 +2031,7 @@ def test_unequal_casefolded_strong_duplicates_are_not_arbitrarily_paired(tmp_pat
                 "Project/same.bin": (100, MODIFIED_AT),
             },
         )
-        _, target_files, _ = add_catalogued_volume(
+        target_id, target_files, _ = add_catalogued_volume(
             db,
             tmp_path,
             name="Target",
@@ -1853,11 +2044,24 @@ def test_unequal_casefolded_strong_duplicates_are_not_arbitrarily_paired(tmp_pat
 
         all_file_ids = [*source_files.values(), *target_files.values()]
         assert all(
-            engine.file_status(file_id).status == "ambiguous"
+            engine.file_status(file_id).status == "likely"
             for file_id in all_file_ids
         )
-        assert engine.folder_status(source_folders["Project"]).status == "ambiguous"
-        assert engine.mirror_candidates() == []
+        project = engine.folder_status(source_folders["Project"])
+        assert project.status == "likely"
+        assert folder_reason_key(project.evidence_text) == "all_files_found"
+        assert project.best_target_volume_id == target_id
+        assert project.matched_files == project.total_files == 2
+        assert project.best_coverage_files_percent == 100.0
+        # Drive-pair overlap still pairs the single target record once.
+        candidates = engine.mirror_candidates()
+        assert all(not row.complete_structure for row in candidates)
+        candidate = next(
+            row
+            for row in candidates
+            if {row.source_volume_id, row.target_volume_id} == {source_id, target_id}
+        )
+        assert candidate.matched_files == 1
     finally:
         db.close()
 
@@ -1905,12 +2109,21 @@ def test_folder_status_separates_complete_and_partial_target_drives(tmp_path):
         db.close()
 
 
-def test_overly_common_folder_fingerprint_never_becomes_complete(tmp_path):
+def test_overly_common_folder_structure_is_still_a_lead_from_its_files(tmp_path):
+    """A repeated structure never hides that every file exists elsewhere.
+
+    Nine drives exceed the folder-fingerprint bound, so no structure match is
+    paired; the files carry no modified time, so each is only a name-and-size
+    lead on the other eight drives. The folder follows its files (amber lead),
+    never "No copy found". Only the best weak-only drive is persisted as a
+    drive-match row; the full drive set stays in other_volume_ids.
+    """
     db = Database(tmp_path / "catalogue.jvvv")
     try:
         folder_ids = []
+        volume_ids = []
         for index in range(9):
-            _, _, folders = add_catalogued_volume(
+            volume_id, _, folders = add_catalogued_volume(
                 db,
                 tmp_path,
                 name=f"Archive {index}",
@@ -1921,24 +2134,38 @@ def test_overly_common_folder_fingerprint_never_becomes_complete(tmp_path):
                 },
             )
             folder_ids.append(folders["Project"])
+            volume_ids.append(volume_id)
 
         engine = BackupAnalysisEngine(db)
         assert engine.analyse().status == "completed"
 
-        assert all(
-            engine.folder_status(folder_id).status == "ambiguous"
-            for folder_id in folder_ids
-        )
-        assert all(engine.folder_matches(folder_id) == [] for folder_id in folder_ids)
+        full_match_keys = {"full_match_hashed", "full_match_partly_hashed", "full_match_legacy"}
+        for folder_id, volume_id in zip(folder_ids, volume_ids):
+            status = engine.folder_status(folder_id)
+            assert status.status == "possible"
+            assert folder_reason_key(status.evidence_text) == "all_files_weak"
+            assert folder_reason_key(status.evidence_text) not in full_match_keys
+            assert set(status.other_volume_ids) == set(volume_ids) - {volume_id}
+            assert status.other_drive_count == 8
+            assert status.strong_volume_ids == ()
+            assert status.best_target_volume_id in set(volume_ids) - {volume_id}
+            assert status.possible_volume_ids == (status.best_target_volume_id,)
+            assert status.matched_files == 0
+            assert status.total_files == 2
+            matches = engine.folder_matches(folder_id)
+            assert len(matches) == 1
+            assert matches[0].status == "possible"
+            assert matches[0].target_volume_id == status.best_target_volume_id
+        # Name-and-size-only pairs never count towards drive-pair overlap.
         assert engine.mirror_candidates() == []
     finally:
         db.close()
 
 
-def test_repeated_folder_structure_does_not_reuse_one_target_folder(tmp_path):
+def test_repeated_folder_structure_is_found_everywhere_but_drive_pairing_counts_once(tmp_path):
     db = Database(tmp_path / "catalogue.jvvv")
     try:
-        _, _, source_folders = add_catalogued_volume(
+        source_id, _, source_folders = add_catalogued_volume(
             db,
             tmp_path,
             name="Source",
@@ -1950,7 +2177,7 @@ def test_repeated_folder_structure_does_not_reuse_one_target_folder(tmp_path):
                 "Y/Project/b.bin": (200, MODIFIED_AT),
             },
         )
-        _, _, target_folders = add_catalogued_volume(
+        target_id, _, target_folders = add_catalogued_volume(
             db,
             tmp_path,
             name="Target",
@@ -1963,17 +2190,33 @@ def test_repeated_folder_structure_does_not_reuse_one_target_folder(tmp_path):
 
         engine = BackupAnalysisEngine(db)
         assert engine.analyse().status == "completed"
-        project_ids = [
-            source_folders["X/Project"],
-            source_folders["Y/Project"],
-            target_folders["Z/Project"],
-        ]
+        x = engine.folder_status(source_folders["X/Project"])
+        y = engine.folder_status(source_folders["Y/Project"])
+        z = engine.folder_status(target_folders["Z/Project"])
 
+        # Two same-name folders cannot both claim the one target folder as a
+        # structure match, so none of the three is a full match...
+        full_match_keys = {"full_match_hashed", "full_match_partly_hashed", "full_match_legacy"}
         assert all(
-            engine.folder_status(folder_id).status == "ambiguous"
-            for folder_id in project_ids
+            folder_reason_key(status.evidence_text) not in full_match_keys
+            for status in (x, y, z)
         )
-        assert all(engine.folder_matches(folder_id) == [] for folder_id in project_ids)
+        # ...but every file of each folder exists on the other drive, so all
+        # three get the same verdict regardless of how pairing went.
+        for status in (x, y, z):
+            assert status.status == "likely"
+            assert folder_reason_key(status.evidence_text) == "all_files_found"
+            assert status.matched_files == status.total_files == 2
+        assert x.best_target_volume_id == y.best_target_volume_id == target_id
+        assert z.best_target_volume_id == source_id
+        # The drive-pair overlap pairs the target's two files once each.
+        candidate = next(
+            row
+            for row in engine.mirror_candidates()
+            if {row.source_volume_id, row.target_volume_id} == {source_id, target_id}
+        )
+        assert candidate.matched_files == 2
+        assert candidate.complete_structure is False
     finally:
         db.close()
 
@@ -2013,9 +2256,291 @@ def test_complete_drive_copy_requires_trustworthy_applied_scans(tmp_path):
 
         assert candidate.complete_structure is False
         assert "not labelled a complete drive copy" in candidate.evidence_text
+        # The folder itself still matches; the scan problem stays an explicit flag.
         folder = engine.folder_status(first_folders["Project"])
+        assert folder.status == "likely"
+        assert folder_reason_key(folder.evidence_text) == "full_match_legacy"
+        assert folder_evidence_flags(folder.evidence_text) == {"scan_errors"}
+        assert folder.strong_volume_ids == (second_id,)
+    finally:
+        db.close()
+
+
+def test_modified_time_tolerance_is_two_seconds_or_an_exact_hour(tmp_path):
+    assert modified_times_match(MODIFIED_AT, MODIFIED_AT)
+    assert modified_times_match(MODIFIED_AT, MODIFIED_PLUS_2S)
+    assert not modified_times_match(MODIFIED_AT, MODIFIED_PLUS_3S)
+    assert modified_times_match(MODIFIED_AT, MODIFIED_PLUS_1H)
+    assert not modified_times_match(MODIFIED_AT, None)
+    # Two unusable values never "match" each other just by being equal text.
+    assert not modified_times_match("", "")
+    assert not modified_times_match("garbage", "garbage")
+    assert not modified_times_match(None, None)
+
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+        )
+        within_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Two seconds later",
+            drive_id="AID-002",
+            files={"Project/report.psd": (100, MODIFIED_PLUS_2S)},
+        )
+        beyond_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Three seconds later",
+            drive_id="AID-003",
+            files={"Project/report.psd": (100, MODIFIED_PLUS_3S)},
+        )
+        dst_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="FAT clock offset",
+            drive_id="AID-004",
+            files={"Project/report.psd": (100, MODIFIED_PLUS_1H)},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        status = engine.file_status(source_files["Project/report.psd"])
+
+        assert status.status == "likely"
+        assert status.strong_volume_ids == (within_id, dst_id)
+        assert status.possible_volume_ids == (beyond_id,)
+        assert status.other_volume_ids == (within_id, beyond_id, dst_id)
+        assert file_reason_key(status.evidence_text) == "time_match"
+    finally:
+        db.close()
+
+
+def test_hash_conflict_is_ambiguous_until_another_drive_verifies_the_content(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, source_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+            content_hashes={"Project/report.psd": HASH_A},
+        )
+        _, other_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Different content",
+            drive_id="AID-002",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+            content_hashes={"Project/report.psd": HASH_B},
+        )
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        status = engine.file_status(source_files["Project/report.psd"])
+        assert status.status == "ambiguous"
+        assert file_reason_key(status.evidence_text) == "hash_conflict"
+        assert status.other_volume_ids == ()
+        assert status.strong_volume_ids == status.possible_volume_ids == ()
+        assert engine.file_matches(source_files["Project/report.psd"]) == []
+        assert engine.analyse().ambiguous_files == 2
+
+        verified_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Same content",
+            drive_id="AID-003",
+            files={"Project/report.psd": (100, LATER_SCAN)},
+            content_hashes={"Project/report.psd": HASH_A},
+        )
+        assert engine.analyse().status == "completed"
+
+        status = engine.file_status(source_files["Project/report.psd"])
+        assert status.status == "likely"
+        assert file_reason_key(status.evidence_text) == "hash_verified"
+        assert "conflict" in file_evidence_flags(status.evidence_text)
+        assert status.verified_volume_ids == (verified_id,)
+        assert status.strong_volume_ids == (verified_id,)
+        # The conflicting drive is a warning, never a lead.
+        assert status.possible_volume_ids == ()
+        assert status.other_volume_ids == (verified_id,)
+        # The odd one out still conflicts with everything else.
+        odd = engine.file_status(other_files["Project/report.psd"])
+        assert odd.status == "ambiguous"
+        assert file_reason_key(odd.evidence_text) == "hash_conflict"
+    finally:
+        db.close()
+
+
+def test_folder_found_only_by_name_and_size_is_a_weak_lead(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, _, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={
+                "Project/one.bin": (100, MODIFIED_AT),
+                "Project/two.bin": (200, MODIFIED_AT),
+            },
+        )
+        target_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Retimed and scattered",
+            drive_id="AID-002",
+            files={
+                "Loose/one.bin": (100, LATER_SCAN),
+                "Other/two.bin": (200, LATER_SCAN),
+            },
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        folder = engine.folder_status(source_folders["Project"])
+        matches = engine.folder_matches(source_folders["Project"])
+
         assert folder.status == "possible"
-        assert "scan" in folder.evidence_text.casefold()
+        assert folder_reason_key(folder.evidence_text) == "all_files_weak"
+        assert folder.best_target_volume_id == target_id
+        assert folder.strong_volume_ids == ()
+        assert folder.possible_volume_ids == (target_id,)
+        # Weak matches are leads, not coverage.
+        assert folder.matched_files == 0
+        assert folder.total_files == 2
+        assert folder.best_coverage_files_percent == 0.0
+        assert len(matches) == 1
+        assert matches[0].status == "possible"
+        assert "name and size only" in matches[0].evidence_text
+    finally:
+        db.close()
+
+
+def test_generic_files_make_their_folder_and_its_parent_a_lead_not_missing(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        folder_ids: list[tuple[int, int]] = []
+        file_ids = []
+        volume_ids = []
+        for index in range(10):
+            volume_id, files, folders = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Camera card {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={
+                    "Media/Shoot/IMG_0001.JPG": (4096, f"2026-08-{index + 1:02d}T09:00:00.000000+0000"),
+                    "Media/Shoot/IMG_0002.JPG": (4096, f"2026-08-{index + 1:02d}T09:05:00.000000+0000"),
+                },
+            )
+            volume_ids.append(volume_id)
+            folder_ids.append((folders["Media/Shoot"], folders["Media"]))
+            file_ids.extend(files.values())
+
+        # Ten drives exceed this generic bound: every file is an amber lead.
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_candidate_volumes_per_key=8),
+        )
+        assert engine.analyse().status == "completed"
+
+        for file_id in file_ids:
+            status = engine.file_status(file_id)
+            assert status.status == "possible"
+            assert file_reason_key(status.evidence_text) == "generic"
+            assert status.strong_volume_ids == ()
+            assert status.other_drive_count == 9
+        for (shoot_id, media_id), volume_id in zip(folder_ids, volume_ids):
+            for folder_id in (shoot_id, media_id):
+                folder = engine.folder_status(folder_id)
+                assert folder.status == "possible"
+                assert folder_reason_key(folder.evidence_text) == "all_files_weak"
+                assert folder.strong_volume_ids == ()
+                # Every other drive is a lead; only the best one is persisted
+                # as a drive-match row because none holds strong evidence.
+                assert set(folder.other_volume_ids) == set(volume_ids) - {volume_id}
+                assert folder.best_target_volume_id in set(volume_ids) - {volume_id}
+                assert folder.possible_volume_ids == (folder.best_target_volume_id,)
+                assert folder.matched_files == 0
+                assert folder.total_files == 2
+                assert folder.best_coverage_files_percent == 0.0
+                assert {match.status for match in engine.folder_matches(folder_id)} == {"possible"}
+    finally:
+        db.close()
+
+
+def test_coverage_verdicts_keep_scan_errors_explicit_on_either_side(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, _, errored_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Errored source",
+            drive_id="AID-001",
+            files={"Project/one.bin": (100, MODIFIED_AT)},
+            scan_errors=1,
+        )
+        clean_id, _, clean_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Clean target",
+            drive_id="AID-002",
+            files={"Elsewhere/one.bin": (100, MODIFIED_AT)},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        # The folder's own scan had errors.
+        errored = engine.folder_status(errored_folders["Project"])
+        assert errored.status == "likely"
+        assert folder_reason_key(errored.evidence_text) == "all_files_found"
+        assert folder_evidence_flags(errored.evidence_text) == {"scan_errors"}
+        assert errored.best_target_volume_id == clean_id
+        # The best target drive's scan had errors.
+        clean = engine.folder_status(clean_folders["Elsewhere"])
+        assert clean.status == "likely"
+        assert folder_reason_key(clean.evidence_text) == "all_files_found"
+        assert folder_evidence_flags(clean.evidence_text) == {"scan_errors"}
+    finally:
+        db.close()
+
+
+def test_full_match_with_a_never_scanned_target_is_not_flagged_as_scan_errors(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        files = {
+            "Project/one.bin": (100, MODIFIED_AT),
+            "Project/two.bin": (200, MODIFIED_AT),
+        }
+        _, _, source_folders = add_catalogued_volume(
+            db, tmp_path, name="Source", drive_id="AID-001", files=files
+        )
+        target_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Never scanned",
+            drive_id="AID-002",
+            files=files,
+            scan_status=None,
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        folder = engine.folder_status(source_folders["Project"])
+
+        assert folder.status == "likely"
+        assert folder_reason_key(folder.evidence_text) == "full_match_legacy"
+        # "reported access errors" is only true of a completed scan with errors.
+        assert folder_evidence_flags(folder.evidence_text) == frozenset()
+        assert folder.strong_volume_ids == (target_id,)
     finally:
         db.close()
 
@@ -2170,6 +2695,396 @@ def test_published_analysis_can_be_queried_through_a_read_only_connection(tmp_pa
         reader.close()
 
 
+def test_generic_keys_shared_by_many_drives_still_feed_mirror_candidates(tmp_path):
+    """Nine drives sharing three same-time files: every drive pair is a 100% mirror candidate.
+
+    The keys take the generic path (bound lowered to 8 drives), which never
+    pairs for coverage, but the bounded same-time bucket still feeds the
+    drive-pair overlap. The root structure repeats on too many drives to be
+    called a complete copy.
+    """
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        file_ids = []
+        for index in range(9):
+            _, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={
+                    "P/a.mov": (10, MODIFIED_AT),
+                    "P/b.mov": (20, MODIFIED_AT),
+                    "c.mov": (30, MODIFIED_AT),
+                },
+            )
+            file_ids.extend(files.values())
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_candidate_volumes_per_key=8),
+        )
+        assert engine.analyse().status == "completed"
+
+        candidates = engine.mirror_candidates()
+        assert len(candidates) == 36
+        for candidate in candidates:
+            assert candidate.source_coverage_percent == 100.0
+            assert candidate.target_coverage_percent == 100.0
+            assert candidate.matched_files == 3
+            assert candidate.complete_structure is False
+            assert "modified time" in candidate.evidence_text
+        for file_id in file_ids:
+            status = engine.file_status(file_id)
+            assert status.status == "likely"
+            assert file_reason_key(status.evidence_text) == "generic"
+            assert len(status.strong_volume_ids) == 8
+    finally:
+        db.close()
+
+
+def test_generic_group_strong_tier_tolerates_two_second_fat_rounding(tmp_path):
+    """Half the drives saved T, half T+2 s: one bucket, every copy strong on 11 drives.
+
+    A thirteenth drive saved T+1 h. The one-hour FAT/DST rule is deliberately
+    not applied in generic groups, so that copy stays a name-and-size lead.
+    """
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        file_ids = []
+        for index in range(12):
+            _, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={
+                    "Clips/clip.mov": (
+                        5_000,
+                        MODIFIED_AT if index % 2 == 0 else MODIFIED_PLUS_2S,
+                    )
+                },
+            )
+            file_ids.extend(files.values())
+        hour_id, hour_files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Clock offset",
+            drive_id="AID-013",
+            files={"Clips/clip.mov": (5_000, MODIFIED_PLUS_1H)},
+        )
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_candidate_volumes_per_key=8),
+        )
+        assert engine.analyse().status == "completed"
+
+        for file_id in file_ids:
+            status = engine.file_status(file_id)
+            assert status.status == "likely"
+            assert file_reason_key(status.evidence_text) == "generic"
+            assert len(status.strong_volume_ids) == 11
+            assert status.possible_volume_ids == (hour_id,)
+            assert status.other_drive_count == 12
+        offset = engine.file_status(hour_files["Clips/clip.mov"])
+        assert offset.status == "possible"
+        assert offset.strong_volume_ids == ()
+        assert len(offset.possible_volume_ids) == 12
+        # The same-time bucket also feeds the drive-pair overlap: 12 choose 2;
+        # the clock-offset drive shares no strong pair with anyone.
+        candidates = engine.mirror_candidates()
+        assert len(candidates) == 66
+        assert all(
+            hour_id not in (row.source_volume_id, row.target_volume_id)
+            for row in candidates
+        )
+    finally:
+        db.close()
+
+
+def test_capped_generic_ids_keep_strong_drives_before_leads(tmp_path):
+    """When a generic group's drive list is truncated, strong drives survive the cut."""
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        drives = MAX_STORED_OTHER_VOLUME_IDS + 2
+        strong_drives = 40
+        strong_ids = []
+        file_ids = []
+        for index in range(drives):
+            volume_id, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={
+                    f"Folder-{index}/common.bin": (
+                        4096,
+                        MODIFIED_AT
+                        if index < strong_drives
+                        else f"2027-01-{index - strong_drives + 1:02d}T09:00:00.000000+0000",
+                    )
+                },
+            )
+            file_ids.append(files[f"Folder-{index}/common.bin"])
+            if index < strong_drives:
+                strong_ids.append(volume_id)
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(
+                max_strong_volumes_per_signature=drives,
+                max_strong_edges_per_signature=drives * drives,
+            ),
+        )
+        assert engine.analyse().status == "completed"
+
+        status = engine.file_status(file_ids[0])
+        assert status.status == "likely"
+        assert file_reason_key(status.evidence_text) == "generic"
+        assert set(status.strong_volume_ids) == set(strong_ids) - {strong_ids[0]}
+        assert len(status.other_volume_ids) == MAX_STORED_OTHER_VOLUME_IDS
+        assert set(status.strong_volume_ids) <= set(status.other_volume_ids)
+        assert status.other_drive_count == drives - 1
+    finally:
+        db.close()
+
+
+def test_generic_folder_coverage_is_scattered_when_strong_files_sit_on_different_drives(
+    tmp_path,
+):
+    """Key-level existence rows still add up per folder and per drive.
+
+    The source folder holds a.bin and b.bin. Eight other drives hold only a.bin
+    (one of them with the same time) and eight hold only b.bin (one with the
+    same time), so each key is a generic group. The folder is partial on its
+    best drive, scattered across two, and persists only the two drives holding
+    strong evidence while every lead stays in other_volume_ids.
+    """
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        source_id, _, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={"P/a.bin": (100, MODIFIED_AT), "P/b.bin": (200, MODIFIED_AT)},
+        )
+        other_ids = []
+        for index in range(16):
+            name = "a.bin" if index < 8 else "b.bin"
+            size = 100 if index < 8 else 200
+            same_time = index in {0, 8}
+            volume_id, _, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 2:03d}",
+                files={
+                    f"Elsewhere/{name}": (
+                        size,
+                        MODIFIED_AT
+                        if same_time
+                        else f"2027-02-{index + 1:02d}T09:00:00.000000+0000",
+                    )
+                },
+            )
+            other_ids.append(volume_id)
+        a_strong_id, b_strong_id = other_ids[0], other_ids[8]
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_candidate_volumes_per_key=8),
+        )
+        assert engine.analyse().status == "completed"
+
+        folder = engine.folder_status(source_folders["P"])
+        assert folder.status == "possible"
+        assert folder_reason_key(folder.evidence_text) == "partial"
+        assert folder.scattered is True
+        assert folder.matched_files == 1
+        assert folder.total_files == 2
+        assert folder.best_coverage_files_percent == 50.0
+        # Both strong drives hold one file; the tie goes to the larger bytes.
+        assert folder.best_target_volume_id == b_strong_id
+        assert folder.best_coverage_bytes_percent == pytest.approx(200 / 3)
+        assert folder.other_drive_count == 16
+        assert set(folder.other_volume_ids) == set(other_ids)
+        matches = engine.folder_matches(source_folders["P"])
+        assert {match.target_volume_id for match in matches} == {a_strong_id, b_strong_id}
+        assert all(match.status == "possible" and match.matched_files == 1 for match in matches)
+        # Drives holding the files by name and size alone are leads in
+        # other_volume_ids but are not persisted as drive-match rows.
+        assert set(folder.possible_volume_ids) == {a_strong_id, b_strong_id}
+        assert source_id not in folder.other_volume_ids
+    finally:
+        db.close()
+
+
+def test_generic_group_persists_few_drive_match_rows_per_folder(tmp_path):
+    """60 drives x 200 records of one generic key: verdicts unchanged, fan-out gone.
+
+    Drives are catalogued in pairs that share one modified time, so every
+    record is strong on exactly one other drive and a lead on the other 58.
+    Each folder persists only the drive holding strong evidence rather than
+    a row for every drive the lead points at.
+    """
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        base = datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc)
+        file_ids = []
+        folder_ids = []
+        for drive in range(60):
+            modified_at = (base + timedelta(days=drive // 2)).strftime(
+                "%Y-%m-%dT%H:%M:%S.%f%z"
+            )
+            _, files, folders = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Card {drive}",
+                drive_id=f"AID-{drive + 1:03d}",
+                files={
+                    f"Set-{index:03d}/common.bin": (4096, modified_at)
+                    for index in range(200)
+                },
+            )
+            file_ids.extend(files.values())
+            folder_ids.extend(folders.values())
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        statuses = engine.item_statuses("file", file_ids)
+        assert len(statuses) == len(file_ids) == 12_000
+        for status in statuses.values():
+            assert status.status == "likely"
+            assert file_reason_key(status.evidence_text) == "generic"
+            assert len(status.strong_volume_ids) == 1
+            assert status.other_drive_count == 59
+        folder_statuses = engine.item_statuses("folder", folder_ids)
+        assert len(folder_statuses) == len(folder_ids)
+        for status in folder_statuses.values():
+            assert status.status == "likely"
+            assert folder_reason_key(status.evidence_text) == "all_files_found"
+            assert status.strong_volume_ids == (status.best_target_volume_id,)
+            assert status.other_drive_count == 59
+
+        run_id = engine.state().active_run_id
+        rows_per_folder = db.connection.execute(
+            """
+            SELECT MAX(rows_for_folder)
+            FROM (
+                SELECT COUNT(*) AS rows_for_folder
+                FROM backup_folder_drive_matches
+                WHERE run_id = ?
+                GROUP BY folder_id
+            )
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        assert rows_per_folder <= 2
+    finally:
+        db.close()
+
+
+def test_drive_pair_overlap_counts_strong_pairs_only(tmp_path):
+    """Name-and-size-only agreement never makes two drives look like mirrors."""
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        a_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="A",
+            drive_id="AID-001",
+            files={
+                "Alpha/report.psd": (100, MODIFIED_AT),
+                "Alpha/notes.txt": (50, MODIFIED_AT),
+                "Alpha/extra.bin": (10, MODIFIED_AT),
+            },
+        )
+        b_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="B",
+            drive_id="AID-002",
+            files={
+                "Beta/report.psd": (100, LATER_SCAN),
+                "Beta/notes.txt": (50, LATER_SCAN),
+                "Beta/extra.bin": (10, MODIFIED_AT),
+            },
+        )
+        c_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="C",
+            drive_id="AID-003",
+            files={
+                "Gamma/report.psd": (100, MODIFIED_AT),
+                "Gamma/notes.txt": (50, MODIFIED_AT),
+                "Gamma/extra.bin": (10, LATER_SCAN),
+            },
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        candidates = engine.mirror_candidates()
+
+        # A-B share one file by time (33%), B-C none, A-C two (67%).
+        assert [(row.source_volume_id, row.target_volume_id) for row in candidates] == [
+            (a_id, c_id)
+        ]
+        candidate = candidates[0]
+        assert candidate.matched_files == 2
+        assert candidate.source_coverage_percent == pytest.approx(200 / 3)
+        assert candidate.complete_structure is False
+        assert "name, size and modified time" in candidate.evidence_text
+        assert "filename-and-size" not in candidate.evidence_text
+        assert b_id not in {
+            volume
+            for row in candidates
+            for volume in (row.source_volume_id, row.target_volume_id)
+        }
+    finally:
+        db.close()
+
+
+def test_run_saved_under_older_rules_reads_as_outdated(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, files, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="First",
+            drive_id="AID-001",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+        )
+        add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Second",
+            drive_id="AID-002",
+            files={"Project/report.psd": (100, MODIFIED_AT)},
+        )
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+        assert engine.state().is_stale is False
+
+        # Simulate evidence persisted by the previous rules version.
+        with db.transaction():
+            db.connection.execute("UPDATE backup_analysis_runs SET rules_version = 3")
+
+        state = engine.state()
+        assert state.is_stale is True
+        assert state.status == "outdated"
+        assert state.rules_version == 3
+        assert "rules" in state.stale_reason.casefold()
+        status = engine.file_status(files["Project/report.psd"])
+        assert status.is_stale is True
+        assert status.stale_reason == state.stale_reason
+    finally:
+        db.close()
+
+
 def test_backup_analysis_worker_interrupts_active_sqlite_work_when_cancelled(monkeypatch):
     events = []
 
@@ -2254,3 +3169,422 @@ def test_worker_does_not_report_cancelled_after_analysis_already_completed(monke
     assert len(completed) == 1
     assert completed[0].status == "completed"
     assert cancelled == []
+
+
+class _RecordingDict(dict):
+    """A dict that remembers the most entries it ever held."""
+
+    peak = 0
+
+    def _note(self) -> None:
+        type(self).peak = max(type(self).peak, len(self))
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._note()
+
+    def setdefault(self, key, default=None):
+        result = super().setdefault(key, default)
+        self._note()
+        return result
+
+
+def test_pending_folder_coverage_holds_only_parents_awaiting_children(monkeypatch, tmp_path):
+    """60 drives x 200 records of one generic key: coverage is streamed, not materialised.
+
+    The coverage cursor is read in lockstep with the deepest-first folder
+    loop, so the in-memory map never holds more than the folders whose
+    children are still being judged (here the 60 roots), never every folder.
+    """
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        base = datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc)
+        folder_ids = []
+        for drive in range(60):
+            modified_at = (base + timedelta(days=drive // 2)).strftime(
+                "%Y-%m-%dT%H:%M:%S.%f%z"
+            )
+            _, _, folders = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Card {drive}",
+                drive_id=f"AID-{drive + 1:03d}",
+                files={
+                    f"Set-{index:03d}/common.bin": (4096, modified_at)
+                    for index in range(200)
+                },
+            )
+            folder_ids.extend(folders.values())
+        non_leaf_folders = int(
+            db.connection.execute(
+                "SELECT COUNT(DISTINCT parent_id) FROM folders WHERE parent_id IS NOT NULL"
+            ).fetchone()[0]
+        )
+        assert non_leaf_folders == 60
+
+        _RecordingDict.peak = 0
+        monkeypatch.setattr(
+            BackupAnalysisEngine, "_pending_coverage_map", staticmethod(_RecordingDict)
+        )
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        assert 0 < _RecordingDict.peak <= non_leaf_folders
+        statuses = engine.item_statuses("folder", folder_ids)
+        assert len(statuses) == len(folder_ids) == 60 * 201
+        assert {status.status for status in statuses.values()} == {"likely"}
+        assert {
+            folder_reason_key(status.evidence_text) for status in statuses.values()
+        } == {"all_files_found"}
+    finally:
+        db.close()
+
+
+def test_generic_bucket_strong_tier_is_per_record_not_per_chain(tmp_path):
+    """Records 2 s apart chain into one bucket, but only neighbours within 2 s are strong.
+
+    Seven drives saved T, T+2, ..., T+10 and T+13. The first six chain into
+    one bucket; the copy at T is strong only on the drive at T+2, never on
+    the drive at T+10, and the copy at T+13 has no strong drive at all.
+    """
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        base = datetime(2026, 8, 19, 9, 0, 0, tzinfo=timezone.utc)
+        offsets = [0, 2, 4, 6, 8, 10, 13]
+        volume_ids = []
+        file_ids = []
+        for index, offset in enumerate(offsets):
+            volume_id, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={
+                    "Clips/clip.mov": (
+                        5_000,
+                        (base + timedelta(seconds=offset)).strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+                    )
+                },
+            )
+            volume_ids.append(volume_id)
+            file_ids.append(files["Clips/clip.mov"])
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_candidate_volumes_per_key=2),
+        )
+        assert engine.analyse().status == "completed"
+
+        first = engine.file_status(file_ids[0])
+        assert first.status == "likely"
+        assert file_reason_key(first.evidence_text) == "generic"
+        assert first.strong_volume_ids == (volume_ids[1],)
+        assert set(first.possible_volume_ids) == set(volume_ids[2:])
+        middle = engine.file_status(file_ids[2])
+        assert set(middle.strong_volume_ids) == {volume_ids[1], volume_ids[3]}
+        last_chained = engine.file_status(file_ids[5])
+        assert last_chained.strong_volume_ids == (volume_ids[4],)
+        apart = engine.file_status(file_ids[6])
+        assert apart.status == "possible"
+        assert apart.strong_volume_ids == ()
+        assert set(apart.possible_volume_ids) == set(volume_ids[:6])
+        # Drive-pair overlap follows the same 2 s rule: only neighbours pair.
+        pairs = {
+            frozenset((row.source_volume_id, row.target_volume_id))
+            for row in engine.mirror_candidates()
+        }
+        assert pairs == {
+            frozenset((volume_ids[index], volume_ids[index + 1])) for index in range(5)
+        }
+    finally:
+        db.close()
+
+
+def test_two_drive_mirror_of_many_identical_generic_files_keeps_strong_evidence(tmp_path):
+    """The strong-records bound applies per drive: 2 x 300 same-time copies stay strong."""
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        volume_ids = []
+        file_ids = []
+        folder_ids = []
+        for drive in ("A", "B"):
+            volume_id, files, folders = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Mirror {drive}",
+                drive_id=f"AID-{drive}",
+                files={
+                    f"Clips/{drive}-take-{index:03d}/clip.mov": (5_000, MODIFIED_AT)
+                    for index in range(300)
+                },
+            )
+            volume_ids.append(volume_id)
+            file_ids.extend(files.values())
+            folder_ids.extend(folders.values())
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        statuses = engine.item_statuses("file", file_ids)
+        assert len(statuses) == 600
+        for status in statuses.values():
+            assert status.status == "likely"
+            assert file_reason_key(status.evidence_text) == "generic"
+            twin = volume_ids[1] if status.other_volume_ids == (volume_ids[1],) else volume_ids[0]
+            assert status.strong_volume_ids == (twin,)
+            assert status.possible_volume_ids == ()
+        folder_statuses = engine.item_statuses("folder", folder_ids)
+        assert len(folder_statuses) == len(folder_ids)
+        for status in folder_statuses.values():
+            assert status.status == "likely"
+            assert folder_reason_key(status.evidence_text) == "all_files_found"
+            assert status.matched_files == status.total_files > 0
+    finally:
+        db.close()
+
+
+def test_same_time_generic_copies_on_too_many_drives_stay_a_lead(tmp_path):
+    """33 drives sharing one modified time exceed the drive bound: possible, not strong."""
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        file_ids = []
+        for index in range(33):
+            _, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={f"Folder-{index}/common.bin": (4096, MODIFIED_AT)},
+            )
+            file_ids.append(files[f"Folder-{index}/common.bin"])
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        for file_id in file_ids:
+            status = engine.file_status(file_id)
+            assert status.status == "possible"
+            assert file_reason_key(status.evidence_text) == "generic"
+            assert status.strong_volume_ids == ()
+            assert status.other_drive_count == 32
+    finally:
+        db.close()
+
+
+def test_over_bound_hash_group_beyond_the_id_cap_never_counts_a_file_twice(monkeypatch, tmp_path):
+    """Drives beyond the capped verified list are covered by hash rows already.
+
+    Four drives hold the same content; the hash pass is over its bounds, so
+    existence is written per (hash, drive) for every drive while the stored
+    verified ids are capped at two. The last drive holds the content under
+    another name (hashed) and the same-name file without a saved hash, so the
+    metadata pass sees it only as a time match. It must not get a second,
+    per-record coverage row: the folder also holds a file found nowhere, so
+    it is partial, not complete.
+    """
+    monkeypatch.setattr(backup_analysis, "MAX_STORED_OTHER_VOLUME_IDS", 2)
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        volume_ids = []
+        first_folders = None
+        first_files = None
+        for index in range(4):
+            files = {f"Project-{index}/copy.bin": (100, MODIFIED_AT)}
+            hashes = {f"Project-{index}/copy.bin": HASH_A}
+            if index == 0:
+                files["Project-0/unique.bin"] = (250, MODIFIED_AT)
+            if index == 3:
+                files[f"Project-{index}/renamed.bin"] = (100, MODIFIED_AT)
+                hashes = {f"Project-{index}/renamed.bin": HASH_A}
+            volume_id, file_ids, folders = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files=files,
+                content_hashes=hashes,
+            )
+            volume_ids.append(volume_id)
+            if index == 0:
+                first_folders, first_files = folders, file_ids
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_hash_volumes_per_signature=2),
+        )
+        assert engine.analyse().status == "completed"
+
+        copy = engine.file_status(first_files["Project-0/copy.bin"])
+        assert copy.status == "likely"
+        assert len(copy.verified_volume_ids) == 2
+        assert copy.other_drive_count == 3
+        assert "repeated_content" in file_evidence_flags(copy.evidence_text)
+        folder = engine.folder_status(first_folders["Project-0"])
+        assert folder.status == "possible"
+        assert folder_reason_key(folder.evidence_text) == "partial"
+        assert folder.matched_files == 1
+        assert folder.total_files == 2
+        assert folder.best_coverage_files_percent == 50.0
+        matches = engine.folder_matches(first_folders["Project-0"])
+        assert {match.target_volume_id for match in matches} == set(volume_ids[1:])
+        assert all(match.matched_files == 1 and match.total_files == 2 for match in matches)
+    finally:
+        db.close()
+
+
+def test_saved_modified_times_are_canonicalised_to_the_scanner_format():
+    assert _canonical_modified_time(None) is None
+    assert _canonical_modified_time(MODIFIED_AT) == MODIFIED_AT
+    assert _canonical_modified_time("2026-08-19T09:00:00+00:00") == MODIFIED_AT
+    assert _canonical_modified_time("2026-08-19T11:00:00+02:00") == MODIFIED_AT
+    assert _canonical_modified_time("2026-08-19T09:00:00Z") == MODIFIED_AT
+    assert _canonical_modified_time("2026-08-19T09:00:00") == MODIFIED_AT
+    assert _canonical_modified_time("not a time") == "not a time"
+    assert _canonical_modified_time("") == ""
+
+
+def test_generic_bucket_sweep_matches_equal_instants_saved_with_different_offsets(tmp_path):
+    """09:00+00:00 and 11:00+02:00 are the same instant; 10:00+00:00 is not."""
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        saved = [
+            "2026-08-19T09:00:00+00:00",
+            "2026-08-19T10:00:00+00:00",
+            "2026-08-19T11:00:00+02:00",
+        ]
+        volume_ids = []
+        file_ids = []
+        for index, modified_at in enumerate(saved):
+            volume_id, files, _ = add_catalogued_volume(
+                db,
+                tmp_path,
+                name=f"Archive {index}",
+                drive_id=f"AID-{index + 1:03d}",
+                files={"Clips/clip.mov": (5_000, modified_at)},
+            )
+            volume_ids.append(volume_id)
+            file_ids.append(files["Clips/clip.mov"])
+
+        engine = BackupAnalysisEngine(
+            db,
+            AnalysisOptions(max_candidate_volumes_per_key=2),
+        )
+        assert engine.analyse().status == "completed"
+
+        utc = engine.file_status(file_ids[0])
+        offset = engine.file_status(file_ids[2])
+        hour_later = engine.file_status(file_ids[1])
+        assert file_reason_key(utc.evidence_text) == "generic"
+        assert utc.status == offset.status == "likely"
+        assert utc.strong_volume_ids == (volume_ids[2],)
+        assert offset.strong_volume_ids == (volume_ids[0],)
+        assert hour_later.status == "possible"
+        assert hour_later.strong_volume_ids == ()
+    finally:
+        db.close()
+
+
+def test_full_match_folder_counts_only_whole_folder_drives_as_strong(tmp_path):
+    """A drive holding every file loose is a lead, not a "Full-match drive"."""
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, _, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={
+                "Project/one.bin": (100, MODIFIED_AT),
+                "Project/two.bin": (200, MODIFIED_AT),
+            },
+        )
+        structure_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Structure",
+            drive_id="AID-002",
+            files={
+                "Project/one.bin": (100, MODIFIED_AT),
+                "Project/two.bin": (200, MODIFIED_AT),
+            },
+        )
+        loose_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Loose",
+            drive_id="AID-003",
+            files={
+                "Loose/one.bin": (100, MODIFIED_AT),
+                "Other/two.bin": (200, MODIFIED_AT),
+            },
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        folder = engine.folder_status(source_folders["Project"])
+        assert folder.status == "likely"
+        assert folder_reason_key(folder.evidence_text) == "full_match_legacy"
+        assert folder.strong_volume_ids == (structure_id,)
+        assert folder.possible_volume_ids == ()
+        assert folder.other_volume_ids == (structure_id, loose_id)
+        matches = {match.target_volume_id: match for match in engine.folder_matches(folder.item_id)}
+        assert set(matches) == {structure_id, loose_id}
+        assert matches[structure_id].status == matches[loose_id].status == "likely"
+        assert matches[structure_id].evidence_text.startswith(FOLDER_MATCH_EVIDENCE_WHOLE_PREFIX)
+        assert not matches[loose_id].evidence_text.startswith(FOLDER_MATCH_EVIDENCE_WHOLE_PREFIX)
+        assert matches[loose_id].evidence_text == "Every file found here by name, size and time."
+    finally:
+        db.close()
+
+
+def test_partial_drive_row_text_reports_weak_matches_when_they_exceed_strong_ones(tmp_path):
+    db = Database(tmp_path / "catalogue.jvvv")
+    try:
+        _, _, source_folders = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Source",
+            drive_id="AID-001",
+            files={
+                "Project/a.bin": (100, MODIFIED_AT),
+                "Project/b.bin": (200, MODIFIED_AT),
+                "Project/c.bin": (300, MODIFIED_AT),
+            },
+        )
+        mixed_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Mixed",
+            drive_id="AID-002",
+            files={
+                "Elsewhere/a.bin": (100, MODIFIED_AT),
+                "Elsewhere/b.bin": (200, "2027-01-01T09:00:00.000000+0000"),
+            },
+        )
+        strong_only_id, _, _ = add_catalogued_volume(
+            db,
+            tmp_path,
+            name="Strong only",
+            drive_id="AID-003",
+            files={"Elsewhere/a.bin": (100, MODIFIED_AT)},
+        )
+
+        engine = BackupAnalysisEngine(db)
+        assert engine.analyse().status == "completed"
+
+        folder = engine.folder_status(source_folders["Project"])
+        assert folder.status == "possible"
+        assert folder_reason_key(folder.evidence_text) == "partial"
+        matches = {match.target_volume_id: match for match in engine.folder_matches(folder.item_id)}
+        assert matches[mixed_id].status == "possible"
+        assert matches[mixed_id].matched_files == 1
+        assert matches[mixed_id].evidence_text == (
+            "Part of this folder is here (1 of 3 files by name, size and time; "
+            "2 by name and size)."
+        )
+        assert matches[strong_only_id].evidence_text == (
+            "Part of this folder is here (1 of 3 files by name, size and time)."
+        )
+    finally:
+        db.close()

@@ -36,14 +36,15 @@ JVVV. There is no server or cloud component.
   available.
 - Analyse saved catalogue hashes and metadata for evidence that files and folders
   also exist on other registered drives, without reconnecting or rescanning them.
-- Show explicit copy-evidence states that say what matched rather than how
-  confident the tool feels: **Full match (hashed / no hashes)** for whole
-  folders; **Hash verified**, **Metadata match (no hash)**, and **Name and size
-  only** for files; **Not confirmed · <reason>** and **Partial** for folders
-  that are held back; **Content differs** for same-name files whose hashes
-  disagree; **No copy found**; and **Not analysed / Outdated / Can't tell**.
-  Each label carries the matching drive IDs, a plain-language "Why", and the
-  exact metadata used for the conclusion.
+- Show explicit copy-evidence states that answer "does this exist on another
+  drive, and how sure are we?": aqua **Hash verified** (proven identical by
+  SHA-256), green **Same size & time** (contents not compared), amber **Name and
+  size** and **Content differs** for files; **Full match (hashed / partly hashed
+  / no hashes)**, **All files hash-verified / All files found**, **Found by name
+  & size only**, **Partial**, and **Not confirmed · structure repeats** for
+  folders; red **No copy found**; and grey **Not analysed / Outdated / Can't
+  tell**. Each label carries the matching drive IDs, a plain-language "Why", and
+  the exact metadata used for the conclusion.
 - Report per-volume other-copy coverage, potential whole-drive copies, and the
   latest scan health. Successfully scanned empty drives are shown as
   **N/A · empty** (and drives holding only system files as **N/A · system files
@@ -144,26 +145,51 @@ the full-file SHA-256 values previously recorded by scans are identical, even if
 the files have different names, paths, or timestamps. Re-run the analysis when
 the application marks its results as outdated after catalogue contents change.
 
-The labels are deliberately conservative and explain their evidence in the
-interface. When one of the two records has no comparable hash, **Metadata match
-(no hash)** requires the normalized filename, exact byte size, modified time,
-and parent path to agree; **Name and size only** means only normalized filename
-and exact size agree and is a lead, not a copy. Two comparable but different
-hashes are shown as **Content differs**, never as a match. A folder is a
-**Full match** only when a bounded, same-named, hash-aware structure containing
-at least two content files matches on one other drive and both scan
-denominators are trustworthy; the label adds **(hashed)** or **(no hashes)** so
-it is always clear whether file contents or only names and sizes were compared.
-Folders that match but are held back are labelled **Not confirmed** with the
-reason in the cell (a scan had errors, different folder name there, some files
-lack saved hashes, single-file folder, or files found one by one); folders with
-only part of their contents elsewhere are **Partial** with percentages that never
-round up, so 100% appears only when every file was found. Each folder is judged
-on its own and never rolled up from its subfolders, which is why a parent can be
-Not confirmed while every subfolder inside it is a Full match; the status strip
-above the file list states this for the open folder. Overly repetitive hashes or
-metadata are shown as **Too common** rather than being guessed, and known
-operating-system bookkeeping is excluded from coverage.
+The colour of an item answers "does this exist on another drive, and how sure
+are we?", never how the coverage arithmetic paired it, so two identical records
+on the same drive always get the same label. Aqua with a double tick is
+**Hash verified**: proven identical by SHA-256. Green with a tick is
+**Same size & time**: the normalized filename, exact byte size and modified time
+(within 2 seconds, or an exact one-hour clock offset for names that are not
+generic) agree, but contents were not compared. Amber with a dash is a lead to
+look at: **Name and size** (the modified time differs, is missing, or is shared
+by so many drives that it cannot single out copies; a name that is generic
+across the catalogue is flagged as **· generic name**, but only when no modified
+time agrees within 2 seconds on a bounded number of drives, since a time match
+on that scale still counts as **Same size & time**; the one-hour offset is not
+applied to generic names) or **Content differs** (two
+comparable hashes disagree, so it is a different version or a damaged copy,
+never a match). Red is **No copy found**;
+grey is reserved for **Not analysed / Outdated / Can't tell**.
+
+Folders follow the same tiers. **Full match** means the folder name, layout, and
+every file's name and size match on one other drive; the bracket says how much
+content was compared: **(hashed)** is aqua, **(partly hashed)** and
+**(no hashes)** are green. When a scan had errors or the folder is named
+differently there, the cell says so explicitly (**· scan errors**,
+**· different name there**). **All files hash-verified** (aqua) and **All files
+found** (green) mean every file was found on one other drive, including
+single-file folders, but the folder layout there differs; **Found by name & size
+only** is amber; **Partial** shows percentages that never round up, so 100%
+appears only when every file was found, and reads **Partial · leads only** when
+the best drive holds files by name and size but none by modified time;
+**Not confirmed · structure repeats** means the structure repeats on too many
+other drives to pair copies safely. Each
+folder is judged on its own and never rolled up from its subfolders, which is why
+a parent can be Partial while every subfolder inside it is a Full match; the
+status strip above the file list states this for the open folder. Known
+operating-system bookkeeping is excluded from coverage. Green never means
+hash-verified: a file's **Same size & time** compares name, size and modified
+time, and a folder's **Full match** compares folder name, layout, file names and
+sizes; only aqua labels prove contents identical. The whole-drive copies table in
+the Backup Evidence dialog says **Full match (layout & sizes)** for the same
+reason. The Properties dialog lists **Drives with any evidence** (drives with a
+strong match or a lead; the first 64 for very common items, and the row says how
+many there are in total), then breaks them down by tier: **Full-match
+drives** for a Full match, or **Drives holding every file** when every file was
+found there one by one; for a folder found by name and size only it reports how
+many files were found rather than a percentage, because percentages count only
+name-size-and-time matches.
 
 While a scan is running, use **Cancel Scan** beside the progress bar to cancel
 it. Partial results are discarded, so the existing catalogue remains intact.

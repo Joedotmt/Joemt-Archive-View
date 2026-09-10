@@ -83,7 +83,10 @@ from .config import APP_NAME
 from .backup_analysis import (
     ITEM_EVIDENCE_MISSING,
     BackupAnalysisEngine,
+    evidence_counts,
+    file_evidence_flags,
     file_reason_key,
+    folder_evidence_flags,
     folder_reason_key,
 )
 from .catalogue_backup import (
@@ -561,28 +564,30 @@ BACKUP_FOLDER_RULE_SENTENCE = (
 )
 BACKUP_COLUMN_HEADER_TOOLTIP = (
     "Whether another catalogue drive holds a copy of this item, judged from the "
-    "saved catalogue.\n"
-    "Green: Full match (the whole folder) or a matching file. Amber: not confirmed, "
-    "partial, name-and-size only, or content differs. Red: no copy found. Grey: not "
-    "analysed, outdated, or can't tell.\n"
-    "Green does not always mean hashes were compared: the label says whether the "
-    "match used saved hashes or only names and sizes.\n"
+    "saved catalogue. The colour says how sure the evidence is.\n"
+    "Aqua (double tick): proven identical by SHA-256 hash. Green (tick): a file with "
+    "the same name, size and modified time, a folder with the same folder name, "
+    "layout, file names and sizes, or a folder whose every file was found elsewhere "
+    "by name, size and modified time; contents were not compared. Amber (dash): a lead "
+    "to check: partial, name and size only, a generic name, a folder structure that "
+    "repeats too often to pair, or content that differs. Red (cross): no "
+    "copy found. Grey (ring): not analysed, outdated, or can't tell.\n"
     f"{BACKUP_FOLDER_RULE_SENTENCE}\n\n"
     f"{BACKUP_METADATA_DISCLAIMER}"
 )
 BACKUP_VOLUME_COVERAGE_TOOLTIP = (
     "The share of this drive's indexed files and bytes with a hash-verified or "
-    "metadata match (name, size, modified time and path) on another catalogue "
-    "drive. This is stricter than the per-folder figure, which also counts "
-    "name-and-size-only matches. Empty drives are N/A.\n\n"
+    "same-size-and-time match (name, size and modified time) on another catalogue "
+    "drive. Name-and-size-only leads are not counted. Empty drives are N/A.\n\n"
     f"{BACKUP_METADATA_DISCLAIMER}"
 )
 BACKUP_FILTER_OPTIONS = (
     ("All items", "all"),
     ("Needs attention", "attention"),
     ("No copy found", "none"),
-    ("Not confirmed, partial, name and size only, or content differs", "possible"),
-    ("Full match, hash verified, or metadata match", "strong"),
+    ("Partial, leads, or content differs", "possible"),
+    ("Hash verified only", "verified"),
+    ("Full match, hash verified, or same size & time", "strong"),
     ("Not analysed, outdated, or can't tell", "unknown"),
 )
 
@@ -630,6 +635,23 @@ NOT_ANALYSED_BACKUP_DISPLAY = BackupDisplay(
 
 def plural_other_drives(count: int) -> str:
     return f"{count} other drive" + ("" if count == 1 else "s")
+
+
+def other_drives_from_group(other_count: int, counts: tuple[int, int] | None) -> int:
+    """Other-drive count for a capped group: the true count when the engine
+    saved it, else the group's drive count minus this drive."""
+    group_others = (counts[1] - 1) if counts else 0
+    return max(int(other_count or 0), group_others)
+
+
+def safe_int_ids(values: Any) -> set[int]:
+    ids: set[int] = set()
+    for value in values or ():
+        try:
+            ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return ids
 
 
 def backup_drive_references(
@@ -693,40 +715,117 @@ def coverage_percent_text(matched: Any, total: Any, percent: Any = None) -> str 
     return f"{floored:.1f}%"
 
 
-# Folder reasons the engine records when a structure matched but is withheld
-# from Full match: (cell suffix, plain "why" sentence, what would confirm it).
-FOLDER_REASON_LABELS: dict[str, tuple[str, str, str | None]] = {
-    "mixed_hash": (
-        "some files lack saved hashes",
-        "The folder name, layout, file names and sizes all match on the other "
-        "drive, but only some files have saved hashes to compare, so the analysis "
-        "holds back from Full match.",
-        "A fresh scan of both drives that records hashes for every file.",
+# Folder reason key -> (state, plain "why" sentence). The cell text is built in
+# item_backup_display; the Properties dialog reuses the sentence for its "Why" row.
+FOLDER_REASON_LABELS: dict[str, tuple[str, str]] = {
+    "full_match_hashed": (
+        "verified",
+        "The whole folder matches on the other drive: same folder name, same layout, "
+        "and every file's name, size and saved SHA-256 hash.",
     ),
-    "untrusted_scan": (
-        "a scan had errors",
-        "The folder name and structure match on the other drive, but the last scan "
-        "of one of the two drives reported access errors or did not finish, so its "
-        "listing may be incomplete.",
-        "A clean, complete re-scan of the drive whose scan had errors.",
+    "full_match_partly_hashed": (
+        "strong",
+        "The whole folder matches on the other drive by folder name, layout, file "
+        "names and sizes. The files that have saved hashes match too, but not every "
+        "file has one, so contents were only partly compared.",
     ),
-    "untrusted_and_renamed": (
-        "scan had errors, name differs",
-        "The structure matches on more than one drive, but one copy is named "
-        "differently there and one scan had errors.",
-        "A clean, complete re-scan of the drive whose scan had errors.",
+    "full_match_legacy": (
+        "strong",
+        "The whole folder matches on the other drive by folder name, layout, file "
+        "names and sizes. These records have no saved hashes, so contents were not "
+        "compared.",
     ),
-    "renamed": (
-        "different folder name there",
-        "The same files, sizes and layout exist on the other drive, but the folder "
-        "itself is named differently there.",
-        None,
+    "all_files_hashed": (
+        "verified",
+        "Every file in this folder has a hash-verified copy on the best single other "
+        "drive, but the folder layout there differs or could not be matched as a unit.",
     ),
+    "all_files_found": (
+        "strong",
+        "Every file in this folder was found on the best single other drive by name, "
+        "size and modified time, but the folder layout there differs or could not be "
+        "matched as a unit. Contents were not compared.",
+    ),
+    "all_files_weak": (
+        "possible",
+        "Every file in this folder has a same-name, same-size file on the best single "
+        "other drive, but the modified times differ, are missing, or were shared by "
+        "too many drives to single out copies, so these are leads rather than "
+        "confirmed copies.",
+    ),
+    "partial": (
+        "possible",
+        "Only part of this folder was found on the best single other drive, counting "
+        "files that match by name, size and modified time.",
+    ),
+    "structure_repeats": (
+        "possible",
+        "This folder structure repeats too often across the catalogue to pair copies "
+        "safely, so no single copy is claimed.",
+    ),
+}
+FULL_MATCH_FOLDER_REASONS = frozenset(
+    {"full_match_hashed", "full_match_partly_hashed", "full_match_legacy"}
+)
+FULL_MATCH_TIERS = {
+    "full_match_hashed": " (hashed)",
+    "full_match_partly_hashed": " (partly hashed)",
+    "full_match_legacy": " (no hashes)",
+}
+COVERAGE_FOLDER_REASONS = frozenset(
+    {"all_files_hashed", "all_files_found", "all_files_weak", "partial"}
+)
+# Rules-version 3 reason keys only ever appear on an outdated analysis run.
+LEGACY_FOLDER_REASONS = frozenset(
+    {
+        "trusted_hashed",
+        "trusted_legacy",
+        "mixed_hash",
+        "untrusted_and_renamed",
+        "untrusted_scan",
+        "renamed",
+        "coverage",
+        "ambiguous",
+    }
+)
+LEGACY_FILE_REASONS = frozenset(
+    {"metadata_likely", "competing", "repetitive_hash", "too_common"}
+)
+# Qualifiers the engine appends to a Full match: cell suffix (errors must stay
+# explicit in the cell) and the sentence used in tooltips and Properties.
+FOLDER_FLAG_SUFFIXES = {
+    "scan_errors": " · scan errors",
+    "renamed": " · different name there",
+}
+FOLDER_FLAG_SENTENCES = {
+    "scan_errors": (
+        "A scan of one of the two drives reported access errors, so its listing may "
+        "be incomplete."
+    ),
+    "renamed": "The folder is named differently on that drive.",
 }
 COVERAGE_ONE_WAY_CAVEAT = (
     "Files were matched one by one, so this does not say whether the other "
     "drive's folder also holds items that are not here."
 )
+
+
+def folder_strong_drives_label(reason: str) -> str:
+    """Label for a folder's strong_volume_ids row.
+
+    For Full match verdicts these drives hold the whole folder; for coverage
+    verdicts (all files hashed/found/weak, partial) they hold every file by
+    strong evidence, which is not a whole-folder match.
+    """
+    if reason in COVERAGE_FOLDER_REASONS:
+        return "Drives holding every file"
+    return "Full-match drives"
+# Hedge-first ordering: the weakest verdict sorts first.
+BACKUP_STATE_RANKS = {"none": 0, "possible": 1, "unknown": 2, "strong": 3, "verified": 4}
+COPY_FOUND_STATES = frozenset({"verified", "strong"})
+LIKELY_ENGINE_STATES = frozenset({"strong", "complete", "likely", "matched"})
+POSSIBLE_ENGINE_STATES = frozenset({"possible", "partial", "probable", "scattered"})
+NONE_ENGINE_STATES = frozenset({"none", "no_match", "unprotected", "single", "single_copy"})
 
 
 def item_backup_display(
@@ -768,7 +867,13 @@ def item_backup_display(
     possible_refs = backup_drive_references(possible_ids or (), references)
     evidence = str(object_value(status, "evidence_text", "") or "").strip()
     analysed_at = object_value(status, "analysed_at")
-    reason = folder_reason_key(evidence) if is_folder else file_reason_key(evidence)
+    if is_folder:
+        reason = folder_reason_key(evidence)
+        flags = folder_evidence_flags(evidence)
+    else:
+        reason = file_reason_key(evidence)
+        flags = file_evidence_flags(evidence)
+    counts = evidence_counts(evidence)
 
     matched_files = object_value(status, "matched_files")
     total_files = object_value(status, "total_files")
@@ -803,8 +908,71 @@ def item_backup_display(
         except (TypeError, ValueError):
             best_target_name = None
     where = f" on {best_target_name}" if best_target_name else " on the best single drive"
+    where_short = best_target_name or "best single drive"
     confirm: str | None = None
     show_coverage_lines = False
+
+    # Evidence tiers decide the colour. Status-only records (no per-tier drive
+    # lists) fall back to the engine status word and the overall drive count; a
+    # matched status implies at least one other drive.
+    verified_count = len(verified_refs)
+    strong_count = len(strong_refs)
+    possible_count = len(possible_refs)
+    if not (verified_count or strong_count or possible_count):
+        if raw_state in LIKELY_ENGINE_STATES:
+            if reason == "hash_verified":
+                verified_count = max(1, other_count)
+            else:
+                strong_count = max(1, other_count)
+        elif raw_state in POSSIBLE_ENGINE_STATES:
+            possible_count = max(1, other_count)
+
+    def partial_verdict() -> tuple[str, list[str]]:
+        if total_count > 0 and matched_count == 0:
+            # Nothing on the best drive matched by time; only name-and-size
+            # leads exist there, so a percentage would read 0% and mislead.
+            return f"Partial · leads only · {where_short}", [
+                f"No file in this folder matches by name, size and modified time on "
+                f"{where_short}; some files are present there by name and size only, "
+                "so treat this drive as a lead, not a copy."
+            ]
+        if scattered:
+            spread = (
+                f"spread over {other_count} drives"
+                if other_count >= 2
+                else "spread across drives"
+            )
+            return f"Partial · {spread}", [
+                "Together the other drives hold all of these files, but no single "
+                f"drive holds the whole folder; the best one{where} has "
+                f"{files_text or 'part'} of the files."
+            ]
+        parts = []
+        if files_text:
+            parts.append(f"{files_text} files")
+        if bytes_text:
+            parts.append(f"{bytes_text} data")
+        text = (
+            "Partial · " + " · ".join(parts)
+            if parts
+            else f"Partial · {plural_other_drives(other_count)}"
+        )
+        detail = f" ({matched_count:,} of {total_count:,} files)" if total_count else ""
+        missing_count = max(0, total_count - matched_count)
+        # Files missing from the count may still exist there by name and size;
+        # only strong (name, size and time) matches are counted.
+        missing = (
+            f" {missing_count:,} file{'' if missing_count == 1 else 's'} "
+            f"{'has' if missing_count == 1 else 'have'} no name, size and time match "
+            "on it; files present there by name and size only are not counted."
+            if total_count
+            else ""
+        )
+        return text, [
+            f"The best single drive{where} holds {files_text or 'part'} of this "
+            f"folder's files{detail}, counting files that match by name, size and "
+            f"modified time.{missing}"
+        ]
 
     if stale:
         lines = [
@@ -814,183 +982,41 @@ def item_backup_display(
         ]
         state = "unknown"
         text = "Outdated · re-run analysis"
-        rank = 2
     elif raw_state == "empty":
         state = "unknown"
         text = "N/A · empty"
-        rank = 2
         lines = ["The catalogue has no files in this folder, so there is nothing to compare."]
     elif raw_state == "excluded":
         state = "unknown"
         text = "N/A · system files only"
-        rank = 2
         lines = [
-            "This folder holds only system files (Thumbs.db, .DS_Store and similar), "
-            "which are excluded from copy coverage."
-        ]
-    elif raw_state == "ambiguous":
-        if not is_folder and reason == "hash_conflict":
-            state = "conflict"
-            text = "Content differs · same name and size"
-            rank = 1
-            lines = [
-                "A file with the same name and size exists on another drive, but the "
-                "saved SHA-256 hashes differ, so it is a different version or a damaged "
-                "copy, not a copy."
-            ]
-        else:
-            state = "unknown"
-            text = "Too common"
-            rank = 2
-            lines = [
-                (
-                    "This folder structure repeats too often in the catalogue to tell "
-                    "which copy is which."
-                    if is_folder
-                    else "This name-and-size combination is too common in the catalogue "
-                    "to pin down a copy."
-                )
-            ]
-    elif raw_state in {"strong", "complete", "likely", "matched"}:
-        state = "strong"
-        rank = 3
-        complete_count = len(strong_ids or ()) if has_target_breakdown else other_count
-        if is_folder:
-            if reason == "trusted_hashed":
-                tier = " (hashed)"
-                first = (
-                    "The whole folder matches on another drive: same folder name, same "
-                    "layout, and every file's name, size and saved hash."
-                )
-            elif reason == "trusted_legacy":
-                tier = " (no hashes)"
-                first = (
-                    "The whole folder matches on another drive by folder name, layout, "
-                    "file names and sizes. These records have no saved hashes, so this is "
-                    "not a byte-for-byte check."
-                )
-            else:
-                tier = ""
-                first = (
-                    "The whole folder matches on another drive: same folder name, "
-                    "layout, file names and sizes."
-                )
-            text = f"Full match{tier} · {plural_other_drives(complete_count)}"
-        elif verified_refs:
-            text = f"Hash verified · {plural_other_drives(len(verified_refs))}"
-            first = "The full-file SHA-256 recorded during scanning matches on another drive."
-        else:
-            text = f"Metadata match (no hash) · {plural_other_drives(complete_count)}"
-            first = (
-                "Filename, exact size, modified time and parent path match on another "
-                "drive. No saved hash was available, so this is not a byte-for-byte check."
+            (
+                "This folder holds only system files (Thumbs.db, .DS_Store and similar), "
+                "which are excluded from copy coverage."
             )
-        lines = [first]
-    elif raw_state in {"possible", "partial", "probable", "scattered"}:
-        state = "possible"
-        rank = 1
-        if is_folder:
-            if reason in FOLDER_REASON_LABELS:
-                suffix, why, confirm = FOLDER_REASON_LABELS[reason]
-                text = f"Not confirmed · {suffix}"
-                lines = [
-                    (
-                        f"The folder matches{where}, but it is not confirmed as a Full match."
-                        if best_target_name
-                        else "The folder matches on another drive, but it is not confirmed "
-                        "as a Full match."
-                    ),
-                    f"Why: {why}",
-                ]
-            else:
-                # Judged file by file on the best single other drive.
-                show_coverage_lines = True
-                all_found = files_text == "100%" and bytes_text in (None, "100%")
-                if total_count == 1:
-                    text = "Not confirmed · single-file folder"
-                    lines = [
-                        f"The only file in this folder was found{where}, but one "
-                        "name-and-size match is too weak to confirm a whole folder.",
-                        "Why: Folders need at least two files before their structure can "
-                        "be matched as a unit. Check the file's own status instead.",
-                    ]
-                elif all_found:
-                    text = "Not confirmed · files found one by one"
-                    lines = [
-                        f"Every file in this folder was found{where}, counting "
-                        "name-and-size matches, but the folder as a whole could not be "
-                        "confirmed as the same folder there.",
-                        "Why: The other drive's folder may hold extra or different items "
-                        "or a different layout, or the same structure repeats too often "
-                        "to pair it safely.",
-                        COVERAGE_ONE_WAY_CAVEAT,
-                    ]
-                elif scattered:
-                    spread = (
-                        f"spread over {other_count} drives"
-                        if other_count >= 2
-                        else "spread across drives"
-                    )
-                    text = f"Partial · {spread}"
-                    lines = [
-                        "Together the other drives hold all of these files, but no single "
-                        f"drive holds the whole folder; the best one{where} has "
-                        f"{files_text or 'part'} of the files.",
-                    ]
-                else:
-                    parts = []
-                    if files_text:
-                        parts.append(f"{files_text} files")
-                    if bytes_text:
-                        parts.append(f"{bytes_text} data")
-                    text = (
-                        "Partial · " + " · ".join(parts)
-                        if parts
-                        else f"Partial · {plural_other_drives(other_count)}"
-                    )
-                    detail = (
-                        f" ({matched_count:,} of {total_count:,} files)"
-                        if total_count
-                        else ""
-                    )
-                    missing_count = max(0, total_count - matched_count)
-                    missing = (
-                        f" {missing_count:,} file{'' if missing_count == 1 else 's'} "
-                        f"{'was' if missing_count == 1 else 'were'} not found on it."
-                        if total_count
-                        else ""
-                    )
-                    lines = [
-                        f"The best single drive{where} holds {files_text or 'part'} of "
-                        f"this folder's files{detail}, counting name-and-size matches."
-                        f"{missing}"
-                    ]
-            if confirm:
-                lines.append(f"What would confirm it: {confirm}")
-            lines.append(BACKUP_FOLDER_RULE_SENTENCE)
-        else:
-            text = f"Name and size only · {plural_other_drives(other_count)}"
-            lines = [
-                "A file with the same name and size exists on another drive, but the "
-                "modified time or path differs. Treat it as a lead, not a confirmed copy."
-            ]
-    elif raw_state in {"none", "no_match", "unprotected", "single", "single_copy"}:
-        state = "none"
-        text = "No copy found"
-        rank = 0
-        coverage_fraction = 0.0
-        lines = [
-            "No matching copy of this item was found on another drive in this catalogue."
+            if is_folder
+            else (
+                "This is a known system file (Thumbs.db, .DS_Store and similar), which "
+                "is excluded from copy coverage."
+            )
         ]
-    else:
+    elif reason in (LEGACY_FOLDER_REASONS if is_folder else LEGACY_FILE_REASONS):
         state = "unknown"
-        rank = 2
-        if raw_state in {"not_analysed", "not_analyzed", ""} or (
-            raw_state == "unknown" and analysed_at is None
-        ):
-            text = "Not analysed"
-            lines = ["Backup evidence has not been analysed for this item."]
-        elif evidence == ITEM_EVIDENCE_MISSING:
+        text = "Outdated · re-run analysis"
+        lines = [
+            "This item was analysed under an older set of rules, so its saved verdict "
+            "no longer applies.",
+            "Re-run the backup analysis to refresh it.",
+        ]
+    elif raw_state in {"not_analysed", "not_analyzed", ""} or (
+        raw_state == "unknown" and analysed_at is None
+    ):
+        state = "unknown"
+        text = "Not analysed"
+        lines = ["Backup evidence has not been analysed for this item."]
+    elif raw_state == "unknown":
+        state = "unknown"
+        if evidence == ITEM_EVIDENCE_MISSING:
             text = "Can't tell · record missing"
             lines = [
                 "The last scan of this drive no longer found this item, so there is "
@@ -1003,6 +1029,215 @@ def item_backup_display(
                 or "The catalogue does not hold enough current information to judge "
                 "this item: the last scan is missing or reported access errors."
             ]
+    elif is_folder:
+        if reason in FULL_MATCH_FOLDER_REASONS:
+            state, why = FOLDER_REASON_LABELS[reason]
+            text = f"Full match{FULL_MATCH_TIERS[reason]} · {plural_other_drives(strong_count)}"
+            lines = [why]
+            # Drives with evidence that are neither whole-folder matches nor
+            # partial/lead rows hold every file, just not as one folder.
+            if has_target_breakdown:
+                paired_ids = safe_int_ids(strong_ids) | safe_int_ids(possible_ids)
+                loose_ids = [
+                    value for value in other_ids if safe_int_ids((value,)) - paired_ids
+                ]  # ids that parse and are not in either tier
+                if loose_ids:
+                    loose_refs = backup_drive_references(loose_ids, references)
+                    lines.append(
+                        "Also holds every file, but not as one folder: "
+                        f"{summarized_backup_drive_references(loose_refs)}."
+                    )
+        elif reason == "all_files_hashed":
+            state, why = FOLDER_REASON_LABELS[reason]
+            text = f"All files hash-verified · {where_short}"
+            lines = [why, COVERAGE_ONE_WAY_CAVEAT]
+        elif reason == "all_files_found":
+            state, why = FOLDER_REASON_LABELS[reason]
+            text = f"All files found · {where_short}"
+            lines = [why, COVERAGE_ONE_WAY_CAVEAT]
+        elif reason == "all_files_weak":
+            state, why = FOLDER_REASON_LABELS[reason]
+            text = f"Found by name & size only · {where_short}"
+            lines = [why]
+            if matched_count > 0 and total_count > 0:
+                lines.append(
+                    f"{matched_count:,} of {total_count:,} files also match by modified "
+                    f"time on {where_short}."
+                )
+        elif reason == "partial" or (
+            reason == "" and raw_state in POSSIBLE_ENGINE_STATES
+        ):
+            # Judged file by file on the best single other drive.
+            state = "possible"
+            # Leads-only folders (no time match on the best drive) skip the
+            # percentage lines, which would only read 0%.
+            show_coverage_lines = not (total_count > 0 and matched_count == 0)
+            text, lines = partial_verdict()
+        elif reason == "structure_repeats":
+            state, why = FOLDER_REASON_LABELS[reason]
+            repeats = other_drives_from_group(other_count, counts)
+            text = f"Not confirmed · structure repeats on {plural_other_drives(repeats)}"
+            lines = [why]
+            if counts:
+                lines.append(
+                    f"The same structure appears in {counts[0]:,} folders across "
+                    f"{counts[1]:,} drives."
+                )
+        elif reason == "single" or raw_state in NONE_ENGINE_STATES:
+            state = "none"
+            text = "No copy found"
+            lines = [
+                "No matching copy of this item was found on another drive in this catalogue."
+            ]
+        elif raw_state in LIKELY_ENGINE_STATES:
+            # Matched folder whose saved evidence text is not recognised: report
+            # the engine's verdict without claiming how it was reached.
+            state = "strong"
+            text = f"Copy found · {plural_other_drives(strong_count)}"
+            lines = [
+                "A copy was recorded on another drive; the saved evidence text is not "
+                "one this version recognises."
+            ]
+        else:
+            state = "unknown"
+            text = "Can't tell · scan incomplete"
+            lines = [
+                stale_reason
+                or "The catalogue does not hold enough current information to judge "
+                "this folder."
+            ]
+        for flag, suffix in FOLDER_FLAG_SUFFIXES.items():
+            if flag in flags:
+                text += suffix
+                lines.append(FOLDER_FLAG_SENTENCES[flag])
+        if "scan_errors" in flags:
+            confirm = (
+                f"a clean, complete re-scan of {best_target_name} and of this drive"
+                if best_target_name
+                else "a clean, complete re-scan of the drive whose scan had errors"
+            )
+        if "suppressed" in flags:
+            lines.append("Further repeated copies of this structure were not paired.")
+        if confirm:
+            lines.append(f"What would confirm it: {confirm}.")
+        if state == "possible":
+            lines.append(BACKUP_FOLDER_RULE_SENTENCE)
+    else:
+        # A generic name (common across the catalogue) proves little on its own,
+        # but a time match or a hash match still counts: amber only when the
+        # file has neither.
+        generic_time_matched = reason == "generic" and bool(verified_count or strong_count)
+        if reason == "generic" and not generic_time_matched:
+            state = "possible"
+            generic_others = other_drives_from_group(other_count, counts)
+            text = f"Name and size · {plural_other_drives(generic_others)} · generic name"
+            lines = [
+                "Files with this name and size are all over the catalogue, so a match by "
+                "name and size means little here and no copy was paired. No modified time "
+                "agreed within 2 seconds on a small enough set of drives to single out "
+                "copies.",
+                "Check the folder that holds this file for a folder-level match instead.",
+            ]
+            if counts:
+                lines.append(
+                    f"{counts[0]:,} records across {counts[1]:,} drives share this name "
+                    "and size."
+                )
+        elif verified_count:
+            state = "verified"
+            # Repeated content: the saved id list is capped, so the true drive
+            # count lives in other_drive_count.
+            shown_verified = (
+                max(verified_count, other_count)
+                if "repeated_content" in flags
+                else verified_count
+            )
+            text = f"Hash verified · {plural_other_drives(shown_verified)}"
+            lines = [
+                "The full-file SHA-256 recorded during scanning is identical on another "
+                "drive, so the contents are proven the same."
+            ]
+            if strong_count:
+                lines.append(
+                    f"Also found by name, size and time on {strong_count} more "
+                    f"drive{'' if strong_count == 1 else 's'}, where no comparable hash "
+                    "was saved."
+                )
+            if possible_count:
+                lines.append(
+                    f"Also found by name and size only on {possible_count} more "
+                    f"drive{'' if possible_count == 1 else 's'}."
+                )
+        elif strong_count:
+            state = "strong"
+            text = f"Same size & time · {plural_other_drives(strong_count)}"
+            lines = [
+                "A file with the same name, size and modified time exists on another "
+                "drive. Contents were not compared, so this is not a byte-for-byte check."
+            ]
+            if possible_count:
+                lines.append(
+                    f"Name and size also match on {possible_count} more "
+                    f"drive{'' if possible_count == 1 else 's'}, but the modified time "
+                    "there differs."
+                )
+        elif possible_count:
+            state = "possible"
+            text = f"Name and size · {plural_other_drives(possible_count)}"
+            lines = [
+                "A file with the same name and size exists on another drive, but the "
+                "modified time differs, is missing, or was shared by too many drives to "
+                "single out copies. Treat it as a lead, not a confirmed copy."
+            ]
+        elif raw_state == "ambiguous" or reason == "hash_conflict":
+            state = "possible"
+            text = "Content differs · same name and size"
+            lines = [
+                "A file with the same name and size exists on another drive, but the "
+                "saved SHA-256 hashes differ, so it is a different version or a damaged "
+                "copy, not a copy. Look at it before relying on it."
+            ]
+        elif raw_state in NONE_ENGINE_STATES or reason in {"", "name_size_only", "time_match"}:
+            state = "none"
+            text = "No copy found"
+            lines = [
+                "No matching copy of this item was found on another drive in this catalogue."
+            ]
+        else:
+            state = "unknown"
+            text = "Can't tell · scan incomplete"
+            lines = [
+                stale_reason
+                or "The catalogue does not hold enough current information to judge "
+                "this file."
+            ]
+        if generic_time_matched:
+            common = (
+                f" ({counts[0]:,} records on {counts[1]:,} drives)" if counts else ""
+            )
+            lines.append(
+                f"This name and size is common across the catalogue{common}; the time "
+                "match still counts."
+            )
+        if "conflict" in flags and text != "Content differs · same name and size":
+            lines.append(
+                "Another drive holds a different version of this file: same name and "
+                "size, but the saved hashes do not match."
+            )
+        if "repeated_content" in flags:
+            lines.append(
+                "This exact content occurs on many drives, so individual copies were "
+                "not paired for folder coverage."
+            )
+        if other_ids and other_count > len(other_ids):
+            lines.append(
+                f"Only the first {len(other_ids)} drives are listed; {other_count} other "
+                "drives hold it in total."
+            )
+
+    rank = BACKUP_STATE_RANKS[state]
+    if state == "none":
+        coverage_fraction = 0.0
 
     if is_folder and state == "possible":
         if scattered:
@@ -1010,12 +1245,14 @@ def item_backup_display(
                 "Matching files are spread across drives; no single drive has a "
                 "complete folder copy."
             )
-        if best_target_name:
+        if best_target_name and reason not in {"all_files_weak"}:
             lines.append(f"Best single matching drive: {best_target_name}.")
         if show_coverage_lines:
             if files_text:
-                counts = f" ({matched_count:,} of {total_count:,} files)" if total_count else ""
-                lines.append(f"Best single-drive file coverage: {files_text}{counts}.")
+                counts_text = (
+                    f" ({matched_count:,} of {total_count:,} files)" if total_count else ""
+                )
+                lines.append(f"Best single-drive file coverage: {files_text}{counts_text}.")
             if bytes_text:
                 sizes = ""
                 try:
@@ -1032,12 +1269,12 @@ def item_backup_display(
         if is_folder:
             if strong_refs:
                 lines.append(
-                    f"{backup_evidence_label('Full-match drives', stale)}: "
+                    f"{backup_evidence_label(folder_strong_drives_label(reason), stale)}: "
                     f"{summarized_backup_drive_references(strong_refs)}."
                 )
             if possible_refs:
                 lines.append(
-                    f"{backup_evidence_label('Not confirmed or partial drives', stale)}: "
+                    f"{backup_evidence_label('Partial or lead drives', stale)}: "
                     f"{summarized_backup_drive_references(possible_refs)}."
                 )
         else:
@@ -1048,7 +1285,7 @@ def item_backup_display(
                 )
             if strong_refs:
                 lines.append(
-                    f"{backup_evidence_label('Metadata-only drives (no hash)', stale)}: "
+                    f"{backup_evidence_label('Same-size-and-time drives (no hash)', stale)}: "
                     f"{summarized_backup_drive_references(strong_refs)}."
                 )
             if possible_refs:
@@ -1076,11 +1313,13 @@ def backup_filter_matches(display: BackupDisplay, filter_key: str) -> bool:
     if display.text.startswith("N/A"):
         return False
     if filter_key == "attention":
-        return display.state != "strong"
+        return display.state not in COPY_FOUND_STATES
     if filter_key == "possible":
-        return display.state in {"possible", "conflict"}
+        return display.state == "possible"
+    if filter_key == "verified":
+        return display.state == "verified"
     if filter_key == "strong":
-        return display.state == "strong"
+        return display.state in COPY_FOUND_STATES
     if filter_key == "none":
         return display.state == "none"
     if filter_key == "unknown":
@@ -1115,8 +1354,11 @@ def browser_status_strip_text(
     # analysed rows would otherwise be counted as "0 match", which is false.
     judged_folders = [item for item in folders if item.backup.state != "unknown"]
     if judged_folders:
-        full = sum(1 for item in judged_folders if item.backup.state == "strong")
-        parts.append(f"Folders here: {full} of {len(judged_folders)} are a Full match.")
+        full = sum(1 for item in judged_folders if item.backup.state in COPY_FOUND_STATES)
+        verb = "has" if len(judged_folders) == 1 else "have"
+        parts.append(
+            f"Folders here: {full} of {len(judged_folders)} {verb} a copy elsewhere."
+        )
     judged_files = [item for item in files if item.backup.state != "unknown"]
     if judged_files:
         none_items = [item for item in judged_files if item.backup.state == "none"]
@@ -1129,13 +1371,15 @@ def browser_status_strip_text(
                 f"found ({names}{more})."
             )
         else:
-            matched = sum(1 for item in judged_files if item.backup.state == "strong")
+            matched = sum(
+                1 for item in judged_files if item.backup.state in COPY_FOUND_STATES
+            )
             leads = len(judged_files) - matched
             sentence = (
                 f"Files here: {matched} of {len(judged_files)} match on another drive"
             )
             if leads:
-                sentence += f"; {leads} {'is' if leads == 1 else 'are'} a name-and-size lead only"
+                sentence += f"; {leads} {'is' if leads == 1 else 'are'} a lead only"
             parts.append(sentence + ".")
     if not parts:
         return ""
@@ -1315,9 +1559,7 @@ def volume_backup_display(
         state, rank = "none", 0
     possible_files = int(object_value(summary, "possible_files", 0) or 0)
     ambiguous_files = int(object_value(summary, "ambiguous_files", 0) or 0)
-    if state == "unknown" and ambiguous_files:
-        text = f"Too common · {ambiguous_files:,} files"
-    elif state == "possible" and files_value <= 0 and possible_files:
+    if state == "possible" and files_value <= 0 and possible_files:
         text = f"Name and size only · {possible_files:,} files"
     else:
         files_label = (
@@ -1332,15 +1574,18 @@ def volume_backup_display(
             )
             text += f" · {bytes_label} data"
     tooltip = (
-        f"Hash verified or Metadata match (no hash) on another drive: {strong_files:,} of "
+        f"Hash verified or same size & time on another drive: {strong_files:,} of "
         f"{coverage_files:,} coverage-eligible files"
     )
     if coverage_bytes:
         tooltip += f", {format_size(strong_bytes)} of {format_size(coverage_bytes)}"
     if possible_files:
-        tooltip += f". Name-and-size-only matches not counted as coverage: {possible_files:,} files"
+        tooltip += f". Name-and-size-only leads not counted as coverage: {possible_files:,} files"
     if ambiguous_files:
-        tooltip += f". Too-common metadata excluded from matching: {ambiguous_files:,} files"
+        tooltip += (
+            f". Content differs (same name and size, different hash), not counted: "
+            f"{ambiguous_files:,} files"
+        )
     if excluded_files:
         tooltip += f". Operating-system metadata excluded: {excluded_files:,} files"
     tooltip += (
@@ -1504,9 +1749,9 @@ class CatalogueIconProvider:
 
 class BackupStatusIconProvider:
     COLORS = {
+        "verified": "#1fa9b8",
         "strong": "#2e9b4b",
         "possible": "#d18a00",
-        "conflict": "#d18a00",
         "none": "#cf3f3f",
         "unknown": "#7b8794",
     }
@@ -1539,14 +1784,20 @@ class BackupStatusIconProvider:
             glyph = QPen(QColor("white"), 1.6)
             glyph.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(glyph)
-            if state == "strong":
+            if state == "verified":
+                # Double tick: two ticks 3 px apart, so "proven identical" is
+                # told from a plain tick without relying on aqua vs green.
+                glyph.setWidthF(1.3)
+                painter.setPen(glyph)
+                painter.drawLine(QPoint(4, 8), QPoint(6, 10))
+                painter.drawLine(QPoint(6, 10), QPoint(9, 6))
+                painter.drawLine(QPoint(7, 8), QPoint(9, 10))
+                painter.drawLine(QPoint(9, 10), QPoint(12, 6))
+            elif state == "strong":
                 painter.drawLine(QPoint(5, 8), QPoint(7, 10))
                 painter.drawLine(QPoint(7, 10), QPoint(11, 6))
             elif state == "possible":
                 painter.drawLine(QPoint(5, 8), QPoint(11, 8))
-            elif state == "conflict":
-                painter.drawLine(QPoint(8, 5), QPoint(8, 8))
-                painter.drawPoint(QPoint(8, 11))
             else:
                 painter.drawLine(QPoint(6, 6), QPoint(10, 10))
                 painter.drawLine(QPoint(10, 6), QPoint(6, 10))
@@ -2750,9 +3001,9 @@ class BackupEvidenceDialog(QDialog):
 
         explanation = QLabel(
             "This compares records already saved in the catalogue. It does not reconnect "
-            "or rescan drives or read file contents. Hash-verified means SHA-256 values "
-            "recorded during scans match; Metadata match (no hash) means name, size, "
-            "modified time and path agree without a hash."
+            "or rescan drives or read file contents. Hash verified means SHA-256 values "
+            "recorded during scans match; Same size & time means name, size and "
+            "modified time agree without a hash, so contents were not compared."
         )
         explanation.setObjectName("offlineNotice")
         explanation.setWordWrap(True)
@@ -2770,42 +3021,51 @@ class BackupEvidenceDialog(QDialog):
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         legend = QLabel(
-            "Green (tick) — Full match for a whole folder; Hash verified or Metadata "
-            "match (no hash) for a file\n"
-            "Amber (dash) — Not confirmed, Partial, or Name and size only\n"
-            "Amber (!) — Content differs: same name and size, but saved hashes disagree\n"
+            "Aqua (double tick) — proven identical by SHA-256: Hash verified for a file; "
+            "Full match (hashed) or All files hash-verified for a folder\n"
+            "Green (tick) — contents not compared: for a file, the same name, size and "
+            "modified time (Same size & time); for a folder, the same folder name, "
+            "layout, file names and sizes (Full match, partly hashed / no hashes) or "
+            "every file found by name, size and time (All files found)\n"
+            "Amber (dash) — a lead to check: Name and size, Content differs, Found by "
+            "name & size only, Partial, or Not confirmed · structure repeats\n"
             "Red (cross) — No copy found\n"
-            "Grey (ring) — Not analysed, Outdated, Too common, N/A system files, or "
-            "Can't tell"
+            "Grey (ring) — Not analysed, Outdated, N/A system files, or Can't tell"
         )
         legend.setWordWrap(True)
         rules = QLabel(
             "What the labels mean:\n"
-            "• Full match (hashed): the folder name, layout, every file's name and size, "
-            "and the saved SHA-256 hashes all match on one other drive, and both drives' "
-            "scans completed without errors.\n"
-            "• Full match (no hashes): the same comparison, but these records were scanned "
-            "before hashing existed, so only names, sizes and layout were compared, not "
-            "file contents.\n"
-            "• Not confirmed: the folder matched but is deliberately held back, and the "
-            "label says why: a scan had errors, the folder is named differently there, "
-            "some files lack saved hashes, it is a single-file folder, or the files were "
-            "found one by one without the folder matching as a unit.\n"
+            "• Hash verified: the full-file SHA-256 values recorded during scans are "
+            "identical, so the contents are proven the same. Names, paths and "
+            "timestamps may differ.\n"
+            "• Same size & time: filename, exact size and modified time (within 2 "
+            "seconds, or an exact one-hour clock offset for names that are not generic) "
+            "match on another drive. No hash was compared, so this is not a "
+            "byte-for-byte check.\n"
+            "• Name and size: only the filename and exact size match; the modified time "
+            "differs, is missing, or is shared by so many drives that it cannot single "
+            "out copies. A lead, not a copy. A generic name that appears on many drives "
+            "is flagged as such, but only when no modified time agrees within 2 seconds "
+            "on a bounded number of drives; a time match on that scale still counts as "
+            "Same size & time. The one-hour clock offset is not applied to generic "
+            "names.\n"
+            "• Content differs: same name and size, but the saved hashes differ, so it is "
+            "a different version or a damaged copy, not a copy.\n"
+            "• Full match (hashed / partly hashed / no hashes): the folder name, layout, "
+            "and every file's name and size match on one other drive; the bracket says "
+            "how many files also had saved hashes to compare. The cell adds "
+            "\"scan errors\" or \"different name there\" when that applies.\n"
+            "• All files hash-verified / All files found: every file in the folder was "
+            "found on one other drive (by hash, or by name, size and time), but the "
+            "folder layout there differs or could not be matched as a unit.\n"
+            "• Found by name & size only: every file has a same-name, same-size file on "
+            "one other drive, but the modified times differ, are missing, or were "
+            "shared by too many drives to single out copies.\n"
             "• Partial: the best single other drive holds only part of this folder's "
             "files. Percentages never round up; 100% appears only when every file was "
             "found.\n"
-            "• Hash verified: the full-file SHA-256 values recorded during scans are "
-            "identical. Names, paths, and timestamps may differ.\n"
-            "• Metadata match (no hash): filename, exact size, modified time and parent "
-            "path match; no comparable hash was available.\n"
-            "• Name and size only: a lead, not a copy. The path or modified time differs "
-            "or is missing.\n"
-            "• Content differs: same name and size, but the saved hashes differ, so it is "
-            "a different version or a damaged copy.\n"
-            "• Too common: repetitive hashes or weak name-and-size evidence are suppressed "
-            "when they span more than 8 drives, 64 records, or 256 projected "
-            "file-to-drive links. Exact path-and-time subgroups use separate bounded "
-            "limits (32 drives, 512 records, or 4,096 links).\n"
+            "• Not confirmed · structure repeats: the folder structure repeats too often "
+            "in the catalogue to pair copies safely, so no single copy is claimed.\n"
             f"• {BACKUP_FOLDER_RULE_SENTENCE} A parent stays amber when a loose file or "
             "a subfolder directly inside it differs between the drives, or when the "
             "other drive holds extra items there.\n"
@@ -2834,9 +3094,9 @@ class BackupEvidenceDialog(QDialog):
             [
                 "Drive",
                 "Indexed files",
-                "Hash verified / Metadata match",
+                "Hash verified / same size & time",
                 "Name and size only",
-                "Too common",
+                "Content differs",
                 "OS metadata",
                 "File coverage",
                 "Byte coverage",
@@ -2870,8 +3130,9 @@ class BackupEvidenceDialog(QDialog):
         volume_page = QWidget()
         volume_layout = QVBoxLayout(volume_page)
         volume_note = QLabel(
-            "Coverage counts Hash verified and Metadata match (no hash) files on a "
-            "different drive; percentages never round up. "
+            "Coverage counts Hash verified and Same size & time files on a "
+            "different drive; name-and-size-only leads are not counted, and "
+            "percentages never round up. "
             "Empty successfully scanned drives are N/A."
         )
         volume_note.setWordWrap(True)
@@ -3015,10 +3276,10 @@ class BackupEvidenceDialog(QDialog):
             ]
         else:
             summary_parts = [
-                f"The last completed analysis found Hash verified or Metadata match "
-                f"(no hash) evidence on another "
+                f"The last completed analysis found Hash verified or Same size & time "
+                f"evidence on another "
                 f"drive for {strong_files:,} of {total_files:,} indexed file records.",
-                f"Name and size only: {possible_files:,}. Too common to use: "
+                f"Name and size only: {possible_files:,}. Content differs: "
                 f"{ambiguous_files:,}. Excluded OS metadata: {excluded_files:,}.",
             ]
         if stale_reason:
@@ -3166,7 +3427,7 @@ class BackupEvidenceDialog(QDialog):
                     coverage_percent_text(None, None, b_on_a) or "N/A",
                     "Outdated · re-run analysis"
                     if analysis_stale
-                    else ("Full match" if complete else "Partial overlap"),
+                    else ("Full match (layout & sizes)" if complete else "Partial overlap"),
                     reason,
                 ]
             )
@@ -8266,19 +8527,36 @@ class MainWindow(QMainWindow):
             getattr(self, "backup_volume_references", {}),
         )
         stale_status = bool(object_value(status, "is_stale", False))
+        # The saved id list is capped (64 drives); the true count lives in
+        # other_drive_count, so a longer list must say it is a sample.
+        try:
+            other_total = int(
+                (object_value(status, "other_drive_count", 0) if status is not None else 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            other_total = 0
+
+        def first_of(references: list[str]) -> str:
+            text = ", ".join(references)
+            if references and other_total > len(references):
+                text += f" (first {len(references)} of {other_total:,} drives)"
+            return text
+
         properties.append(("Other-copy status", display.text))
         if item_type == "folder" and display.reason in FOLDER_REASON_LABELS:
-            properties.append(
-                (
-                    backup_evidence_label("Why", stale_status),
-                    FOLDER_REASON_LABELS[display.reason][1],
-                )
-            )
+            why = FOLDER_REASON_LABELS[display.reason][1]
+            flags = folder_evidence_flags(object_value(status, "evidence_text", ""))
+            if "scan_errors" in flags:
+                why += " " + FOLDER_FLAG_SENTENCES["scan_errors"]
+            if "renamed" in flags:
+                why += " " + FOLDER_FLAG_SENTENCES["renamed"]
+            properties.append((backup_evidence_label("Why", stale_status), why))
         properties.extend(
             [
                 (
-                    backup_evidence_label("Matching catalogue drives", stale_status),
-                    ", ".join(other_refs) if other_refs else "None listed",
+                    backup_evidence_label("Drives with any evidence", stale_status),
+                    first_of(other_refs) if other_refs else "None listed",
                 ),
                 (
                     backup_evidence_label("Engine evidence", stale_status),
@@ -8307,16 +8585,23 @@ class MainWindow(QMainWindow):
                 getattr(self, "backup_volume_references", {}),
             )
             if verified_refs:
+                file_flags = file_evidence_flags(
+                    str(object_value(status, "evidence_text", "") or "")
+                )
                 properties.append(
                     (
                         backup_evidence_label("Hash-verified drives", stale_status),
-                        ", ".join(verified_refs),
+                        first_of(verified_refs)
+                        if "repeated_content" in file_flags
+                        else ", ".join(verified_refs),
                     )
                 )
             if strong_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Metadata-only drives (no hash)", stale_status),
+                        backup_evidence_label(
+                            "Same-size-and-time drives (no hash)", stale_status
+                        ),
                         ", ".join(strong_refs),
                     )
                 )
@@ -8339,14 +8624,16 @@ class MainWindow(QMainWindow):
             if strong_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Full-match drives", stale_status),
+                        backup_evidence_label(
+                            folder_strong_drives_label(display.reason), stale_status
+                        ),
                         ", ".join(strong_refs),
                     )
                 )
             if possible_refs:
                 properties.append(
                     (
-                        backup_evidence_label("Not confirmed or partial drives", stale_status),
+                        backup_evidence_label("Partial or lead drives", stale_status),
                         ", ".join(possible_refs),
                     )
                 )
@@ -8360,25 +8647,72 @@ class MainWindow(QMainWindow):
                 object_value(status, "total_bytes"),
                 object_value(status, "best_coverage_bytes_percent"),
             )
-            if display.reason in FOLDER_REASON_LABELS:
+            if display.reason in FULL_MATCH_FOLDER_REASONS:
                 # The engine records 100/100 for these by construction, so a
-                # percentage would only repeat the confusion the label removes.
+                # percentage would only repeat what the label already says.
                 properties.append(
                     (
                         backup_evidence_label("Whole-folder structure", stale_status),
-                        "Matches on another drive; see Why for what holds it back.",
+                        "Matches on another drive; see Why for how much was compared.",
                     )
                 )
-            elif files_text is not None or bytes_text is not None:
-                parts = []
-                if files_text is not None:
-                    parts.append(f"{files_text} of files")
-                if bytes_text is not None:
-                    parts.append(f"{bytes_text} of bytes")
+            elif display.reason == "all_files_weak":
+                # matched_files counts strong matches only, so the percentage
+                # rows would read 0% here; say what was actually found instead.
+                best_target_id = object_value(status, "best_target_volume_id")
+                best_target_name = None
+                if best_target_id is not None:
+                    try:
+                        best_target_name = getattr(
+                            self, "backup_volume_references", {}
+                        ).get(int(best_target_id), f"Volume {int(best_target_id)}")
+                    except (TypeError, ValueError):
+                        best_target_name = None
+                try:
+                    weak_total = int(object_value(status, "total_files") or 0)
+                    weak_matched = int(object_value(status, "matched_files") or 0)
+                except (TypeError, ValueError):
+                    weak_total = weak_matched = 0
+                if weak_total > 0:
+                    where = f" on {best_target_name}" if best_target_name else ""
+                    weak_value = (
+                        f"all {weak_total:,} file{'' if weak_total == 1 else 's'}{where}"
+                    )
+                    if weak_matched > 0:
+                        weak_value += (
+                            f"; {weak_matched:,} of them also by modified time"
+                        )
+                    properties.append(
+                        (
+                            backup_evidence_label(
+                                "Found by name & size only", stale_status
+                            ),
+                            weak_value,
+                        )
+                    )
+            elif display.reason in COVERAGE_FOLDER_REASONS and (
+                files_text is not None or bytes_text is not None
+            ):
+                try:
+                    coverage_total = int(object_value(status, "total_files") or 0)
+                    coverage_matched = int(object_value(status, "matched_files") or 0)
+                except (TypeError, ValueError):
+                    coverage_total = coverage_matched = 0
+                if coverage_total > 0 and coverage_matched == 0:
+                    # Only name-and-size leads on the best drive: 0% would
+                    # hide the fact that files are there at all.
+                    coverage_value = "none by name, size and time; leads only"
+                else:
+                    parts = []
+                    if files_text is not None:
+                        parts.append(f"{files_text} of files")
+                    if bytes_text is not None:
+                        parts.append(f"{bytes_text} of bytes")
+                    coverage_value = ", ".join(parts)
                 properties.append(
                     (
                         backup_evidence_label("Found on best single drive", stale_status),
-                        ", ".join(parts),
+                        coverage_value,
                     )
                 )
         properties.extend(
