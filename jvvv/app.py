@@ -109,8 +109,13 @@ from .database import (
     sqlite_file_uri,
 )
 from .snapshot_repository import (
-    CATALOGUE_META_REPOSITORY_KEY,
+    LINK_LINKED,
+    LINK_MISSING,
+    LINK_UNLINKED,
+    LINK_WRONG,
     REPOSITORY_EXTENSION,
+    RelinkCandidate,
+    RepositoryLink,
     PruneResult,
     RestoreResult,
     SnapshotCancelled,
@@ -119,9 +124,10 @@ from .snapshot_repository import (
     SnapshotResult,
     VerifyResult,
     VolumeRestoreResult,
-    repository_path_for_catalogue,
-    repository_path_with_extension,
-    repository_setting_value,
+    inspect_relink_target,
+    locate_repository_candidates,
+    repository_link_settings,
+    resolve_repository_link,
 )
 from .scanner import VolumeScanner
 from .media_metadata import (
@@ -3641,6 +3647,159 @@ class SnapshotPickerDialog(QDialog):
         return dialog.selected
 
 
+class RelinkRepositoryDialog(QDialog):
+    """Choose the moved snapshot repository: nearby matches first, or browse to it."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        link: RepositoryLink,
+        candidates: list[RelinkCandidate],
+        *,
+        catalogue_uuid: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Relink Snapshot Repository")
+        self.resize(760, 420)
+        self.link = link
+        self.catalogue_uuid = catalogue_uuid
+        self.candidates: list[RelinkCandidate] = []
+        self.selected: Path | None = None
+
+        if link.status == LINK_MISSING:
+            explanation = (
+                f"Last known location:\n{link.recorded_path}\n\nThe folder is not there. "
+                "Choose the repository at its new location. Only repositories that belong to "
+                "this catalogue are accepted."
+            )
+        elif link.status == LINK_WRONG:
+            explanation = (
+                f"{link.recorded_path}\n\nThis folder cannot be used: {link.detail}. "
+                "Choose this catalogue's repository."
+            )
+        else:
+            explanation = (
+                "This catalogue has no snapshot repository linked yet. Choose an existing "
+                "repository of this catalogue, or cancel and take a snapshot to create one."
+            )
+        label = QLabel(explanation)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Location", "Match", "Snapshots", "Latest snapshot"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemSelectionChanged.connect(self.update_buttons)
+        self.table.doubleClicked.connect(lambda _index: self.accept())
+        self.found_label = QLabel("")
+        self.found_label.setObjectName("mutedLabel")
+
+        self.browse_button = QPushButton("Browse…")
+        self.browse_button.clicked.connect(self.browse)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Relink")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+        row = QHBoxLayout()
+        row.addWidget(self.found_label, 1)
+        row.addWidget(self.browse_button)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(row)
+        layout.addWidget(self.buttons)
+
+        for candidate in candidates:
+            self.add_candidate(candidate, select=False)
+        if self.table.rowCount():
+            self.table.selectRow(0)
+        self.found_label.setText(
+            f"{len(candidates)} matching repositor{'y' if len(candidates) == 1 else 'ies'} found nearby."
+            if candidates
+            else "No matching repository was found nearby. Browse to it."
+        )
+        self.update_buttons()
+
+    def add_candidate(self, candidate: RelinkCandidate, *, select: bool) -> None:
+        for existing_row, existing in enumerate(self.candidates):
+            if existing.path.resolve(strict=False) == candidate.path.resolve(strict=False):
+                if select:
+                    self.table.selectRow(existing_row)
+                return
+        self.candidates.append(candidate)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        latest = candidate.latest_snapshot_id.split("-")[0] if candidate.latest_snapshot_id else "—"
+        values = (str(candidate.path), candidate.match_label, str(candidate.snapshot_count), latest)
+        for column, text in enumerate(values):
+            item = QTableWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+        if select:
+            self.table.selectRow(row)
+
+    def browse(self) -> None:
+        start = self.link.recorded_path.parent if self.link.recorded_path is not None else Path.home()
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Locate Snapshot Repository",
+            str(start),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not chosen:
+            return
+        try:
+            candidate = inspect_relink_target(
+                Path(chosen),
+                repository_uuid=self.link.repository_uuid,
+                catalogue_uuid=self.catalogue_uuid,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Not This Catalogue's Repository", str(exc))
+            return
+        self.add_candidate(candidate, select=True)
+
+    def current_candidate(self) -> RelinkCandidate | None:
+        items = self.table.selectedItems()
+        if not items:
+            return None
+        return self.candidates[int(items[0].data(Qt.ItemDataRole.UserRole))]
+
+    def update_buttons(self) -> None:
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            self.current_candidate() is not None
+        )
+
+    def accept(self) -> None:  # type: ignore[override]
+        candidate = self.current_candidate()
+        if candidate is None:
+            return
+        self.selected = candidate.path
+        super().accept()
+
+    @classmethod
+    def choose(
+        cls,
+        parent: QWidget | None,
+        link: RepositoryLink,
+        candidates: list[RelinkCandidate],
+        *,
+        catalogue_uuid: str,
+    ) -> Path | None:
+        dialog = cls(parent, link, candidates, catalogue_uuid=catalogue_uuid)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.selected
+
+
 class SnapshotHistoryDialog(QDialog):
     """Version history of the open catalogue: browse, restore, delete, prune, verify."""
 
@@ -3652,6 +3811,7 @@ class SnapshotHistoryDialog(QDialog):
         self.setModal(False)
         self.manifests: list[SnapshotManifest] = []
         self.repository_path: Path | None = None
+        self.link: RepositoryLink | None = None
 
         self.location_label = QLabel("")
         self.location_label.setWordWrap(True)
@@ -3659,12 +3819,15 @@ class SnapshotHistoryDialog(QDialog):
         self.stats_label = QLabel("")
         self.stats_label.setObjectName("mutedLabel")
         self.stats_label.setWordWrap(True)
-        self.change_location_button = QPushButton("Change Location…")
-        self.change_location_button.clicked.connect(self.change_location)
+        self.relink_button = QPushButton("Relink…")
+        self.relink_button.setToolTip(
+            "Point the catalogue at its repository after the folder was moved or renamed"
+        )
+        self.relink_button.clicked.connect(self.relink)
 
         header = QHBoxLayout()
         header.addWidget(self.location_label, 1)
-        header.addWidget(self.change_location_button)
+        header.addWidget(self.relink_button)
 
         self.snapshot_table = QTableWidget(0, 5)
         self.snapshot_table.setHorizontalHeaderLabels(
@@ -3736,23 +3899,41 @@ class SnapshotHistoryDialog(QDialog):
 
     def refresh(self) -> None:
         window = self.window_ref
-        self.repository_path = window.catalogue_repository_path()
+        link = window.repository_link()
+        self.link = link
+        self.repository_path = link.path if link is not None and link.linked else None
         self.manifests = []
         self.snapshot_table.setRowCount(0)
         self.volume_table.setRowCount(0)
-        if self.repository_path is None:
+        if link is None:
             self.location_label.setText("No catalogue is open.")
             self.stats_label.setText("")
             self.update_buttons()
             return
-        repository = SnapshotRepository(self.repository_path)
-        self.location_label.setText(f"Repository: {self.repository_path}")
-        if not repository.exists():
+        if link.status == LINK_UNLINKED:
+            self.location_label.setText("No snapshot repository yet.")
+            self.stats_label.setText(f"The first snapshot creates {link.recorded_path}.")
+            self.update_buttons()
+            return
+        if link.status == LINK_MISSING:
+            self.location_label.setText(
+                f"Repository offline — last known location: {link.recorded_path}"
+            )
             self.stats_label.setText(
-                "The repository has not been created yet. It is created by the first snapshot."
+                "The folder is not there. Move it back, or use Relink… to point the catalogue "
+                "at its new location."
             )
             self.update_buttons()
             return
+        if link.status == LINK_WRONG:
+            self.location_label.setText(f"Repository offline — {link.recorded_path}")
+            self.stats_label.setText(
+                f"The folder cannot be used: {link.detail}. Use Relink… to choose the right one."
+            )
+            self.update_buttons()
+            return
+        repository = SnapshotRepository(self.repository_path)
+        self.location_label.setText(f"Repository: {self.repository_path}")
         try:
             self.manifests = repository.list_snapshots()
             statistics = repository.statistics()
@@ -3862,20 +4043,21 @@ class SnapshotHistoryDialog(QDialog):
         self.update_buttons()
 
     def update_buttons(self) -> None:
-        has_repository = self.repository_path is not None and SnapshotRepository(self.repository_path).exists()
+        link = self.link
+        has_repository = link is not None and link.linked
         manifest = self.selected_manifest()
-        self.create_button.setEnabled(self.repository_path is not None)
+        self.create_button.setEnabled(link is not None)
         self.restore_button.setEnabled(manifest is not None)
         self.restore_volume_button.setEnabled(manifest is not None and self.selected_volume() is not None)
         self.delete_button.setEnabled(manifest is not None)
         self.prune_button.setEnabled(has_repository)
         self.verify_button.setEnabled(has_repository)
-        self.change_location_button.setEnabled(self.repository_path is not None)
+        self.relink_button.setEnabled(link is not None and not link.linked)
 
     # -- actions --------------------------------------------------------
 
-    def change_location(self) -> None:
-        self.window_ref.choose_repository_location()
+    def relink(self) -> None:
+        self.window_ref.relink_repository()
         self.refresh()
 
     def create_snapshot(self) -> None:
@@ -6542,11 +6724,16 @@ class MainWindow(QMainWindow):
                     pass
             rows.append(("Volume files size", format_size(volume_bytes)))
             rows.append(("Index size (rebuildable)", format_size(index_size)))
-            repository = repository_path_for_catalogue(
-                self.catalogue_path, meta.get(CATALOGUE_META_REPOSITORY_KEY) or None
-            )
-            state = "exists" if SnapshotRepository(repository).exists() else "not created yet"
-            rows.append(("Snapshot repository", f"{repository} ({state})"))
+            link = resolve_repository_link(self.catalogue_path, meta)
+            if link.status == LINK_LINKED:
+                text = f"{link.path} (linked)"
+            elif link.status == LINK_UNLINKED:
+                text = f"none yet — the first snapshot creates {link.recorded_path}"
+            elif link.status == LINK_MISSING:
+                text = f"{link.recorded_path} (offline — relink it in Snapshot History)"
+            else:
+                text = f"{link.recorded_path} ({link.detail or 'wrong repository'} — relink it in Snapshot History)"
+            rows.append(("Snapshot repository", text))
             report = db.last_reconcile
             if report is not None and report.orphan_files:
                 rows.append(
@@ -6588,55 +6775,106 @@ class MainWindow(QMainWindow):
     # Snapshots (version history)
     # ------------------------------------------------------------------
 
-    def catalogue_repository_path(self) -> Path | None:
-        """The snapshot repository the open catalogue uses (stored setting or default)."""
+    def repository_link(self) -> RepositoryLink | None:
+        """Where the open catalogue's snapshot repository is, or why it is offline."""
 
         if self.db is None or self.catalogue_path is None:
             return None
-        stored: str | None = None
         try:
-            stored = self.db.catalogue_meta().get(CATALOGUE_META_REPOSITORY_KEY) or None
+            meta = self.db.catalogue_meta()
         except Exception:
-            stored = None
-        return repository_path_for_catalogue(self.catalogue_path, stored)
+            meta = {}
+        return resolve_repository_link(self.catalogue_path, meta)
 
-    def choose_repository_location(self) -> Path | None:
+    def catalogue_repository_path(self) -> Path | None:
+        """The linked repository, or None while it is offline or does not exist yet."""
+
+        link = self.repository_link()
+        return link.path if link is not None else None
+
+    def record_repository_link(self, repository_path: Path) -> bool:
+        """Remember *repository_path* (and its id) as this catalogue's repository."""
+
+        if self.db is None or self.catalogue_path is None:
+            return False
+        try:
+            settings = repository_link_settings(self.catalogue_path, repository_path)
+            current = self.db.catalogue_meta()
+            for key, value in settings.items():
+                if current.get(key) != value:
+                    self.db.set_catalogue_meta(key, value)
+        except Exception as exc:
+            QMessageBox.critical(self, "Repository Link Failed", str(exc))
+            return False
+        return True
+
+    def relink_repository(self) -> Path | None:
+        """Point the catalogue at its repository after it moved (like relinking media)."""
+
         if self.db is None or self.catalogue_path is None:
             return None
-        current = self.catalogue_repository_path()
-        dialog = QFileDialog(self, "Snapshot Repository Location")
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
-        dialog.setNameFilter(REPOSITORY_FILE_FILTER)
-        dialog.setDefaultSuffix(REPOSITORY_EXTENSION.lstrip("."))
-        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
-        dialog.setDirectory(str(current.parent if current is not None else Path.home()))
-        if current is not None:
-            dialog.selectFile(current.name)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        link = self.repository_link()
+        if link is None:
             return None
-        selected = dialog.selectedFiles()
-        if not selected:
+        try:
+            catalogue_uuid = self.db.catalogue_uuid()
+        except Exception:
+            catalogue_uuid = ""
+        candidates = locate_repository_candidates(
+            self.catalogue_path,
+            repository_uuid=link.repository_uuid,
+            catalogue_uuid=catalogue_uuid,
+        )
+        chosen = RelinkRepositoryDialog.choose(self, link, candidates, catalogue_uuid=catalogue_uuid)
+        if chosen is None:
             return None
-        path = repository_path_with_extension(selected[0])
-        if path.exists() and not SnapshotRepository(path).exists():
-            if not path.is_dir() or any(path.iterdir()):
+        if not self.record_repository_link(chosen):
+            return None
+        self.statusBar().showMessage("Snapshot repository relinked.", 4000)
+        self.refresh_snapshot_history_dialog()
+        return chosen
+
+    def ensure_repository_for_snapshot(self) -> Path | None:
+        """Resolve where a new snapshot goes; offer Relink when the repository is offline."""
+
+        link = self.repository_link()
+        if link is None:
+            return None
+        if link.linked:
+            return link.path
+        if link.status == LINK_UNLINKED:
+            return link.recorded_path
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Snapshot Repository Offline")
+        reason = (
+            f"Nothing is at its last known location:\n{link.recorded_path}"
+            if link.status == LINK_MISSING
+            else f"The folder at {link.recorded_path} cannot be used: {link.detail}."
+        )
+        box.setText(
+            f"The catalogue's snapshot repository is offline.\n\n{reason}\n\n"
+            "If you moved or renamed it, relink it. Creating a new repository starts the "
+            "version history from scratch; the old one is left where it is."
+        )
+        relink = box.addButton("Relink…", QMessageBox.ButtonRole.AcceptRole)
+        create = box.addButton("Create New Repository", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is relink:
+            return self.relink_repository()
+        if clicked is create:
+            if link.status == LINK_WRONG:
                 QMessageBox.warning(
                     self,
-                    "Not a Snapshot Repository",
-                    f"{path} exists and is not an empty folder or a JVVV snapshot repository.",
+                    "Location In Use",
+                    f"{link.recorded_path} is occupied by another repository. Move it away "
+                    "first, or relink to the correct one.",
                 )
                 return None
-        try:
-            self.db.set_catalogue_meta(
-                CATALOGUE_META_REPOSITORY_KEY,
-                repository_setting_value(self.catalogue_path, path),
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Repository Location Failed", str(exc))
-            return None
-        self.refresh_snapshot_history_dialog()
-        return path
+            return link.recorded_path
+        return None
 
     def create_snapshot_from_menu(self) -> None:
         if self.db is None or self.catalogue_path is None:
@@ -6644,7 +6882,7 @@ class MainWindow(QMainWindow):
         if self._catalogue_job_running() or self._catalogue_open_in_progress():
             self._show_catalogue_job_running_message()
             return
-        repository = self.catalogue_repository_path()
+        repository = self.ensure_repository_for_snapshot()
         if repository is None:
             return
         label, accepted = QInputDialog.getText(
@@ -6911,6 +7149,8 @@ class MainWindow(QMainWindow):
 
     def on_snapshot_finished(self, result: SnapshotResult) -> None:
         self.scan_progress.setFormat("Snapshot created")
+        # The first snapshot (or one into a freshly created repository) links it.
+        self.record_repository_link(result.repository_path)
         manifest = result.manifest
         changed = result.volumes_written
         corrected = ""

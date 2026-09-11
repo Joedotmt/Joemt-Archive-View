@@ -299,3 +299,102 @@ def test_open_rejects_folders_that_are_not_repositories(tmp_path):
     created = SnapshotRepository.create(tmp_path / "fresh.jvvvrepo")
     assert created.exists() and created.snapshot_ids() == []
     assert SnapshotRepository.open_or_create(tmp_path / "fresh.jvvvrepo").path == created.path
+
+
+def test_repository_link_follows_the_repository_when_it_moves(tmp_path):
+    import shutil
+    from jvvv.snapshot_repository import (
+        LINK_LINKED,
+        LINK_MISSING,
+        LINK_UNLINKED,
+        LINK_WRONG,
+        inspect_relink_target,
+        locate_repository_candidates,
+        repository_link_settings,
+        resolve_repository_link,
+    )
+
+    # Nested one level so the nearby search (parent and grandparent) stays inside
+    # this test's temporary directory.
+    work = tmp_path / "work"
+    catalogue, first, second = build_catalogue(work, files_a=3, files_b=1)
+    db = open_catalogue(catalogue)
+    try:
+        meta = db.catalogue_meta()
+        # Nothing yet: the first snapshot would create the default sibling.
+        link = resolve_repository_link(catalogue, meta)
+        assert link.status == LINK_UNLINKED
+        assert link.recorded_path == work / "Archive.jvvvrepo"
+
+        repository = SnapshotRepository.create(link.recorded_path)
+        repository.create_snapshot(catalogue, label="one")
+        for key, value in repository_link_settings(catalogue, repository.path).items():
+            db.set_catalogue_meta(key, value)
+        meta = db.catalogue_meta()
+        link = resolve_repository_link(catalogue, meta)
+        assert link.status == LINK_LINKED and link.path == repository.path
+        assert link.repository_uuid == repository.meta()["repository_uuid"]
+
+        # Move the repository: the catalogue reports it offline at the last known location.
+        moved = work / "Backups" / "Archive moved.jvvvrepo"
+        moved.parent.mkdir()
+        shutil.move(str(repository.path), str(moved))
+        link = resolve_repository_link(catalogue, meta)
+        assert link.status == LINK_MISSING
+        assert link.recorded_path == work / "Archive.jvvvrepo"
+
+        # A repository of another catalogue nearby is never offered or accepted.
+        other = create_catalogue(work / "Other")
+        other.create_volume("Other drive", str(tmp_path), {"drive_id": "AID-001"})
+        other.close()
+        other_repository = SnapshotRepository.create(work / "Other.jvvvrepo")
+        other_repository.create_snapshot(work / "Other.jvvv")
+        candidates = locate_repository_candidates(
+            catalogue,
+            repository_uuid=link.repository_uuid,
+            catalogue_uuid=meta["catalogue_uuid"],
+        )
+        assert [candidate.path for candidate in candidates] == [moved]
+        assert candidates[0].same_repository and candidates[0].snapshot_count == 1
+        with pytest.raises(SnapshotError, match="different catalogue"):
+            inspect_relink_target(
+                other_repository.path,
+                repository_uuid=link.repository_uuid,
+                catalogue_uuid=meta["catalogue_uuid"],
+            )
+        with pytest.raises(InvalidRepositoryError):
+            inspect_relink_target(work, repository_uuid="", catalogue_uuid=meta["catalogue_uuid"])
+
+        # Relink: the settings now point at the moved folder and it is linked again.
+        for key, value in repository_link_settings(catalogue, moved).items():
+            db.set_catalogue_meta(key, value)
+        link = resolve_repository_link(catalogue, db.catalogue_meta())
+        assert link.status == LINK_LINKED and link.path == moved.resolve()
+
+        # Another catalogue's repository dropped onto the recorded path is reported as wrong.
+        shutil.move(str(other_repository.path), str(moved.parent / "x.jvvvrepo"))
+        shutil.move(str(moved), str(work / "Archive.jvvvrepo"))
+        shutil.move(str(moved.parent / "x.jvvvrepo"), str(moved))
+        link = resolve_repository_link(catalogue, db.catalogue_meta())
+        assert link.status == LINK_WRONG
+        assert "different catalogue" in link.detail
+    finally:
+        db.close()
+
+
+def test_restored_catalogue_is_linked_to_the_repository_it_came_from(tmp_path):
+    from jvvv.snapshot_repository import LINK_LINKED, resolve_repository_link
+
+    catalogue, *_ = build_catalogue(tmp_path, files_a=2, files_b=1)
+    repository = SnapshotRepository.create(tmp_path / "Backups" / "Archive.jvvvrepo")
+    snapshot = repository.create_snapshot(catalogue)
+    result = repository.restore_snapshot(snapshot.manifest.snapshot_id, tmp_path / "Elsewhere" / "Restored")
+
+    restored = open_catalogue(result.catalogue_path)
+    try:
+        link = resolve_repository_link(result.catalogue_path, restored.catalogue_meta())
+        assert link.status == LINK_LINKED
+        assert link.path == repository.path.resolve()
+        assert link.repository_uuid == repository.meta()["repository_uuid"]
+    finally:
+        restored.close()

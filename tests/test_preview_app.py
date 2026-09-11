@@ -2244,10 +2244,12 @@ def test_snapshot_finished_message_states_the_preview_backup_policy(monkeypatch,
     progress = FakeProgress()
     status_bar = FakeStatusBar()
     refreshed = []
+    linked = []
     window = SimpleNamespace(
         scan_progress=progress,
         statusBar=lambda: status_bar,
         refresh_snapshot_history_dialog=lambda: refreshed.append(True),
+        record_repository_link=lambda path: linked.append(path) or True,
     )
     manifest = SnapshotManifest(
         snapshot_id="20260911T120000Z-abcd1234",
@@ -2283,6 +2285,7 @@ def test_snapshot_finished_message_states_the_preview_backup_policy(monkeypatch,
     assert progress.format() == "Snapshot created"
     assert status_bar.messages == [("Snapshot created.", 5000)]
     assert refreshed == [True]
+    assert linked == [tmp_path / "archive.jvvvrepo"]
 
 
 # ---------------------------------------------------------------------------

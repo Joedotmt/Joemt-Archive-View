@@ -1150,3 +1150,58 @@ def test_cancelled_catalogue_open_ignores_a_late_success():
         ("open", False),
         ("status", "Catalogue opening cancelled.", 3000),
     ]
+
+
+def test_snapshot_history_offers_relink_when_the_repository_moved(monkeypatch, tmp_path):
+    import shutil
+
+    from jvvv.app import SnapshotHistoryDialog, acquire_catalogue_lock
+    from jvvv.database import open_catalogue
+    from jvvv.snapshot_repository import SnapshotRepository, default_repository_path
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
+    application = QApplication.instance() or QApplication([])
+    catalogue_path = tmp_path / "Archive.jvvv"
+    created = create_catalogue(catalogue_path)
+    created.create_volume("Drive", str(tmp_path), {"drive_id": "AID-001"})
+    created.close()
+    repository = SnapshotRepository.create(default_repository_path(catalogue_path))
+    repository.create_snapshot(catalogue_path, label="one")
+
+    window = MainWindow()
+    try:
+        lock = acquire_catalogue_lock(catalogue_path)
+        window._open_catalogue_in_window(open_catalogue(catalogue_path, check_same_thread=False), catalogue_path, lock)
+        # The default sibling repository counts as linked and gets remembered by a snapshot.
+        assert window.repository_link().status == "linked"
+        assert window.record_repository_link(repository.path)
+        dialog = SnapshotHistoryDialog(window)
+        dialog.refresh()
+        assert dialog.snapshot_table.rowCount() == 1
+        assert not dialog.relink_button.isEnabled()
+
+        moved = tmp_path / "Moved.jvvvrepo"
+        shutil.move(str(repository.path), str(moved))
+        dialog.refresh()
+        assert window.repository_link().status == "missing"
+        assert "offline" in dialog.location_label.text()
+        assert dialog.relink_button.isEnabled()
+        assert not dialog.prune_button.isEnabled()
+        assert dialog.snapshot_table.rowCount() == 0
+
+        # Relinking through the dialog path (user picks the found candidate).
+        monkeypatch.setattr(
+            "jvvv.app.RelinkRepositoryDialog.choose",
+            classmethod(lambda cls, parent, link, candidates, catalogue_uuid: candidates[0].path),
+        )
+        assert window.relink_repository() == moved
+        dialog.refresh()
+        assert window.repository_link().status == "linked"
+        assert window.repository_link().path == moved.resolve()
+        assert dialog.snapshot_table.rowCount() == 1
+        assert not dialog.relink_button.isEnabled()
+        window.close_catalogue(show_status=False)
+    finally:
+        window.close()
+    assert application is not None

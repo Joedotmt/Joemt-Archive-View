@@ -113,7 +113,11 @@ snapshot; a volume file that is not registered is left alone and listed under
 
 Use **File > Create Snapshot…** to record the catalogue in its snapshot
 repository, a `.jvvvrepo` folder that by default sits next to the catalogue
-(**Snapshot History > Change Location…** moves it). A snapshot is a small JSON
+If you later move or rename that folder, the catalogue shows the repository as
+offline and **Snapshot History > Relink…** points it at the new location — the
+app lists matching repositories it finds nearby and refuses folders that belong
+to another catalogue. A catalogue restored from a snapshot comes out linked to
+the repository it was restored from. A snapshot is a small JSON
 manifest listing every volume with its metadata row and the digests of two
 blobs: its *content* (folders, files, media details, preview status) and its
 *scan history*. Blobs are stored once, named by the SHA-256 of their canonical

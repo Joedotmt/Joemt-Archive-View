@@ -81,6 +81,12 @@ SNAPSHOT_FORMAT = "jvvv-snapshot"
 SNAPSHOT_FORMAT_VERSION = 1
 SNAPSHOT_FILE_EXTENSION = ".json"
 CATALOGUE_META_REPOSITORY_KEY = "snapshot_repository"
+CATALOGUE_META_REPOSITORY_UUID_KEY = "snapshot_repository_uuid"
+# Link states between a catalogue and its repository (see resolve_repository_link).
+LINK_LINKED = "linked"
+LINK_MISSING = "missing"
+LINK_UNLINKED = "unlinked"
+LINK_WRONG = "wrong_repository"
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
 
 ProgressCallback = Callable[["SnapshotProgress"], None]
@@ -909,6 +915,9 @@ class SnapshotRepository:
                         "next_volume_id",
                         str(max(manifest.next_volume_id, registry_next_volume_id(registry))),
                     )
+                    # The restored catalogue knows which repository it came from.
+                    for key, value in repository_link_settings(target, self.path).items():
+                        set_registry_meta(registry, key, value)
             finally:
                 registry.close()
             _check_cancel(cancel_callback)
@@ -1057,3 +1066,175 @@ def repository_setting_value(catalogue_path: str | Path, repository_path: str | 
         return os.path.relpath(repository, catalogue.parent)
     except ValueError:
         return str(repository)
+
+
+# ----------------------------------------------------------------------
+# Repository link: where a catalogue's repository is, and relinking it
+# ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RepositoryLink:
+    """The relationship between an open catalogue and its snapshot repository.
+
+    ``status`` is one of :data:`LINK_LINKED` (usable at ``path``),
+    :data:`LINK_MISSING` (a repository was recorded but nothing is at
+    ``recorded_path``), :data:`LINK_UNLINKED` (no repository yet; the first
+    snapshot creates ``recorded_path``) or :data:`LINK_WRONG` (a folder is at
+    ``recorded_path`` but it is not this catalogue's repository; see ``detail``).
+    """
+
+    status: str
+    path: Path | None
+    recorded_path: Path
+    repository_uuid: str
+    detail: str = ""
+
+    @property
+    def linked(self) -> bool:
+        return self.status == LINK_LINKED
+
+    @property
+    def offline(self) -> bool:
+        return self.status in (LINK_MISSING, LINK_WRONG)
+
+
+@dataclass(frozen=True)
+class RelinkCandidate:
+    path: Path
+    repository_uuid: str
+    same_repository: bool
+    snapshot_count: int
+    latest_snapshot_id: str
+
+    @property
+    def match_label(self) -> str:
+        return "same repository" if self.same_repository else "same catalogue"
+
+
+def _repository_identity(path: Path) -> tuple[str, str]:
+    meta = SnapshotRepository(path).meta()
+    return str(meta.get("repository_uuid") or ""), str(meta.get("catalogue_uuid") or "")
+
+
+def resolve_repository_link(catalogue_path: str | Path, meta: dict[str, Any]) -> RepositoryLink:
+    """Work out where the catalogue's repository is from its recorded settings."""
+
+    catalogue = Path(catalogue_path).expanduser()
+    stored_path = str(meta.get(CATALOGUE_META_REPOSITORY_KEY) or "") or None
+    stored_uuid = str(meta.get(CATALOGUE_META_REPOSITORY_UUID_KEY) or "")
+    catalogue_uuid = str(meta.get("catalogue_uuid") or "")
+    recorded = repository_path_for_catalogue(catalogue, stored_path)
+    repository = SnapshotRepository(recorded)
+    if not repository.exists():
+        if stored_path is None and not stored_uuid:
+            return RepositoryLink(LINK_UNLINKED, None, recorded, "")
+        return RepositoryLink(LINK_MISSING, None, recorded, stored_uuid)
+    try:
+        found_uuid, owner = _repository_identity(recorded)
+    except InvalidRepositoryError as exc:
+        return RepositoryLink(LINK_WRONG, None, recorded, stored_uuid, str(exc))
+    if owner and catalogue_uuid and owner != catalogue_uuid:
+        return RepositoryLink(
+            LINK_WRONG,
+            None,
+            recorded,
+            stored_uuid,
+            "the folder holds snapshots of a different catalogue",
+        )
+    # A different repository for the same catalogue (a clone, or a fresh one
+    # created after the old one was lost) is a valid link.
+    return RepositoryLink(LINK_LINKED, recorded, recorded, found_uuid)
+
+
+def repository_link_settings(catalogue_path: str | Path, repository_path: str | Path) -> dict[str, str]:
+    """The registry settings that link *catalogue_path* to *repository_path*."""
+
+    repository_uuid, _ = _repository_identity(Path(repository_path))
+    return {
+        CATALOGUE_META_REPOSITORY_KEY: repository_setting_value(catalogue_path, repository_path),
+        CATALOGUE_META_REPOSITORY_UUID_KEY: repository_uuid,
+    }
+
+
+def inspect_relink_target(
+    path: str | Path,
+    *,
+    repository_uuid: str,
+    catalogue_uuid: str,
+) -> RelinkCandidate:
+    """Check that *path* may be relinked as this catalogue's repository."""
+
+    candidate = Path(path).expanduser()
+    repository = SnapshotRepository(candidate)
+    if not repository.exists():
+        raise InvalidRepositoryError(
+            f"{candidate} is not a JVVV snapshot repository (no {REPOSITORY_FILE_NAME})."
+        )
+    found_uuid, owner = _repository_identity(candidate)
+    if owner and catalogue_uuid and owner != catalogue_uuid:
+        raise SnapshotError(
+            f"{candidate.name} holds snapshots of a different catalogue and cannot be linked to this one."
+        )
+    ids = repository.snapshot_ids()
+    return RelinkCandidate(
+        path=candidate,
+        repository_uuid=found_uuid,
+        same_repository=bool(repository_uuid) and found_uuid == repository_uuid,
+        snapshot_count=len(ids),
+        latest_snapshot_id=ids[-1] if ids else "",
+    )
+
+
+def locate_repository_candidates(
+    catalogue_path: str | Path,
+    *,
+    repository_uuid: str,
+    catalogue_uuid: str,
+    extra_roots: Iterable[Path] = (),
+) -> list[RelinkCandidate]:
+    """Find repositories of this catalogue near it (folder, parent, one level down).
+
+    The same repository (by id) sorts first, then the most recently used.
+    Repositories of other catalogues are never offered.
+    """
+
+    catalogue = Path(catalogue_path).expanduser()
+    roots: list[Path] = [catalogue.parent, catalogue.parent.parent, *extra_roots]
+    seen: set[Path] = set()
+    candidates: list[RelinkCandidate] = []
+
+    def consider(folder: Path) -> None:
+        try:
+            resolved = folder.resolve(strict=False)
+        except OSError:
+            return
+        if resolved in seen or folder.suffix.lower() != REPOSITORY_EXTENSION:
+            return
+        seen.add(resolved)
+        try:
+            candidates.append(
+                inspect_relink_target(
+                    folder, repository_uuid=repository_uuid, catalogue_uuid=catalogue_uuid
+                )
+            )
+        except (SnapshotError, OSError):
+            return
+
+    for root in roots:
+        try:
+            entries = [entry for entry in root.iterdir() if entry.is_dir()]
+        except OSError:
+            continue
+        for entry in entries:
+            consider(entry)
+            if entry.suffix.lower() in (REPOSITORY_EXTENSION, ".jvvv"):
+                continue
+            try:
+                for child in entry.iterdir():
+                    if child.is_dir():
+                        consider(child)
+            except OSError:
+                continue
+    # Same repository first; within each group the most recently used first.
+    candidates.sort(key=lambda item: (item.same_repository, item.latest_snapshot_id), reverse=True)
+    return candidates
