@@ -98,7 +98,6 @@ from .database import (
     CONNECTOR_OPTIONS,
     CatalogueInUseError,
     Database,
-    LegacyCatalogueError,
     VOLUME_CONDITIONS,
     catalogue_path_with_extension,
     create_catalogue,
@@ -109,14 +108,6 @@ from .database import (
     parse_db_time,
     sqlite_file_uri,
 )
-# LEGACY: single-file catalogue conversion; remove with the jvvv.legacy package.
-from .legacy import (
-    MigrationResult,
-    inspect_legacy_catalogue,
-    is_legacy_catalogue_file,
-    migrate_legacy_catalogue,
-)
-from .legacy.single_file import MigrationCancelled
 from .snapshot_repository import (
     CATALOGUE_META_REPOSITORY_KEY,
     REPOSITORY_EXTENSION,
@@ -214,8 +205,6 @@ THEME_STYLE_SETTING = "appearance/themeStyle"
 COLOR_MODE_SETTING = "appearance/colorMode"
 ACCENT_COLOR_SETTING = "appearance/accentColor"
 CATALOGUE_FILE_FILTER = "Joemt Archive View Catalogues (*.jvvv)"
-# LEGACY: file filter for single-file catalogues offered for conversion.
-LEGACY_CATALOGUE_FILE_FILTER = "Single-file JVVV catalogues (*.jvvv)"
 REPOSITORY_FILE_FILTER = "JVVV Snapshot Repositories (*.jvvvrepo)"
 CATALOGUE_PROBE_ARGUMENT = "--catalogue-location-probe"
 CATALOGUE_PROBE_TIMEOUT_MS = 8000
@@ -365,9 +354,7 @@ def acquire_catalogue_lock(path: Path) -> QLockFile:
 def probe_catalogue_location(path: str | Path) -> int:
     """Read a catalogue without modifying it to test whether its location responds.
 
-    A catalogue is a folder; its registry (``catalogue.sqlite``) is probed.  A
-    bare file is probed as-is so a legacy single-file catalogue reports OK and
-    the open path can offer to convert it.
+    A catalogue is a folder; its registry (``catalogue.sqlite``) is probed.
     """
     catalogue_path = locate_catalogue(path)
     if catalogue_path.is_dir():
@@ -375,6 +362,9 @@ def probe_catalogue_location(path: str | Path) -> int:
         if not registry.is_file():
             return CATALOGUE_PROBE_INVALID
         catalogue_path = registry
+    elif catalogue_path.exists():
+        # A bare file is never a catalogue.
+        return CATALOGUE_PROBE_INVALID
     try:
         with catalogue_path.open("rb") as catalogue_file:
             header = catalogue_file.read(100)
@@ -4510,7 +4500,7 @@ class _RepositoryWorker(_CancellableWorker):
                 progress_callback=self._report_progress,
                 cancel_callback=lambda: self.cancel_requested,
             )
-        except (SnapshotCancelled, MigrationCancelled):
+        except SnapshotCancelled:
             self.cancel_requested = True
         except Exception as exc:
             error = exc
@@ -4608,18 +4598,6 @@ def repository_verify_worker(repository_path: Path) -> _RepositoryWorker:
         )
 
     return _RepositoryWorker(operation, description="verify")
-
-
-# LEGACY: conversion worker for single-file catalogues.
-def legacy_migration_worker(source_path: Path) -> _RepositoryWorker:
-    def operation(*, progress_callback, cancel_callback) -> MigrationResult:
-        return migrate_legacy_catalogue(
-            source_path,
-            progress_callback=progress_callback,
-            cancel_callback=cancel_callback,
-        )
-
-    return _RepositoryWorker(operation, description="conversion")
 
 
 @dataclass(frozen=True)
@@ -5183,20 +5161,6 @@ class MainWindow(QMainWindow):
 
         self.file_menu.addSeparator()
 
-        # LEGACY: remove together with the jvvv.legacy package.
-        self.convert_legacy_catalogue_action = QAction(
-            "Convert Legacy Catalogue File\u2026",
-            self,
-        )
-        self.convert_legacy_catalogue_action.setToolTip(
-            "Convert a single-file .jvvv catalogue from an earlier JVVV into a catalogue folder"
-        )
-        self.convert_legacy_catalogue_action.triggered.connect(
-            self.convert_legacy_catalogue_from_dialog
-        )
-        self.file_menu.addAction(self.convert_legacy_catalogue_action)
-
-        self.file_menu.addSeparator()
 
         self.open_catalogue_location_action = QAction("Open Catalogue Location", self)
         self.open_catalogue_location_action.triggered.connect(self.open_catalogue_location)
@@ -6026,7 +5990,6 @@ class MainWindow(QMainWindow):
             self.create_snapshot_action,
             self.snapshot_history_action,
             self.restore_snapshot_action,
-            self.convert_legacy_catalogue_action,
         ]
         self.scan_blocked_widgets = []
 
@@ -6945,8 +6908,6 @@ class MainWindow(QMainWindow):
             self.on_prune_finished(result)
         elif operation == "verify":
             self.on_verify_finished(result)
-        elif operation == "conversion":
-            self.on_legacy_migration_finished(result)
 
     def on_snapshot_finished(self, result: SnapshotResult) -> None:
         self.scan_progress.setFormat("Snapshot created")
@@ -7095,7 +7056,6 @@ class MainWindow(QMainWindow):
         self.new_catalogue_action.setEnabled(enabled)
         self.open_catalogue_action.setEnabled(enabled)
         self.restore_snapshot_action.setEnabled(enabled)
-        self.convert_legacy_catalogue_action.setEnabled(enabled)
         self.welcome_new_button.setEnabled(enabled)
         self.welcome_open_button.setEnabled(enabled)
         if running:
@@ -7105,7 +7065,6 @@ class MainWindow(QMainWindow):
                 "volume restore": "Restoring volume from snapshot…",
                 "prune": "Pruning snapshot repository…",
                 "verify": "Verifying snapshot repository…",
-                "conversion": "Converting legacy catalogue…",
             }
             label = labels.get(self.repository_operation, "Working…")
             self.scan_progress.setRange(0, 0)
@@ -7119,72 +7078,6 @@ class MainWindow(QMainWindow):
                 self.stack.setCurrentWidget(self.loading_page)
         elif self.db is None and not self._catalogue_open_in_progress():
             self._set_catalogue_open(False)
-
-    # ------------------------------------------------------------------
-    # LEGACY: single-file catalogue conversion.  Remove with jvvv.legacy.
-    # ------------------------------------------------------------------
-
-    def convert_legacy_catalogue_from_dialog(self) -> None:
-        if self._catalogue_job_running() or self._catalogue_open_in_progress():
-            self._show_catalogue_job_running_message()
-            return
-        path_text, _ = QFileDialog.getOpenFileName(
-            self,
-            "Convert Legacy Catalogue File",
-            str(self.catalogue_path.parent if self.catalogue_path else Path.home()),
-            LEGACY_CATALOGUE_FILE_FILTER,
-        )
-        if not path_text:
-            return
-        path = Path(path_text).expanduser()
-        if not is_legacy_catalogue_file(path):
-            QMessageBox.warning(
-                self,
-                "Not a Legacy Catalogue",
-                f"{path} is not a single-file JVVV catalogue.",
-            )
-            return
-        self.offer_legacy_conversion(path)
-
-    def offer_legacy_conversion(self, path: Path) -> None:
-        try:
-            info = inspect_legacy_catalogue(path)
-        except Exception as exc:
-            self._show_catalogue_error("Open Catalogue Failed", exc)
-            return
-        answer = QMessageBox.question(
-            self,
-            "Convert Catalogue",
-            f"{path.name} is a single-file catalogue from an earlier JVVV version "
-            f"({info.volume_count} volumes, {info.file_count:,} files, "
-            f"{format_size(info.size_bytes)}).\n\n"
-            "Convert it to the current catalogue folder format? The folder takes the "
-            f"same name; the original file is kept as {path.name}.legacy until you delete it.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        if self.db is not None and not self.close_catalogue(show_status=False):
-            return
-        self._start_repository_worker(legacy_migration_worker(path), "conversion")
-
-    def on_legacy_migration_finished(self, result: MigrationResult) -> None:
-        self.scan_progress.setFormat("Catalogue converted")
-        QMessageBox.information(
-            self,
-            "Catalogue Converted",
-            f"{result.catalogue_path.name} is now a catalogue folder.\n\n"
-            f"Volumes: {result.volume_count}, files: {result.file_count:,}, "
-            f"folders: {result.folder_count:,}\n"
-            f"Volume files: {format_size(result.volume_files_bytes)}; "
-            f"index: {format_size(result.index_bytes)}\n"
-            f"Time: {result.seconds:.1f} s\n\n"
-            f"The original file was kept as {result.legacy_path.name}. Once you have checked "
-            "the converted catalogue and taken a snapshot, delete it.",
-        )
-        self.pending_restored_catalogue_path = result.catalogue_path
-        self.pending_restored_status_message = "Converted catalogue opened."
-        self.statusBar().showMessage("Catalogue converted.", 5000)
 
     def new_catalogue(self) -> None:
         if self._catalogue_open_in_progress() or self.repository_worker is not None:
@@ -7241,10 +7134,6 @@ class MainWindow(QMainWindow):
         if self._catalogue_open_in_progress() or self.repository_worker is not None:
             return
         path = locate_catalogue(path)
-        # LEGACY: a single-file catalogue is offered for conversion instead of opened.
-        if path.is_file() and is_legacy_catalogue_file(path):
-            self.offer_legacy_conversion(path)
-            return
         if self.db is not None and not self.close_catalogue(show_status=False):
             return
 
@@ -7433,10 +7322,6 @@ class MainWindow(QMainWindow):
         self.catalogue_open_path = None
         self._set_catalogue_loading(False)
         self._set_catalogue_open(False)
-        # LEGACY: offer conversion instead of an error for single-file catalogues.
-        if isinstance(exc, LegacyCatalogueError):
-            self.offer_legacy_conversion(exc.legacy_path)
-            return
         self._show_catalogue_error("Open Catalogue Failed", exc)
 
     @Slot()
@@ -7468,7 +7353,6 @@ class MainWindow(QMainWindow):
         self.new_catalogue_action.setEnabled(enabled)
         self.open_catalogue_action.setEnabled(enabled)
         self.restore_snapshot_action.setEnabled(enabled)
-        self.convert_legacy_catalogue_action.setEnabled(enabled)
         self.welcome_new_button.setEnabled(enabled)
         self.welcome_open_button.setEnabled(enabled)
         self.catalogue_loading_cancel_button.setEnabled(
@@ -7827,7 +7711,6 @@ class MainWindow(QMainWindow):
                 and getattr(self, "repository_worker", None) is None
             )
             self.restore_snapshot_action.setEnabled(standalone_enabled)
-            self.convert_legacy_catalogue_action.setEnabled(standalone_enabled)
 
         if hasattr(self, "volume_table"):
             self.volume_table.setEnabled(enabled)

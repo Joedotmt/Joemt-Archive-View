@@ -54,13 +54,11 @@ def test_file_menu_exposes_snapshots_and_restore_with_correct_availability(monke
         assert "Create Snapshot…" in action_texts
         assert "Snapshot History…" in action_texts
         assert "Restore Catalogue from Snapshot…" in action_texts
-        assert "Convert Legacy Catalogue File…" in action_texts
         assert "Create Catalogue Backup…" not in action_texts
         # Without an open catalogue only the standalone actions are available.
         assert not window.create_snapshot_action.isEnabled()
         assert not window.snapshot_history_action.isEnabled()
         assert window.restore_snapshot_action.isEnabled()
-        assert window.convert_legacy_catalogue_action.isEnabled()
         assert window.create_snapshot_action in window.catalogue_actions
         assert window.snapshot_history_action in window.catalogue_actions
         assert window.restore_snapshot_action not in window.catalogue_actions
@@ -68,7 +66,6 @@ def test_file_menu_exposes_snapshots_and_restore_with_correct_availability(monke
         assert window.restore_snapshot_action in window.scan_blocked_actions
         window._set_catalogue_loading(True)
         assert not window.restore_snapshot_action.isEnabled()
-        assert not window.convert_legacy_catalogue_action.isEnabled()
         window._set_catalogue_loading(False)
         assert window.restore_snapshot_action.isEnabled()
     finally:
@@ -955,13 +952,13 @@ def test_catalogue_location_probe_is_read_only_and_detects_unavailable_paths(tmp
     empty_folder.mkdir()
     assert probe_catalogue_location(empty_folder) == CATALOGUE_PROBE_INVALID
 
-    # LEGACY: a single-file catalogue probes OK so the open path can offer conversion.
-    legacy_path = tmp_path / "legacy.jvvv"
-    connection = sqlite3.connect(legacy_path)
+    # A bare SQLite file is not a catalogue folder.
+    file_path = tmp_path / "single-file.jvvv"
+    connection = sqlite3.connect(file_path)
     connection.execute("CREATE TABLE marker (value TEXT)")
     connection.commit()
     connection.close()
-    assert probe_catalogue_location(legacy_path) == CATALOGUE_PROBE_OK
+    assert probe_catalogue_location(file_path) == CATALOGUE_PROBE_INVALID
 
 
 def test_cancel_catalogue_open_kills_an_unresponsive_location_probe():

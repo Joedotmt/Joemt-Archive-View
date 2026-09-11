@@ -9,7 +9,6 @@ from jvvv import database as database_module
 from jvvv.database import (
     Database,
     InvalidCatalogueError,
-    LegacyCatalogueError,
     SCHEMA_VERSION,
     UnsupportedCatalogueError,
     count_rows,
@@ -819,7 +818,7 @@ def test_future_catalogue_version_is_rejected_without_modification(tmp_path):
     assert index_path.read_bytes() == original_bytes
 
 
-def test_single_file_catalogue_is_reported_as_legacy_without_modification(tmp_path):
+def test_a_bare_sqlite_file_is_rejected_without_modification(tmp_path):
     path = tmp_path / "old-style.jvvv"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
@@ -828,12 +827,11 @@ def test_single_file_catalogue_is_reported_as_legacy_without_modification(tmp_pa
     connection.close()
     original_bytes = path.read_bytes()
 
-    with pytest.raises(LegacyCatalogueError) as error_info:
+    with pytest.raises(InvalidCatalogueError, match="not a catalogue folder"):
         open_catalogue(path)
 
-    assert error_info.value.legacy_path == path
-    assert isinstance(error_info.value, UnsupportedCatalogueError)
     assert path.read_bytes() == original_bytes
+
 
 
 def test_upsert_file_accepts_unsigned_64_bit_identity_values(tmp_path):

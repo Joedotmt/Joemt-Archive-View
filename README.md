@@ -148,20 +148,6 @@ recorded in the catalogue is included, but the preview directory itself may be
 many terabytes; to back up previews, copy the configured preview directory
 separately with your normal file-copy or backup software.
 
-### Converting a single-file catalogue from an earlier JVVV
-
-Earlier JVVV versions stored the whole catalogue in one `.jvvv` SQLite file.
-Opening such a file (or choosing **File > Convert Legacy Catalogue File…**)
-offers to convert it: the file is checkpointed and copied page-for-page into the
-new folder's `index.sqlite` (so every row, id, search structure and Backup
-Evidence result survives), the registry and one volume file per drive are
-written, each volume file is verified against the index, and only then is the
-original renamed to `Name.jvvv.legacy` and the folder moved into place. Nothing
-is deleted; remove the `.legacy` file yourself once you have opened the
-converted catalogue and taken a first snapshot. Only schema version 12 (the
-last single-file version) is converted; older files must be opened once with the
-previous release first.
-
 ## Usage
 
 1. Choose **File > New Catalogue** and save a `.jvvv` file.
@@ -366,8 +352,7 @@ The automated tests cover database initialization and current-schema validation,
 the catalogue folder format (truth-first writes, revision tracking, index
 rebuild, crash recovery of interrupted deletions, external volume-file changes,
 canonical serialisation), the snapshot repository (deduplication, deltas,
-full and single-volume restore, prune, verify, cancellation), the conversion
-of single-file schema-12 catalogues, volume operations, streaming hashes,
+full and single-volume restore, prune, verify, cancellation), volume operations, streaming hashes,
 media inspection, scan cancellation/change review and rollback, hash-first backup
 evidence, offline browsing,
 search, and the offline preview system (profile IDs, preview-root validation,

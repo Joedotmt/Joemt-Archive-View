@@ -25,7 +25,6 @@ from .catalogue_format import (
     new_uuid,
     open_registry_db,
     read_registry,
-    read_sqlite_header,
     read_volume_meta_from_path,
     register_volume,
     registry_meta,
@@ -466,19 +465,6 @@ class UnsupportedCatalogueError(CatalogueError):
     pass
 
 
-# LEGACY: raised when *path* is a single-file catalogue written by a JVVV build
-# before the directory format.  jvvv.legacy converts such files; once every
-# catalogue has been converted this class and the check in Database.__init__
-# can be removed together with the jvvv.legacy package.
-class LegacyCatalogueError(UnsupportedCatalogueError):
-    def __init__(self, path: Path) -> None:
-        super().__init__(
-            "This is a single-file catalogue from an earlier JVVV version. "
-            "Convert it to the current catalogue folder format before opening it."
-        )
-        self.legacy_path = Path(path)
-
-
 FolderStatsProgress = Callable[[int, int, str], None]
 ReconcileProgress = Callable[[int, int, str], None]
 
@@ -622,10 +608,7 @@ class Database:
             raise ValueError("A read-only database connection cannot create a catalogue.")
         requested = Path(path).expanduser()
         self._operation = "preparing the catalogue path"
-        # LEGACY: a bare SQLite file is a single-file catalogue from an older build.
         if requested.is_file() and requested.name not in {CATALOGUE_DB_NAME, INDEX_DB_NAME}:
-            if read_sqlite_header(requested) is not None:
-                raise LegacyCatalogueError(requested)
             raise InvalidCatalogueError(
                 f"The selected path is a file, not a catalogue folder: {requested}"
             )
