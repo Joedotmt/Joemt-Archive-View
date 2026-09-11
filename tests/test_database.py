@@ -9,8 +9,8 @@ from jvvv import database as database_module
 from jvvv.database import (
     Database,
     InvalidCatalogueError,
+    LegacyCatalogueError,
     SCHEMA_VERSION,
-    UPGRADABLE_SCHEMA_VERSIONS,
     UnsupportedCatalogueError,
     count_rows,
     create_catalogue,
@@ -56,7 +56,8 @@ def test_database_initializes_schema(tmp_path):
             "backup_volume_results",
             "backup_mirror_candidates",
         } <= tables
-        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert db.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert {"index_state", "index_meta"} <= tables
         assert "file_preview_status" in tables
         assert {"files_fts", "folders_fts"} <= tables
         folder_indexes = {
@@ -241,12 +242,13 @@ def test_network_storage_recognizes_mapped_windows_drive(monkeypatch):
 def test_network_catalogue_preserves_existing_rollback_journal(monkeypatch, tmp_path):
     path = tmp_path / "network-catalogue.jvvv"
     created = Database(path)
+    index_path = created.index_path
     created.close()
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(index_path)
     connection.execute("PRAGMA journal_mode = DELETE").fetchone()
     connection.commit()
     connection.close()
-    assert Database._database_header_journal_mode(path) == "Rollback"
+    assert Database._database_header_journal_mode(index_path) == "Rollback"
 
     monkeypatch.setattr(
         Database,
@@ -266,12 +268,12 @@ def test_network_catalogue_preserves_existing_rollback_journal(monkeypatch, tmp_
 
 def test_network_catalogue_rejects_wal_before_sqlite_access(monkeypatch, tmp_path):
     path = tmp_path / "wal-catalogue.jvvv"
-    connection = sqlite3.connect(path)
-    connection.execute("PRAGMA journal_mode = WAL").fetchone()
-    connection.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
-    connection.commit()
-    connection.close()
-    assert Database._database_header_journal_mode(path) == "WAL"
+    created = Database(path)
+    index_path = created.index_path
+    created.close()
+    # A local catalogue's index is left in WAL mode; moved to a network share it
+    # must be refused before any SQLite access.
+    assert Database._database_header_journal_mode(index_path) == "WAL"
     monkeypatch.setattr(
         Database,
         "_uses_network_storage",
@@ -285,8 +287,9 @@ def test_network_catalogue_rejects_wal_before_sqlite_access(monkeypatch, tmp_pat
 def test_network_catalogue_open_skips_full_integrity_scan(monkeypatch, tmp_path):
     path = tmp_path / "network-catalogue.jvvv"
     db = Database(path)
+    index_path = db.index_path
     db.close()
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(index_path)
     connection.execute("PRAGMA journal_mode = DELETE").fetchone()
     connection.close()
 
@@ -356,7 +359,12 @@ def test_sqlite_failure_reports_connection_stage_and_error_code(monkeypatch, tmp
             self.closed = True
 
     path = tmp_path / "network-catalogue.jvvv"
-    path.touch()
+    created = Database(path)
+    index_path = created.index_path
+    created.close()
+    rollback = sqlite3.connect(index_path)
+    rollback.execute("PRAGMA journal_mode = DELETE").fetchone()
+    rollback.close()
     connection = FailingConnection()
     monkeypatch.setattr(
         Database,
@@ -371,7 +379,7 @@ def test_sqlite_failure_reports_connection_stage_and_error_code(monkeypatch, tmp
     details = error_info.value.diagnostic_details
     assert "Operation: setting SQLite synchronous mode to NORMAL" in details
     assert "Network storage detected: Yes" in details
-    assert "Journal mode in file header: Unknown" in details
+    assert "Journal mode in file header: Rollback" in details
     assert "Requested journal mode: Preserve rollback mode" in details
     assert "SQLite error name: SQLITE_IOERR_IN_PAGE" in details
     assert "SQLite error code: 8714" in details
@@ -762,22 +770,22 @@ def test_mirror_relationships_are_validated_and_block_master_deletion(tmp_path):
         db.close()
 
 
-@pytest.mark.parametrize(
-    "schema_version", sorted(set(range(1, SCHEMA_VERSION)) - UPGRADABLE_SCHEMA_VERSIONS)
-)
+@pytest.mark.parametrize("schema_version", list(range(1, SCHEMA_VERSION)))
 def test_retired_catalogue_versions_are_rejected_without_modification(
     tmp_path,
     schema_version,
 ):
     path = tmp_path / f"catalogue-v{schema_version}.jvvv"
-    connection = sqlite3.connect(path)
-    connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
-    connection.execute("INSERT INTO marker VALUES ('unchanged')")
+    created = Database(path)
+    index_path = created.index_path
+    created.close()
+    connection = sqlite3.connect(index_path)
+    connection.execute("PRAGMA journal_mode = DELETE").fetchone()
     connection.execute(f"PRAGMA user_version = {schema_version}")
     connection.commit()
     connection.close()
-    original_bytes = path.read_bytes()
-    original_journal_mode = Database._database_header_journal_mode(path)
+    original_bytes = index_path.read_bytes()
+    original_journal_mode = Database._database_header_journal_mode(index_path)
 
     with pytest.raises(
         UnsupportedCatalogueError,
@@ -785,19 +793,22 @@ def test_retired_catalogue_versions_are_rejected_without_modification(
     ):
         open_catalogue(path)
 
-    assert path.read_bytes() == original_bytes
-    assert Database._database_header_journal_mode(path) == original_journal_mode
+    assert index_path.read_bytes() == original_bytes
+    assert Database._database_header_journal_mode(index_path) == original_journal_mode
 
 
 def test_future_catalogue_version_is_rejected_without_modification(tmp_path):
     schema_version = SCHEMA_VERSION + 1
     path = tmp_path / "future-catalogue.jvvv"
-    connection = sqlite3.connect(path)
-    connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    created = Database(path)
+    index_path = created.index_path
+    created.close()
+    connection = sqlite3.connect(index_path)
+    connection.execute("PRAGMA journal_mode = DELETE").fetchone()
     connection.execute(f"PRAGMA user_version = {schema_version}")
     connection.commit()
     connection.close()
-    original_bytes = path.read_bytes()
+    original_bytes = index_path.read_bytes()
 
     with pytest.raises(
         UnsupportedCatalogueError,
@@ -805,6 +816,23 @@ def test_future_catalogue_version_is_rejected_without_modification(tmp_path):
     ):
         open_catalogue(path)
 
+    assert index_path.read_bytes() == original_bytes
+
+
+def test_single_file_catalogue_is_reported_as_legacy_without_modification(tmp_path):
+    path = tmp_path / "old-style.jvvv"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    connection.execute("PRAGMA user_version = 12")
+    connection.commit()
+    connection.close()
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(LegacyCatalogueError) as error_info:
+        open_catalogue(path)
+
+    assert error_info.value.legacy_path == path
+    assert isinstance(error_info.value, UnsupportedCatalogueError)
     assert path.read_bytes() == original_bytes
 
 

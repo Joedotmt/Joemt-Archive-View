@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,8 +9,6 @@ from PySide6.QtWidgets import QApplication, QDialog
 from jvvv.app import (
     ACCENT_COLOR_SETTING,
     CatalogueInfoWorker,
-    CatalogueBackupWorker,
-    CatalogueRestoreWorker,
     CatalogueOpenWorker,
     CATALOGUE_PROBE_INVALID,
     CATALOGUE_PROBE_OK,
@@ -25,10 +24,12 @@ from jvvv.app import (
     format_exception_diagnostics,
     include_content_timestamp,
     probe_catalogue_location,
+    snapshot_restore_worker,
+    snapshot_worker,
     suggested_new_volume_drive_id,
 )
-from jvvv.catalogue_backup import BackupProgress, BackupResult, RestoreResult
 from jvvv.database import CatalogueError, create_catalogue
+from jvvv.snapshot_repository import SnapshotProgress
 from jvvv.theme import (
     ADOBE_ACCENT_COLOR,
     ADOBE_THEME,
@@ -42,7 +43,7 @@ from jvvv.theme import (
 from jvvv.utils import VolumeSnapshot
 
 
-def test_file_menu_exposes_backup_and_restore_with_correct_availability(monkeypatch):
+def test_file_menu_exposes_snapshots_and_restore_with_correct_availability(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
     application = QApplication.instance() or QApplication([])
@@ -50,18 +51,26 @@ def test_file_menu_exposes_backup_and_restore_with_correct_availability(monkeypa
     try:
         file_menu = window.menuBar().actions()[0].menu()
         action_texts = [action.text() for action in file_menu.actions()]
-        assert "Create Catalogue Backup…" in action_texts
-        assert "Restore Catalogue from Backup…" in action_texts
-        assert not window.create_catalogue_backup_action.isEnabled()
-        assert window.restore_catalogue_backup_action.isEnabled()
-        assert window.create_catalogue_backup_action in window.catalogue_actions
-        assert window.create_catalogue_backup_action in window.scan_blocked_actions
-        assert window.restore_catalogue_backup_action not in window.catalogue_actions
-        assert window.restore_catalogue_backup_action in window.scan_blocked_actions
+        assert "Create Snapshot…" in action_texts
+        assert "Snapshot History…" in action_texts
+        assert "Restore Catalogue from Snapshot…" in action_texts
+        assert "Convert Legacy Catalogue File…" in action_texts
+        assert "Create Catalogue Backup…" not in action_texts
+        # Without an open catalogue only the standalone actions are available.
+        assert not window.create_snapshot_action.isEnabled()
+        assert not window.snapshot_history_action.isEnabled()
+        assert window.restore_snapshot_action.isEnabled()
+        assert window.convert_legacy_catalogue_action.isEnabled()
+        assert window.create_snapshot_action in window.catalogue_actions
+        assert window.snapshot_history_action in window.catalogue_actions
+        assert window.restore_snapshot_action not in window.catalogue_actions
+        assert window.create_snapshot_action in window.scan_blocked_actions
+        assert window.restore_snapshot_action in window.scan_blocked_actions
         window._set_catalogue_loading(True)
-        assert not window.restore_catalogue_backup_action.isEnabled()
+        assert not window.restore_snapshot_action.isEnabled()
+        assert not window.convert_legacy_catalogue_action.isEnabled()
         window._set_catalogue_loading(False)
-        assert window.restore_catalogue_backup_action.isEnabled()
+        assert window.restore_snapshot_action.isEnabled()
     finally:
         window.close()
     assert application is not None
@@ -89,19 +98,23 @@ def test_opening_first_catalogue_reenables_workspace_after_restore(monkeypatch):
     assert application is not None
 
 
-def test_catalogue_backup_worker_reports_progress_and_result(monkeypatch, tmp_path):
-    source = tmp_path / "source.jvvv"
-    target = tmp_path / "source.zip"
-    expected = BackupResult(source, target, 1000, 250, 500, 750, 75.0, {"files": 2})
+def test_snapshot_worker_reports_progress_and_result(monkeypatch, tmp_path):
+    repository = tmp_path / "archive.jvvvrepo"
+    catalogue = tmp_path / "archive.jvvv"
+    expected = object()
     calls = []
 
-    def fake_create(source_path, backup_path, **kwargs):
-        calls.append((source_path, backup_path, kwargs["overwrite"]))
-        kwargs["progress_callback"](BackupProgress("compress", 3, 4, "Compressing"))
-        return expected
+    class FakeRepository:
+        def create_snapshot(self, catalogue_path, **kwargs):
+            calls.append((catalogue_path, kwargs["label"]))
+            kwargs["progress_callback"](SnapshotProgress("volumes", 3, 4, "Storing content"))
+            return expected
 
-    monkeypatch.setattr("jvvv.app.create_catalogue_backup", fake_create)
-    worker = CatalogueBackupWorker(source, target, overwrite=True)
+    monkeypatch.setattr(
+        "jvvv.app.SnapshotRepository.open_or_create",
+        classmethod(lambda cls, path: calls.append(("open_or_create", path)) or FakeRepository()),
+    )
+    worker = snapshot_worker(repository, catalogue, "nightly")
     progress = []
     finished = []
     worker.progress.connect(lambda done, total, message: progress.append((done, total, message)))
@@ -109,35 +122,33 @@ def test_catalogue_backup_worker_reports_progress_and_result(monkeypatch, tmp_pa
 
     worker.run()
 
-    assert calls == [(source, target, True)]
-    assert progress == [(3, 4, "Compressing")]
+    assert calls == [("open_or_create", repository), (catalogue, "nightly")]
+    assert progress == [(3, 4, "Storing content")]
     assert finished == [expected]
 
 
-def test_catalogue_restore_worker_delegates_normal_catalogue_target(monkeypatch, tmp_path):
-    backup = tmp_path / "source.zip"
+def test_snapshot_restore_worker_delegates_to_the_repository(monkeypatch, tmp_path):
+    repository = tmp_path / "archive.jvvvrepo"
     target = tmp_path / "restored.jvvv"
-    expected = RestoreResult(
-        backup,
-        target,
-        250,
-        1000,
-        ("folder aggregates", "search indexes"),
-    )
+    expected = object()
     calls = []
 
-    def fake_restore(backup_path, catalogue_path, **kwargs):
-        calls.append((backup_path, catalogue_path, kwargs["overwrite"]))
-        return expected
+    class FakeRepository:
+        def restore_snapshot(self, snapshot_id, target_path, **kwargs):
+            calls.append((snapshot_id, target_path, kwargs["overwrite"]))
+            return expected
 
-    monkeypatch.setattr("jvvv.app.restore_catalogue_backup", fake_restore)
-    worker = CatalogueRestoreWorker(backup, target, overwrite=False)
+    monkeypatch.setattr(
+        "jvvv.app.SnapshotRepository.open",
+        classmethod(lambda cls, path: calls.append(("open", path)) or FakeRepository()),
+    )
+    worker = snapshot_restore_worker(repository, "20260101T000000Z-abcd", target, overwrite=False)
     finished = []
     worker.finished.connect(finished.append)
 
     worker.run()
 
-    assert calls == [(backup, target, False)]
+    assert calls == [("open", repository), ("20260101T000000Z-abcd", target, False)]
     assert finished == [expected]
 
 
@@ -933,11 +944,24 @@ def test_catalogue_location_probe_is_read_only_and_detects_unavailable_paths(tmp
     created.close()
 
     assert probe_catalogue_location(path) == CATALOGUE_PROBE_OK
+    assert probe_catalogue_location(path / "catalogue.sqlite") == CATALOGUE_PROBE_OK
     assert probe_catalogue_location(tmp_path / "missing.jvvv") == CATALOGUE_PROBE_UNAVAILABLE
 
     invalid_path = tmp_path / "invalid.jvvv"
     invalid_path.write_text("not a catalogue")
     assert probe_catalogue_location(invalid_path) == CATALOGUE_PROBE_INVALID
+
+    empty_folder = tmp_path / "empty.jvvv"
+    empty_folder.mkdir()
+    assert probe_catalogue_location(empty_folder) == CATALOGUE_PROBE_INVALID
+
+    # LEGACY: a single-file catalogue probes OK so the open path can offer conversion.
+    legacy_path = tmp_path / "legacy.jvvv"
+    connection = sqlite3.connect(legacy_path)
+    connection.execute("CREATE TABLE marker (value TEXT)")
+    connection.commit()
+    connection.close()
+    assert probe_catalogue_location(legacy_path) == CATALOGUE_PROBE_OK
 
 
 def test_cancel_catalogue_open_kills_an_unresponsive_location_probe():

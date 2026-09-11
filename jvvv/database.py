@@ -3,23 +3,49 @@ from __future__ import annotations
 import os
 import platform
 import re
+import shutil
 import sqlite3
-import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from .backup_analysis import ANALYSIS_SCHEMA_SQL, ANALYSIS_TABLE_COLUMNS
+from .catalogue_format import (
+    CATALOGUE_DB_NAME,
+    CATALOGUE_EXTENSION,
+    INDEX_APPLICATION_ID,
+    INDEX_DB_NAME,
+    CatalogueLayout,
+    CatalogueLayoutError,
+    RegistryEntry,
+    catalogue_path_with_extension,
+    create_registry_db,
+    new_uuid,
+    open_registry_db,
+    read_registry,
+    read_sqlite_header,
+    read_volume_meta_from_path,
+    register_volume,
+    registry_meta,
+    registry_next_volume_id,
+    resolve_catalogue_root,
+    set_registry_meta,
+    unregister_volume,
+    validate_registry,
+    volume_uuid_from_file,
+)
 from .folder_statistics import calculate_folder_statistics
+from . import volume_store
+from .volume_store import ImportResult, VolumeStoreError
 
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
-SCHEMA_VERSION = 12
-# Older schema versions this build upgrades in place when a catalogue is
-# opened read-write.  Only the single step that real catalogues need exists.
-UPGRADABLE_SCHEMA_VERSIONS = frozenset({11})
-CATALOGUE_EXTENSION = ".jvvv"
+# Schema of index.sqlite (the working database).  Version 13 is the first
+# directory-catalogue schema: it adds volumes.uuid, the mirror link by UUID and
+# the index_state / index_meta bookkeeping tables.
+SCHEMA_VERSION = 13
 # Scan statuses whose catalogue changes were applied.  ``completed_with_warnings``
 # means indexing succeeded but some offline previews were not created (spec §16).
 COMPLETED_SCAN_STATUSES = frozenset({"completed", "completed_with_warnings"})
@@ -50,6 +76,8 @@ REQUIRED_TABLES = set(ANALYSIS_TABLE_COLUMNS) | {
     "folders_fts",
     "scan_history",
     "scan_errors",
+    "index_state",
+    "index_meta",
 }
 PREVIEW_STATUS_VALUES = frozenset({"available", "failed", "missing", "unsupported"})
 PREVIEW_SCAN_MODES = frozenset({"disabled", "enabled", "skipped-preflight"})
@@ -57,6 +85,7 @@ REQUIRED_COLUMNS = {
     **{table: set(columns) for table, columns in ANALYSIS_TABLE_COLUMNS.items()},
     "volumes": {
         "id",
+        "uuid",
         "name",
         "source_path",
         "identity_kind",
@@ -88,6 +117,7 @@ REQUIRED_COLUMNS = {
         "retired_date",
         "mirror_date",
         "master_volume_id",
+        "master_volume_uuid",
         "created_at",
         "updated_at",
     },
@@ -196,22 +226,17 @@ REQUIRED_COLUMNS = {
         "message",
         "created_at",
     },
+    "index_state": {
+        "volume_id",
+        "uuid",
+        "revision",
+        "content_digest",
+        "history_digest",
+        "synced_at",
+    },
+    "index_meta": {"key", "value"},
 }
 
-
-# Columns added to scan_history by the v11 -> v12 upgrade (offline previews).
-SCAN_HISTORY_PREVIEW_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("preview_mode", "TEXT NOT NULL DEFAULT 'disabled'"),
-    ("image_previews_generated", "INTEGER NOT NULL DEFAULT 0"),
-    ("image_previews_reused", "INTEGER NOT NULL DEFAULT 0"),
-    ("image_previews_failed", "INTEGER NOT NULL DEFAULT 0"),
-    ("video_previews_generated", "INTEGER NOT NULL DEFAULT 0"),
-    ("video_previews_reused", "INTEGER NOT NULL DEFAULT 0"),
-    ("video_previews_failed", "INTEGER NOT NULL DEFAULT 0"),
-    ("previews_storage_skipped", "INTEGER NOT NULL DEFAULT 0"),
-    ("preview_bytes_written", "INTEGER NOT NULL DEFAULT 0"),
-    ("preview_message", "TEXT NOT NULL DEFAULT ''"),
-)
 
 FILE_PREVIEW_STATUS_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS file_preview_status (
@@ -234,20 +259,28 @@ FILE_PREVIEW_STATUS_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_file_preview_status_status ON file_preview_status(status)"
 )
 
-# The complete v11 -> v12 upgrade: additive only, so every existing row survives.
-V11_TO_V12_UPGRADE_SQL: tuple[str, ...] = (
-    *(
-        f"ALTER TABLE scan_history ADD COLUMN {name} {definition}"
-        for name, definition in SCAN_HISTORY_PREVIEW_COLUMNS
-    ),
-    FILE_PREVIEW_STATUS_TABLE_SQL,
-    FILE_PREVIEW_STATUS_INDEX_SQL,
-)
+INDEX_STATE_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS index_state (
+        volume_id INTEGER PRIMARY KEY,
+        uuid TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        content_digest TEXT NOT NULL DEFAULT '',
+        history_digest TEXT NOT NULL DEFAULT '',
+        synced_at TEXT NOT NULL DEFAULT ''
+    )
+    """
+INDEX_META_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS index_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """
 
 CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
     """
     CREATE TABLE volumes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uuid TEXT NOT NULL UNIQUE,
         name TEXT UNIQUE COLLATE NOCASE,
         source_path TEXT NOT NULL,
         capacity_bytes INTEGER NOT NULL DEFAULT 0,
@@ -384,11 +417,14 @@ CATALOGUE_SCHEMA_SQL: tuple[str, ...] = (
         retired_date TEXT,
         mirror_date TEXT,
         master_volume_id INTEGER REFERENCES volumes(id) ON DELETE RESTRICT,
+        master_volume_uuid TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         CHECK (is_mirror IN (0, 1))
     )
     """,
+    INDEX_STATE_TABLE_SQL,
+    INDEX_META_TABLE_SQL,
     "CREATE INDEX idx_folders_volume_parent ON folders(volume_id, parent_id)",
     "CREATE INDEX idx_folders_name ON folders(name COLLATE NOCASE)",
     "CREATE INDEX idx_folders_path ON folders(relative_path COLLATE NOCASE)",
@@ -430,7 +466,41 @@ class UnsupportedCatalogueError(CatalogueError):
     pass
 
 
+# LEGACY: raised when *path* is a single-file catalogue written by a JVVV build
+# before the directory format.  jvvv.legacy converts such files; once every
+# catalogue has been converted this class and the check in Database.__init__
+# can be removed together with the jvvv.legacy package.
+class LegacyCatalogueError(UnsupportedCatalogueError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(
+            "This is a single-file catalogue from an earlier JVVV version. "
+            "Convert it to the current catalogue folder format before opening it."
+        )
+        self.legacy_path = Path(path)
+
+
 FolderStatsProgress = Callable[[int, int, str], None]
+ReconcileProgress = Callable[[int, int, str], None]
+
+DIRTY_CONTENT = "content"
+DIRTY_HISTORY = "history"
+DIRTY_METADATA = "metadata"
+
+
+@dataclass
+class ReconcileReport:
+    """What :meth:`Database.reconcile` did to bring the index in line with truth."""
+
+    imported: list[tuple[int, str]] = field(default_factory=list)
+    removed: list[int] = field(default_factory=list)
+    completed_deletions: list[str] = field(default_factory=list)
+    orphan_files: list[Path] = field(default_factory=list)
+    cleaned_temp_files: int = 0
+    rebuilt: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.imported or self.removed or self.completed_deletions or self.rebuilt)
 
 
 def sqlite_file_uri(
@@ -528,6 +598,16 @@ def _windows_drive_is_remote(drive: str) -> bool:
 
 
 class Database:
+    """One connection to a catalogue directory.
+
+    ``connection`` is the working index (``index.sqlite``) and every query
+    method reads from it.  Mutating methods mark the affected volume dirty; when
+    the outermost :meth:`transaction` commits, the dirty volumes are written to
+    their ``.jvvvol`` files first (the source of truth), then the index commit
+    follows.  A crash between the two leaves the volume file newer than the
+    index, which :meth:`reconcile` repairs on the next open.
+    """
+
     def __init__(
         self,
         path: str | Path,
@@ -540,40 +620,69 @@ class Database:
     ) -> None:
         if create and read_only:
             raise ValueError("A read-only database connection cannot create a catalogue.")
-        self.path = Path(path).expanduser()
+        requested = Path(path).expanduser()
+        self._operation = "preparing the catalogue path"
+        # LEGACY: a bare SQLite file is a single-file catalogue from an older build.
+        if requested.is_file() and requested.name not in {CATALOGUE_DB_NAME, INDEX_DB_NAME}:
+            if read_sqlite_header(requested) is not None:
+                raise LegacyCatalogueError(requested)
+            raise InvalidCatalogueError(
+                f"The selected path is a file, not a catalogue folder: {requested}"
+            )
+        self.path = resolve_catalogue_root(requested)
+        self.layout = CatalogueLayout(self.path)
         self.read_only = read_only
         self.busy_timeout_ms = busy_timeout_ms
-        self._operation = "preparing the catalogue path"
+        self.check_same_thread = check_same_thread
         self._connect_target = ""
         self._use_uri = False
+        self._registry_connection: sqlite3.Connection | None = None
+        self._dirty: dict[int, set[str]] = {}
+        self._created: dict[int, str] = {}
+        self._deleted: dict[int, str] = {}
+        self._pending_tombstones: list[Path] = []
+        self._flushed: list[tuple[int, str]] = []
+        self.index_was_created = False
+        self.last_reconcile: ReconcileReport | None = None
         self._network_storage = self._uses_network_storage(self.path)
         self._requested_journal_mode = ""
-        self._stored_journal_mode = self._database_header_journal_mode(self.path)
+        self._stored_journal_mode = self._database_header_journal_mode(self.layout.index_db)
         if self._network_storage and self._stored_journal_mode == "WAL":
             raise CatalogueError(
                 "This network catalogue is still in WAL mode. Move it to a local drive, "
                 "open and close it there to convert it, then move it back to the network share."
             )
-        stored_schema_version = self._database_header_schema_version(self.path)
-        if stored_schema_version in UPGRADABLE_SCHEMA_VERSIONS and read_only:
-            raise UnsupportedCatalogueError(
-                self._upgrade_required_message(stored_schema_version)
-            )
-        if stored_schema_version not in (None, 0, SCHEMA_VERSION) and (
-            stored_schema_version not in UPGRADABLE_SCHEMA_VERSIONS
-        ):
+        stored_schema_version = self._database_header_schema_version(self.layout.index_db)
+        if stored_schema_version not in (None, 0, SCHEMA_VERSION):
             raise UnsupportedCatalogueError(
                 self._unsupported_schema_message(stored_schema_version)
             )
         if create:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            connect_target = str(self.path)
-            use_uri = False
+            if not self.layout.exists():
+                self._operation = "creating the catalogue folder"
+                self._create_layout()
+            # Always a URI connection: importing a volume file attaches it
+            # read-only through a file: URI, which needs URI handling enabled.
+            connect_target = sqlite_file_uri(self.layout.index_db, mode="rwc")
+            use_uri = True
         else:
-            if not self.path.is_file():
-                raise InvalidCatalogueError(f"Catalogue file does not exist: {self.path}")
+            if not self.layout.exists():
+                if self.path.is_dir():
+                    raise InvalidCatalogueError(
+                        f"The folder is not a JVVV catalogue (no {CATALOGUE_DB_NAME}): {self.path}"
+                    )
+                raise InvalidCatalogueError(f"Catalogue does not exist: {self.path}")
+            if not self.layout.index_db.is_file():
+                if self.read_only:
+                    raise InvalidCatalogueError(
+                        "The catalogue index is missing. Open the catalogue normally once "
+                        "so it can be rebuilt from the volume files."
+                    )
+                # The index is a cache: a missing one is rebuilt by reconcile().
+                self._operation = "creating an empty catalogue index"
+                self._create_index_db()
             connect_target = sqlite_file_uri(
-                self.path,
+                self.layout.index_db,
                 mode="ro" if self.read_only else "rw",
             )
             use_uri = True
@@ -602,12 +711,115 @@ class Database:
                 self.connection.close()
             raise
 
+    # ------------------------------------------------------------------
+    # Directory layout
+    # ------------------------------------------------------------------
+
+    @property
+    def index_path(self) -> Path:
+        return self.layout.index_db
+
+    @property
+    def registry_path(self) -> Path:
+        return self.layout.catalogue_db
+
+    @property
+    def volumes_dir(self) -> Path:
+        return self.layout.volumes_dir
+
+    def _create_layout(self) -> None:
+        if self.path.exists() and not self.path.is_dir():
+            raise InvalidCatalogueError(f"The catalogue path is not a folder: {self.path}")
+        if self.path.is_dir() and any(self.path.iterdir()):
+            raise InvalidCatalogueError(
+                f"The folder is not empty and is not a JVVV catalogue: {self.path}"
+            )
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.layout.volumes_dir.mkdir(exist_ok=True)
+        create_registry_db(
+            self.layout.catalogue_db,
+            catalogue_uuid=new_uuid(),
+            created_at=utc_now(),
+        )
+
+    def _create_index_db(self) -> None:
+        temp = self.layout.index_db.with_name(f"{INDEX_DB_NAME}.creating-{os.urandom(4).hex()}")
+        scratch = Database.__new__(Database)
+        scratch.path = self.path
+        scratch.layout = self.layout
+        scratch.read_only = False
+        scratch.busy_timeout_ms = self.busy_timeout_ms
+        scratch.check_same_thread = True
+        scratch._connect_target = str(temp)
+        scratch._use_uri = False
+        scratch._registry_connection = None
+        scratch._dirty = {}
+        scratch._created = {}
+        scratch._deleted = {}
+        scratch._pending_tombstones = []
+        scratch._flushed = []
+        scratch._network_storage = self._network_storage
+        scratch._requested_journal_mode = ""
+        scratch._stored_journal_mode = "New database"
+        scratch._operation = "creating the catalogue index"
+        scratch.index_was_created = True
+        scratch.last_reconcile = None
+        scratch.connection = sqlite3.connect(str(temp))
+        scratch.connection.row_factory = sqlite3.Row
+        try:
+            scratch._configure_connection()
+            scratch.initialize()
+        finally:
+            scratch.connection.close()
+        for suffix in ("-wal", "-shm"):
+            Path(f"{temp}{suffix}").unlink(missing_ok=True)
+        os.replace(temp, self.layout.index_db)
+        self.index_was_created = True
+
+    def _registry(self) -> sqlite3.Connection:
+        if self._registry_connection is None:
+            self._operation = "opening the catalogue registry"
+            try:
+                self._registry_connection = open_registry_db(
+                    self.layout.catalogue_db,
+                    read_only=self.read_only,
+                    check_same_thread=self.check_same_thread,
+                    timeout=max(self.busy_timeout_ms, 250) / 1000,
+                )
+            except CatalogueLayoutError as exc:
+                raise InvalidCatalogueError(str(exc)) from exc
+        return self._registry_connection
+
+    def catalogue_meta(self) -> dict[str, str]:
+        """Return the registry's key/value metadata (format, UUID, settings)."""
+
+        return registry_meta(self._registry())
+
+    def set_catalogue_meta(self, key: str, value: str) -> None:
+        if self.read_only:
+            raise CatalogueError("The catalogue is open read-only.")
+        registry = self._registry()
+        with registry:
+            set_registry_meta(registry, key, value)
+
+    def catalogue_uuid(self) -> str:
+        return self.catalogue_meta().get("catalogue_uuid", "")
+
+    def registry_entries(self) -> list[RegistryEntry]:
+        return read_registry(self._registry())
+
     def close(self) -> None:
         try:
             if self.connection.in_transaction:
                 self.connection.rollback()
         finally:
-            self.connection.close()
+            try:
+                self.connection.close()
+            finally:
+                registry = self._registry_connection
+                self._registry_connection = None
+                if registry is not None:
+                    registry.close()
 
     @staticmethod
     def _uses_network_storage(path: Path) -> bool:
@@ -714,9 +926,6 @@ class Database:
 
     def initialize(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-        if version in UPGRADABLE_SCHEMA_VERSIONS:
-            self.upgrade_schema(int(version))
-            version = SCHEMA_VERSION
         if version == SCHEMA_VERSION:
             self.validate_schema()
             return
@@ -740,6 +949,11 @@ class Database:
                 (utc_now(),),
             )
             self._create_or_rebuild_search_indexes()
+            self.connection.execute(
+                "INSERT INTO index_meta (key, value) VALUES ('built_at', ?)",
+                (utc_now(),),
+            )
+            self.connection.execute(f"PRAGMA application_id = {INDEX_APPLICATION_ID}")
             self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.connection.commit()
         except sqlite3.Error:
@@ -751,69 +965,27 @@ class Database:
     def _unsupported_schema_message(version: int) -> str:
         if version < SCHEMA_VERSION:
             return (
-                f"This catalogue uses the retired schema version {version}. "
+                f"This catalogue index uses the retired schema version {version}. "
                 f"This JVVV build only opens the current schema version {SCHEMA_VERSION}."
             )
         return (
-            f"This catalogue uses schema version {version}, but this JVVV build only "
+            f"This catalogue index uses schema version {version}, but this JVVV build only "
             f"supports version {SCHEMA_VERSION}."
         )
 
-    @staticmethod
-    def _upgrade_required_message(version: int) -> str:
-        return (
-            f"This catalogue uses schema version {version} and must be upgraded to "
-            f"version {SCHEMA_VERSION} before it can be used read-only. Open it normally "
-            "in JVVV once to upgrade it."
-        )
-
-    def upgrade_schema(self, version: int) -> None:
-        """Upgrade an older catalogue in place, atomically (currently v11 -> v12).
-
-        The upgrade only adds columns and one table, so every existing row is
-        preserved.  It runs in a single ``BEGIN IMMEDIATE`` transaction with the
-        new ``user_version`` written last, so a failure leaves the file at the
-        old version with no partial changes.
-        """
-
-        if version == SCHEMA_VERSION:
-            return
-        if version not in UPGRADABLE_SCHEMA_VERSIONS:
-            raise UnsupportedCatalogueError(self._unsupported_schema_message(int(version)))
-        if self.read_only:
-            raise UnsupportedCatalogueError(self._upgrade_required_message(int(version)))
-        self._operation = f"upgrading the catalogue schema from version {version} to {SCHEMA_VERSION}"
-        try:
-            self.connection.execute("BEGIN IMMEDIATE")
-            current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
-            if current != version:
-                raise CatalogueError(
-                    f"The catalogue schema changed while it was being upgraded "
-                    f"(expected version {version}, found {current})."
-                )
-            existing_columns = self._column_names("scan_history")
-            for statement in V11_TO_V12_UPGRADE_SQL:
-                if statement.startswith("ALTER TABLE scan_history ADD COLUMN"):
-                    column = statement.split()[5]
-                    if column in existing_columns:
-                        continue
-                self.connection.execute(statement)
-            self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            self.connection.commit()
-        except Exception as exc:
-            self.connection.rollback()
-            if isinstance(exc, CatalogueError):
-                raise
-            raise CatalogueError(
-                f"The catalogue could not be upgraded from schema version {version} to "
-                f"{SCHEMA_VERSION}; it was left unchanged. {exc}",
-                diagnostic_details=(
-                    self._diagnostic_details(exc) if isinstance(exc, sqlite3.Error) else ""
-                ),
-            ) from exc
-
     def validate_catalogue(self) -> None:
         try:
+            self._operation = "validating the catalogue registry"
+            try:
+                validate_registry(self._registry())
+            except CatalogueLayoutError as exc:
+                raise InvalidCatalogueError(str(exc)) from exc
+            if not self.layout.volumes_dir.is_dir():
+                if self.read_only:
+                    raise InvalidCatalogueError(
+                        f"The catalogue has no {self.layout.volumes_dir.name} folder."
+                    )
+                self.layout.volumes_dir.mkdir(exist_ok=True)
             # quick_check walks every table and index. On multi-gigabyte
             # catalogues (especially ones with FTS indexes), doing that on
             # every open can take minutes even when the database is healthy.
@@ -822,13 +994,15 @@ class Database:
             # catalogues small enough for it to remain an inexpensive guard.
             if (
                 not self._network_storage
-                and self.path.stat().st_size <= AUTOMATIC_INTEGRITY_CHECK_MAX_BYTES
+                and self.layout.index_db.stat().st_size <= AUTOMATIC_INTEGRITY_CHECK_MAX_BYTES
             ):
                 self._operation = "checking catalogue database integrity"
                 check = self.connection.execute("PRAGMA quick_check(1)").fetchone()
                 if check is None or check[0] != "ok":
                     raise InvalidCatalogueError(
-                        "The selected catalogue database appears to be corrupted."
+                        "The catalogue index database appears to be corrupted. Delete "
+                        f"{INDEX_DB_NAME} inside the catalogue folder; it is rebuilt from the "
+                        "volume files on the next open."
                     )
 
             self._operation = "reading the catalogue schema version"
@@ -837,15 +1011,8 @@ class Database:
             existing_tables = self._table_names()
             if version == 0 and not REQUIRED_TABLES <= existing_tables:
                 raise InvalidCatalogueError(
-                    "The selected file is a SQLite database, but it is not a JVVV catalogue."
+                    "The catalogue index is a SQLite database, but it is not a JVVV index."
                 )
-            if version in UPGRADABLE_SCHEMA_VERSIONS:
-                if self.read_only:
-                    raise UnsupportedCatalogueError(
-                        self._upgrade_required_message(int(version))
-                    )
-                self.upgrade_schema(int(version))
-                version = SCHEMA_VERSION
             if version != SCHEMA_VERSION:
                 raise UnsupportedCatalogueError(
                     self._unsupported_schema_message(int(version))
@@ -860,7 +1027,7 @@ class Database:
         if missing:
             names = ", ".join(sorted(missing))
             raise InvalidCatalogueError(
-                f"The selected file is missing required catalogue tables: {names}."
+                f"The catalogue index is missing required tables: {names}."
             )
         missing_columns: list[str] = []
         for table, required_columns in REQUIRED_COLUMNS.items():
@@ -869,7 +1036,7 @@ class Database:
         if missing_columns:
             names = ", ".join(missing_columns)
             raise InvalidCatalogueError(
-                f"The selected file is missing required catalogue columns: {names}."
+                f"The catalogue index is missing required columns: {names}."
             )
 
     def _table_names(self) -> set[str]:
@@ -967,16 +1134,467 @@ class Database:
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """Group index writes; on the outermost commit, write truth first.
+
+        Volume files are written (and the registry updated) before the index
+        commits.  If the index commit then fails, the already-written volume
+        files are re-imported so this connection stays consistent with truth.
+        """
+
         if self.connection.in_transaction:
             yield self.connection
             return
         try:
             self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield self.connection
+            self._flush_truth()
+            try:
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                self._repair_after_failed_commit()
+                raise
+            self._after_commit()
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.rollback()
+            self._discard_pending_changes()
+            raise
+
+    # ------------------------------------------------------------------
+    # Truth files: dirty tracking, flush, reconcile
+    # ------------------------------------------------------------------
+
+    def _mark_dirty(self, volume_id: int | None, kind: str) -> None:
+        if volume_id is None:
+            return
+        if self.read_only:
+            raise CatalogueError("The catalogue is open read-only.")
+        self._dirty.setdefault(int(volume_id), set()).add(kind)
+
+    def _mark_file_dirty(self, file_id: int) -> None:
+        row = self.connection.execute(
+            "SELECT volume_id FROM files WHERE id = ?", (int(file_id),)
+        ).fetchone()
+        if row is not None:
+            self._mark_dirty(int(row["volume_id"]), DIRTY_CONTENT)
+
+    def _volume_uuid(self, volume_id: int) -> str:
+        row = self.connection.execute(
+            "SELECT uuid FROM volumes WHERE id = ?", (int(volume_id),)
+        ).fetchone()
+        if row is None:
+            raise CatalogueError(f"Volume {volume_id} does not exist.")
+        return str(row["uuid"])
+
+    def _allocate_volume_id(self) -> int:
+        highest = self.connection.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM volumes"
+        ).fetchone()[0]
+        sequence = self.connection.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'volumes'"
+        ).fetchone()
+        candidates = [int(highest) + 1, registry_next_volume_id(self._registry())]
+        if sequence is not None:
+            candidates.append(int(sequence[0]) + 1)
+        return max(candidates)
+
+    def _record_index_state(self, volume_id: int, volume_uuid: str, meta: Any, synced_at: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO index_state (volume_id, uuid, revision, content_digest, history_digest, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(volume_id) DO UPDATE SET
+                uuid = excluded.uuid,
+                revision = excluded.revision,
+                content_digest = excluded.content_digest,
+                history_digest = excluded.history_digest,
+                synced_at = excluded.synced_at
+            """,
+            (
+                int(volume_id),
+                volume_uuid,
+                int(meta.revision),
+                meta.content_digest,
+                meta.history_digest,
+                synced_at,
+            ),
+        )
+
+    def _flush_truth(self) -> None:
+        """Write every dirty volume to its file; called before the index commits."""
+
+        if not self._dirty and not self._created and not self._deleted:
+            return
+        if self.read_only:
+            raise CatalogueError("The catalogue is open read-only.")
+        now = utc_now()
+        self._flushed = []
+        self._pending_tombstones = []
+        for volume_id in sorted(self._dirty):
+            if volume_id in self._deleted:
+                continue
+            kinds = self._dirty[volume_id]
+            volume_uuid = self._created.get(volume_id) or self._volume_uuid(volume_id)
+            path = self.layout.volume_file(volume_uuid)
+            self._operation = f"writing volume file {path.name}"
+            try:
+                if DIRTY_CONTENT in kinds or volume_id in self._created or not path.is_file():
+                    result = volume_store.export_volume_full(
+                        self.connection, volume_id, volume_uuid, path, exported_at=now
+                    )
+                elif DIRTY_HISTORY in kinds:
+                    result = volume_store.export_volume_history(
+                        self.connection, volume_id, volume_uuid, path, exported_at=now
+                    )
+                else:
+                    result = volume_store.export_volume_metadata(
+                        self.connection, volume_id, volume_uuid, path, exported_at=now
+                    )
+            except (VolumeStoreError, CatalogueLayoutError) as exc:
+                raise CatalogueError(f"The volume file could not be written: {exc}") from exc
+            self._record_index_state(volume_id, volume_uuid, result.meta, now)
+            self._flushed.append((volume_id, volume_uuid))
+            if volume_id in self._created:
+                registry = self._registry()
+                with registry:
+                    register_volume(registry, volume_id, volume_uuid, now)
+        for volume_id, volume_uuid in sorted(self._deleted.items()):
+            path = self.layout.volume_file(volume_uuid)
+            tombstone = self.layout.volume_tombstone(volume_uuid)
+            if path.is_file():
+                os.replace(path, tombstone)
+                self._pending_tombstones.append(tombstone)
+            elif tombstone.is_file():
+                self._pending_tombstones.append(tombstone)
+            registry = self._registry()
+            with registry:
+                unregister_volume(registry, volume_id)
+            self.connection.execute("DELETE FROM index_state WHERE volume_id = ?", (volume_id,))
+        self._dirty.clear()
+        self._created.clear()
+        self._deleted.clear()
+
+    def _after_commit(self) -> None:
+        for tombstone in self._pending_tombstones:
+            try:
+                tombstone.unlink()
+            except OSError:
+                # Left behind: reconcile() finishes the deletion on the next open.
+                pass
+        self._pending_tombstones = []
+        self._flushed = []
+
+    def _discard_pending_changes(self) -> None:
+        self._dirty.clear()
+        self._created.clear()
+        self._deleted.clear()
+        self._pending_tombstones = []
+        self._flushed = []
+
+    def _repair_after_failed_commit(self) -> None:
+        """Truth was written but the index commit failed: refresh from truth."""
+
+        flushed = list(self._flushed)
+        self._flushed = []
+        for volume_id, volume_uuid in flushed:
+            path = self.layout.volume_file(volume_uuid)
+            if not path.is_file():
+                continue
+            try:
+                volume_store.import_volume(self.connection, volume_id, volume_uuid, path)
+            except Exception:
+                # The next open reconciles from the volume file.
+                pass
+
+    def reconcile(self, progress_callback: ReconcileProgress | None = None) -> ReconcileReport:
+        """Bring the index in line with catalogue.sqlite and the volume files.
+
+        Runs on every open.  Finishes interrupted deletions, removes temporary
+        export files, refuses to continue when a registered volume file is
+        missing, drops index rows of volumes that are no longer registered, and
+        re-imports every volume whose file revision differs from what the index
+        last synchronised.  A missing index is rebuilt completely.
+        """
+
+        if self.read_only:
+            raise CatalogueError("A read-only connection cannot reconcile the catalogue.")
+        if self.connection.in_transaction:
+            raise CatalogueError("reconcile() cannot run inside a transaction.")
+        report = ReconcileReport()
+        registry = self._registry()
+
+        def emit(done: int, total: int, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(done, total, message)
+
+        self._operation = "removing incomplete volume exports"
+        for temp in self.layout.iter_temp_files():
+            try:
+                temp.unlink()
+                report.cleaned_temp_files += 1
+            except OSError:
+                pass
+
+        entries = read_registry(registry)
+        by_uuid = {entry.uuid: entry for entry in entries}
+
+        self._operation = "finishing interrupted volume deletions"
+        for tombstone in list(self.layout.iter_tombstones()):
+            volume_uuid = volume_uuid_from_file(tombstone)
+            entry = by_uuid.pop(volume_uuid, None)
+            if entry is not None:
+                with registry:
+                    unregister_volume(registry, entry.volume_id)
+                with self._raw_transaction():
+                    volume_store.delete_volume_rows(self.connection, entry.volume_id)
+                    self.connection.execute(
+                        "DELETE FROM index_state WHERE volume_id = ?", (entry.volume_id,)
+                    )
+                entries = [item for item in entries if item.volume_id != entry.volume_id]
+            try:
+                tombstone.unlink()
+            except OSError:
+                pass
+            report.completed_deletions.append(volume_uuid)
+
+        self._operation = "checking registered volume files"
+        missing = [
+            entry for entry in entries if not self.layout.volume_file(entry.uuid).is_file()
+        ]
+        if missing:
+            names = ", ".join(
+                f"{self.layout.volume_file(entry.uuid).name} (volume {entry.volume_id})"
+                for entry in missing
+            )
+            raise InvalidCatalogueError(
+                "The catalogue registers volumes whose files are missing from the volumes "
+                f"folder: {names}. Restore them from a snapshot or put the files back before "
+                "opening the catalogue."
+            )
+
+        index_volumes = {
+            int(row["id"]): str(row["uuid"])
+            for row in self.connection.execute("SELECT id, uuid FROM volumes")
+        }
+        registry_ids = {entry.volume_id: entry.uuid for entry in entries}
+        stale_ids = [
+            volume_id
+            for volume_id, volume_uuid in index_volumes.items()
+            if registry_ids.get(volume_id) != volume_uuid
+        ]
+        if stale_ids:
+            self._operation = "removing unregistered volumes from the index"
+            with self._raw_transaction():
+                for volume_id in stale_ids:
+                    volume_store.delete_volume_rows(self.connection, volume_id)
+                    self.connection.execute(
+                        "DELETE FROM index_state WHERE volume_id = ?", (volume_id,)
+                    )
+                    report.removed.append(volume_id)
+                    index_volumes.pop(volume_id, None)
+        with self._raw_transaction():
+            self.connection.execute(
+                "DELETE FROM index_state WHERE volume_id NOT IN (SELECT id FROM volumes)"
+            )
+
+        states = {
+            int(row["volume_id"]): (str(row["uuid"]), int(row["revision"]))
+            for row in self.connection.execute("SELECT volume_id, uuid, revision FROM index_state")
+        }
+        self._operation = "comparing volume files with the index"
+        to_import: list[RegistryEntry] = []
+        total = len(entries)
+        for position, entry in enumerate(entries, start=1):
+            emit(position, max(total, 1), f"Checking volume files... {position}/{total}")
+            path = self.layout.volume_file(entry.uuid)
+            try:
+                meta = read_volume_meta_from_path(path)
+            except CatalogueLayoutError as exc:
+                raise InvalidCatalogueError(f"{path.name}: {exc}") from exc
+            if meta.uuid != entry.uuid:
+                raise InvalidCatalogueError(
+                    f"{path.name} belongs to volume {meta.uuid}, not {entry.uuid}."
+                )
+            state = states.get(entry.volume_id)
+            if (
+                entry.volume_id not in index_volumes
+                or state is None
+                or state[0] != entry.uuid
+                or state[1] != meta.revision
+            ):
+                to_import.append(entry)
+
+        if to_import:
+            rebuild = len(to_import) == len(entries) and not index_volumes
+            report.rebuilt = rebuild
+            self._operation = "importing volume files into the index"
+            if rebuild:
+                self._import_all(to_import, emit)
+            else:
+                for position, entry in enumerate(to_import, start=1):
+                    emit(
+                        position,
+                        len(to_import),
+                        f"Refreshing index from volume files... {position}/{len(to_import)}",
+                    )
+                    self._import_entry(entry)
+            for entry in to_import:
+                report.imported.append((entry.volume_id, entry.uuid))
+            with self._raw_transaction():
+                volume_store.relink_mirror_masters(self.connection)
+            self._invalidate_evidence(
+                "The catalogue index was refreshed from the volume files."
+            )
+
+        registry_uuids = set(registry_ids.values())
+        for volume_file in self.layout.iter_volume_files():
+            if volume_uuid_from_file(volume_file) not in registry_uuids:
+                report.orphan_files.append(volume_file)
+        self.last_reconcile = report
+        return report
+
+    @contextmanager
+    def _raw_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Index-only transaction that bypasses dirty tracking (reconcile)."""
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            yield self.connection
             self.connection.commit()
         except Exception:
             self.connection.rollback()
             raise
+
+    def _import_entry(self, entry: RegistryEntry) -> ImportResult:
+        path = self.layout.volume_file(entry.uuid)
+        try:
+            return volume_store.import_volume(self.connection, entry.volume_id, entry.uuid, path)
+        except (VolumeStoreError, CatalogueLayoutError) as exc:
+            raise InvalidCatalogueError(f"{path.name}: {exc}") from exc
+
+    def _import_all(self, entries: list[RegistryEntry], emit: ReconcileProgress) -> None:
+        """Import every volume with the FTS triggers off, then rebuild FTS once."""
+
+        triggers = [
+            row["name"]
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%_fts_%'"
+            )
+        ]
+        with self._raw_transaction():
+            for trigger in triggers:
+                self.connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        try:
+            total = len(entries)
+            for position, entry in enumerate(entries, start=1):
+                emit(position, total, f"Rebuilding index from volume files... {position}/{total}")
+                self._import_entry(entry)
+        finally:
+            emit(total, total, "Rebuilding search index...")
+            with self._raw_transaction():
+                self._create_or_rebuild_search_indexes()
+
+    def _invalidate_evidence(self, reason: str) -> None:
+        from .backup_analysis import BackupAnalysisEngine
+
+        BackupAnalysisEngine(self).invalidate_all(reason)
+
+    def volume_file_path(self, volume_id: int) -> Path:
+        return self.layout.volume_file(self._volume_uuid(volume_id))
+
+    def export_volume(
+        self,
+        volume_id: int,
+        progress_callback: ReconcileProgress | None = None,
+    ) -> volume_store.ExportResult:
+        """Regenerate one volume file from the index (recovery and migration)."""
+
+        if self.read_only:
+            raise CatalogueError("The catalogue is open read-only.")
+        if self.connection.in_transaction:
+            raise CatalogueError("export_volume() cannot run inside a transaction.")
+        volume_uuid = self._volume_uuid(volume_id)
+        path = self.layout.volume_file(volume_uuid)
+        now = utc_now()
+        try:
+            result = volume_store.export_volume_full(
+                self.connection, volume_id, volume_uuid, path, exported_at=now, progress=progress_callback
+            )
+        except (VolumeStoreError, CatalogueLayoutError) as exc:
+            raise CatalogueError(f"The volume file could not be written: {exc}") from exc
+        with self._raw_transaction():
+            self._record_index_state(volume_id, volume_uuid, result.meta, now)
+        return result
+
+    def export_all_volumes(
+        self,
+        progress_callback: ReconcileProgress | None = None,
+    ) -> list[volume_store.ExportResult]:
+        """Regenerate every volume file from the index."""
+
+        results = []
+        volume_ids = [
+            int(row["id"]) for row in self.connection.execute("SELECT id FROM volumes ORDER BY id")
+        ]
+        for position, volume_id in enumerate(volume_ids, start=1):
+            if progress_callback is not None:
+                progress_callback(position - 1, len(volume_ids), f"Writing volume files ({position}/{len(volume_ids)})")
+            results.append(self.export_volume(volume_id))
+        return results
+
+    def verify_volume_file(self, volume_id: int) -> volume_store.RowCounts:
+        """Check one volume file against the index: revision, digests and row counts."""
+
+        volume_uuid = self._volume_uuid(volume_id)
+        path = self.layout.volume_file(volume_uuid)
+        try:
+            meta = read_volume_meta_from_path(path)
+        except CatalogueLayoutError as exc:
+            raise InvalidCatalogueError(f"{path.name}: {exc}") from exc
+        if meta.uuid != volume_uuid:
+            raise InvalidCatalogueError(f"{path.name} belongs to volume {meta.uuid}, not {volume_uuid}.")
+        state = self.index_state(volume_id)
+        if state is None or int(state["revision"]) != meta.revision:
+            raise InvalidCatalogueError(
+                f"{path.name} is at revision {meta.revision} but the index recorded "
+                f"{None if state is None else state['revision']}."
+            )
+        content, history = volume_store.volume_file_digests(path)
+        if content != meta.content_digest or history != meta.history_digest:
+            raise InvalidCatalogueError(
+                f"{path.name} does not re-serialise to the digests it records."
+            )
+        connection = volume_store.open_volume_file(path, read_only=True)
+        try:
+            file_counts = volume_store.volume_file_counts(connection)
+        finally:
+            connection.close()
+        index_counts = volume_store.RowCounts(
+            folders=int(self.connection.execute("SELECT COUNT(*) FROM folders WHERE volume_id = ?", (volume_id,)).fetchone()[0]),
+            files=int(self.connection.execute("SELECT COUNT(*) FROM files WHERE volume_id = ?", (volume_id,)).fetchone()[0]),
+            file_media_metadata=int(self.connection.execute(
+                "SELECT COUNT(*) FROM file_media_metadata m JOIN files f ON f.id = m.file_id WHERE f.volume_id = ?",
+                (volume_id,),
+            ).fetchone()[0]),
+            file_preview_status=int(self.connection.execute(
+                "SELECT COUNT(*) FROM file_preview_status p JOIN files f ON f.id = p.file_id WHERE f.volume_id = ?",
+                (volume_id,),
+            ).fetchone()[0]),
+            scan_history=int(self.connection.execute("SELECT COUNT(*) FROM scan_history WHERE volume_id = ?", (volume_id,)).fetchone()[0]),
+            scan_errors=int(self.connection.execute("SELECT COUNT(*) FROM scan_errors WHERE volume_id = ?", (volume_id,)).fetchone()[0]),
+        )
+        if file_counts != index_counts:
+            raise InvalidCatalogueError(
+                f"{path.name} row counts {file_counts.as_dict()} differ from the index "
+                f"{index_counts.as_dict()}."
+            )
+        return file_counts
+
+    def index_state(self, volume_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM index_state WHERE volume_id = ?", (int(volume_id),)
+        ).fetchone()
 
     def _normalize_source_path(self, source_path: str) -> str:
         text = source_path.strip()
@@ -1175,14 +1793,21 @@ class Database:
         data = self._coerce_volume_register(conn, register)
         self._validate_volume_register(conn, volume_id, data)
         now = utc_now()
+        master_uuid = None
+        if data["master_volume_id"] is not None:
+            master_row = conn.execute(
+                "SELECT uuid FROM volumes WHERE id = ?", (int(data["master_volume_id"]),)
+            ).fetchone()
+            master_uuid = str(master_row["uuid"]) if master_row is not None else None
         conn.execute(
             """
             INSERT INTO volume_register (
                 volume_id, drive_id, is_mirror, status, condition, description,
                 earliest_content_date, latest_content_date, connector, date_added,
-                retired_date, mirror_date, master_volume_id, created_at, updated_at
+                retired_date, mirror_date, master_volume_id, master_volume_uuid,
+                created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(volume_id) DO UPDATE SET
                 drive_id = excluded.drive_id,
                 is_mirror = excluded.is_mirror,
@@ -1196,6 +1821,7 @@ class Database:
                 retired_date = excluded.retired_date,
                 mirror_date = excluded.mirror_date,
                 master_volume_id = excluded.master_volume_id,
+                master_volume_uuid = excluded.master_volume_uuid,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1212,10 +1838,12 @@ class Database:
                 data["retired_date"],
                 data["mirror_date"],
                 data["master_volume_id"],
+                master_uuid,
                 now,
                 now,
             ),
         )
+        self._mark_dirty(volume_id, DIRTY_METADATA)
 
     def create_volume(
         self,
@@ -1229,16 +1857,20 @@ class Database:
         clean_name = self._normalize_volume_name(name)
         location_data = self._normalize_volume_location(location)
         with self.transaction() as conn:
-            cur = conn.execute(
+            volume_id = self._allocate_volume_id()
+            volume_uuid = new_uuid()
+            conn.execute(
                 """
                 INSERT INTO volumes (
-                    name, source_path, identity_kind, identity_token,
+                    id, uuid, name, source_path, identity_kind, identity_token,
                     identity_label, identity_serial, identity_filesystem,
                     source_relative_path, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    volume_id,
+                    volume_uuid,
                     clean_name,
                     source,
                     location_data["identity_kind"],
@@ -1251,8 +1883,9 @@ class Database:
                     now,
                 ),
             )
-            volume_id = int(cur.lastrowid)
             self._upsert_volume_register(conn, volume_id, register or {})
+            self._created[volume_id] = volume_uuid
+            self._mark_dirty(volume_id, DIRTY_CONTENT)
             return volume_id
 
     def update_volume(
@@ -1274,6 +1907,7 @@ class Database:
             )
             if register is not None:
                 self._upsert_volume_register(conn, volume_id, register)
+            self._mark_dirty(volume_id, DIRTY_METADATA)
 
     def update_volume_location(
         self,
@@ -1309,8 +1943,11 @@ class Database:
                     volume_id,
                 ),
             )
+            self._mark_dirty(volume_id, DIRTY_METADATA)
 
     def delete_volume(self, volume_id: int) -> None:
+        """Delete a volume: its index rows now, its file and registry row at commit."""
+
         with self.transaction(immediate=True) as conn:
             dependents = self._list_mirror_dependents(conn, volume_id)
             if dependents:
@@ -1319,12 +1956,11 @@ class Database:
                     f"This volume is selected as the master drive for: {names}. "
                     "Remove those mirror relationships before deleting it."
                 )
-            conn.execute("DELETE FROM scan_errors WHERE volume_id = ?", (volume_id,))
-            conn.execute("DELETE FROM scan_history WHERE volume_id = ?", (volume_id,))
-            conn.execute("DELETE FROM files WHERE volume_id = ?", (volume_id,))
-            conn.execute("DELETE FROM folders WHERE volume_id = ?", (volume_id,))
-            conn.execute("DELETE FROM volume_register WHERE volume_id = ?", (volume_id,))
-            conn.execute("DELETE FROM volumes WHERE id = ?", (volume_id,))
+            volume_uuid = self._volume_uuid(volume_id)
+            volume_store.delete_volume_rows(conn, volume_id)
+            self._dirty.pop(int(volume_id), None)
+            self._created.pop(int(volume_id), None)
+            self._deleted[int(volume_id)] = volume_uuid
 
     def get_volume(self, volume_id: int) -> sqlite3.Row | None:
         return self.connection.execute(
@@ -1460,6 +2096,7 @@ class Database:
                 """,
                 (row["earliest"], row["latest"], utc_now(), volume_id),
             )
+            self._mark_dirty(volume_id, DIRTY_METADATA)
 
     def update_volume_storage(
         self,
@@ -1482,6 +2119,7 @@ class Database:
                 """,
                 (capacity_bytes, used_bytes, free_bytes, scanned_at, utc_now(), volume_id),
             )
+            self._mark_dirty(volume_id, DIRTY_METADATA)
 
     def start_scan(self, volume_id: int) -> int:
         with self.transaction() as conn:
@@ -1492,6 +2130,7 @@ class Database:
                 """,
                 (volume_id, utc_now()),
             )
+            self._mark_dirty(volume_id, DIRTY_HISTORY)
             return int(cur.lastrowid)
 
     def finish_scan(
@@ -1587,15 +2226,22 @@ class Database:
                 scan_id=scan_id,
                 keep=SCAN_HISTORY_PER_VOLUME_LIMIT,
             )
+            owner = conn.execute(
+                "SELECT volume_id FROM scan_history WHERE id = ?", (scan_id,)
+            ).fetchone()
+            if owner is not None:
+                self._mark_dirty(int(owner["volume_id"]), DIRTY_HISTORY)
 
     def add_scan_error(self, scan_id: int, volume_id: int, path: str, message: str) -> None:
-        self.connection.execute(
-            """
-            INSERT INTO scan_errors (scan_id, volume_id, path, message, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (scan_id, volume_id, path, message, utc_now()),
-        )
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO scan_errors (scan_id, volume_id, path, message, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (scan_id, volume_id, path, message, utc_now()),
+            )
+            self._mark_dirty(volume_id, DIRTY_HISTORY)
 
     def list_scan_errors(self, volume_id: int, limit: int = 200) -> list[sqlite3.Row]:
         return list(
@@ -1650,6 +2296,7 @@ class Database:
             """,
             (volume_id, parent_id, name, relative_path, scanned_at, modified_at),
         )
+        self._mark_dirty(volume_id, DIRTY_CONTENT)
         return int(cur.fetchone()["id"])
 
     def upsert_file(
@@ -1712,6 +2359,7 @@ class Database:
                 normalized_algorithm,
             ),
         )
+        self._mark_dirty(volume_id, DIRTY_CONTENT)
         return int(cur.fetchone()["id"])
 
     def replace_file_media_metadata(
@@ -1755,6 +2403,7 @@ class Database:
                     "message": retained_message,
                     "probed_at": existing["probed_at"],
                 }
+        self._mark_file_dirty(int(file_id))
         self.connection.execute(
             "DELETE FROM file_media_metadata WHERE file_id = ?",
             (int(file_id),),
@@ -1810,6 +2459,7 @@ class Database:
         preview root, the profile ID, and the file's SHA-256.
         """
 
+        self._mark_file_dirty(int(file_id))
         self.connection.execute(
             "DELETE FROM file_preview_status WHERE file_id = ?",
             (int(file_id),),
@@ -2189,6 +2839,7 @@ class Database:
             """,
             (volume_id, scanned_at),
         )
+        self._mark_dirty(volume_id, DIRTY_CONTENT)
 
     def rebuild_folder_statistics(
         self,
@@ -2308,6 +2959,7 @@ class Database:
             )
             if progress_callback:
                 progress_callback(total, total, "Folder statistics updated")
+            self._mark_dirty(volume_id, DIRTY_CONTENT)
             return total
 
     def refresh_volume_counts(self, volume_id: int, scanned_at: str | None = None) -> None:
@@ -2330,6 +2982,7 @@ class Database:
             """,
             (file_count, folder_count, scanned_at, utc_now(), volume_id),
         )
+        self._mark_dirty(volume_id, DIRTY_METADATA)
 
     def get_root_folder(self, volume_id: int) -> sqlite3.Row | None:
         return self.connection.execute(
@@ -2703,40 +3356,43 @@ class Database:
             )
 
 
-def catalogue_path_with_extension(path: str | Path) -> Path:
-    catalogue_path = Path(path).expanduser()
-    if catalogue_path.suffix.lower() == CATALOGUE_EXTENSION:
-        return catalogue_path
-    return Path(f"{catalogue_path}{CATALOGUE_EXTENSION}")
-
-
 def create_catalogue(path: str | Path, *, overwrite: bool = False) -> Database:
+    """Create a new catalogue folder atomically and return it opened."""
+
     target = catalogue_path_with_extension(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and not overwrite:
         raise FileExistsError(f"Catalogue already exists: {target}")
 
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f"{target.name}.",
-        suffix=".creating",
-        dir=target.parent,
-    )
-    os.close(fd)
-    temp_path = Path(temp_name)
-    temp_path.unlink()
-
+    temp_path = target.with_name(f"{target.name}.creating-{os.urandom(4).hex()}")
     db: Database | None = None
     try:
         db = Database(temp_path)
         db.close()
         db = None
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
         os.replace(temp_path, target)
         return open_catalogue(target)
     except Exception:
         if db is not None:
             db.close()
-        temp_path.unlink(missing_ok=True)
+        shutil.rmtree(temp_path, ignore_errors=True)
         raise
+
+
+def locate_catalogue(path: str | Path) -> Path:
+    """Resolve a user-supplied path to the catalogue folder it refers to."""
+
+    candidate = resolve_catalogue_root(Path(path).expanduser())
+    if candidate.is_dir() and (candidate / CATALOGUE_DB_NAME).is_file():
+        return candidate
+    if candidate.is_file():
+        return candidate
+    return catalogue_path_with_extension(candidate)
 
 
 def open_catalogue(
@@ -2744,9 +3400,12 @@ def open_catalogue(
     *,
     busy_timeout_ms: int = INTERACTIVE_BUSY_TIMEOUT_MS,
     check_same_thread: bool = True,
+    progress_callback: ReconcileProgress | None = None,
 ) -> Database:
+    """Open a catalogue folder, validate it and bring the index up to date."""
+
     db = Database(
-        catalogue_path_with_extension(path),
+        locate_catalogue(path),
         initialize=False,
         create=False,
         busy_timeout_ms=busy_timeout_ms,
@@ -2754,6 +3413,7 @@ def open_catalogue(
     )
     try:
         db.validate_catalogue()
+        db.reconcile(progress_callback)
         return db
     except Exception:
         db.close()

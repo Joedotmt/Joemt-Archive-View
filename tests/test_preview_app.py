@@ -45,7 +45,7 @@ from jvvv.app import (  # noqa: E402
     preview_property_rows,
     save_preview_settings,
 )
-from jvvv.catalogue_backup import BackupResult  # noqa: E402
+from jvvv.snapshot_repository import SnapshotManifest, SnapshotResult  # noqa: E402
 from jvvv.database import Database, utc_now  # noqa: E402
 from jvvv.preview_cache import (  # noqa: E402
     PreviewCache,
@@ -2236,29 +2236,53 @@ def test_load_scan_log_lists_preview_results_skipped_preflights_and_failures(cat
 # ---------------------------------------------------------------------------
 # Backup policy (spec §23)
 # ---------------------------------------------------------------------------
-def test_backup_finished_message_states_the_preview_backup_policy(monkeypatch, tmp_path):
+def test_snapshot_finished_message_states_the_preview_backup_policy(monkeypatch, tmp_path):
     infos = []
     monkeypatch.setattr(
         QMessageBox, "information", lambda parent, title, text, *args: infos.append((title, text))
     )
     progress = FakeProgress()
     status_bar = FakeStatusBar()
-    window = SimpleNamespace(scan_progress=progress, statusBar=lambda: status_bar)
-    result = BackupResult(
-        tmp_path / "archive.jvvv", tmp_path / "archive.zip", 1000, 250, 500, 750, 75.0, {"files": 2}
+    refreshed = []
+    window = SimpleNamespace(
+        scan_progress=progress,
+        statusBar=lambda: status_bar,
+        refresh_snapshot_history_dialog=lambda: refreshed.append(True),
+    )
+    manifest = SnapshotManifest(
+        snapshot_id="20260911T120000Z-abcd1234",
+        created_at="2026-09-11T12:00:00.000000+0000",
+        label="nightly",
+        catalogue_uuid="0" * 32,
+        catalogue_name="archive",
+        next_volume_id=3,
+        volumes=(),
+    )
+    result = SnapshotResult(
+        repository_path=tmp_path / "archive.jvvvrepo",
+        manifest=manifest,
+        volumes_written=1,
+        volumes_reused=1,
+        blobs_added=2,
+        bytes_written=4096,
+        raw_bytes_serialised=12000,
+        digests_corrected=(),
+        seconds=1.5,
     )
 
-    MainWindow.on_catalogue_backup_finished(window, result)
+    MainWindow.on_snapshot_finished(window, result)
 
     assert len(infos) == 1
     title, text = infos[0]
-    assert title == "Catalogue Backup Created"
+    assert title == "Snapshot Created"
     assert text.endswith(BACKUP_POLICY_TEXT)
     assert "JVVV catalogue backups do not include offline preview files." in text
     assert "copy the configured preview directory separately" in text
-    assert str(tmp_path / "archive.zip") in text
-    assert progress.format() == "Catalogue backup created"
-    assert status_bar.messages == [("Catalogue backup created.", 5000)]
+    assert str(tmp_path / "archive.jvvvrepo") in text
+    assert "1 written, 1 unchanged and reused" in text
+    assert progress.format() == "Snapshot created"
+    assert status_bar.messages == [("Snapshot created.", 5000)]
+    assert refreshed == [True]
 
 
 # ---------------------------------------------------------------------------

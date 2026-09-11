@@ -191,10 +191,14 @@ class VolumeScanner:
         self.media_metadata_collected = 0
         self._last_hash_progress_bytes = 0
         self._last_hash_progress_time = 0.0
+        # The catalogue is a folder (registry, index and volume files) with a
+        # lock file beside it; none of it is archive content even when the
+        # folder lives on the drive being scanned.
         catalogue_path = os.path.normcase(os.path.abspath(str(self.db.path)))
+        self._catalogue_root_path = catalogue_path
         self._catalogue_storage_paths = {
             catalogue_path,
-            *(f"{catalogue_path}{suffix}" for suffix in ("-wal", "-shm", "-journal")),
+            f"{catalogue_path}.lock",
         }
         # A preview root inside the scanned volume must not be indexed as
         # archive content (each rescan would otherwise preview the previews).
@@ -319,6 +323,8 @@ class VolumeScanner:
                             self.db.add_scan_error(scan_id, volume_id, rel_path, str(exc))
                             continue
                         if self._is_link_or_reparse_point(stat_result) or not stat.S_ISDIR(stat_result.st_mode):
+                            continue
+                        if self._is_catalogue_storage_path(full_path):
                             continue
                         if self._is_preview_storage_path(full_path):
                             self._emit_progress(
@@ -822,7 +828,9 @@ class VolumeScanner:
 
     def _is_catalogue_storage_path(self, path: Path) -> bool:
         normalized = os.path.normcase(os.path.abspath(str(path)))
-        return normalized in self._catalogue_storage_paths
+        if normalized in self._catalogue_storage_paths:
+            return True
+        return normalized.startswith(self._catalogue_root_path + os.sep)
 
     def _is_preview_storage_path(self, path: Path) -> bool:
         if self._preview_root_path is None:

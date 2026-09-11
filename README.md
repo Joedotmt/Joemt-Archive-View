@@ -1,7 +1,7 @@
 # JVVV
 
 JVVV is a small desktop catalogue application inspired by Virtual Volumes View.
-It scans removable drives or folders into user-managed `.jvvv` catalogue files
+It scans removable drives or folders into user-managed `.jvvv` catalogue folders
 so their contents can be browsed and searched later, even while the original
 drive is disconnected.
 
@@ -14,9 +14,14 @@ JVVV. There is no server or cloud component.
 ## Features
 
 - Create, edit, delete, and scan catalogue volumes.
-- Store each catalogue as a single SQLite-backed `.jvvv` file.
-- Create a compact, lossless semantic backup as one versioned `.zip`, and
-  restore it atomically to a normal `.jvvv` catalogue.
+- Store each catalogue as a `.jvvv` folder: a small registry
+  (`catalogue.sqlite`), one self-contained SQLite file per volume
+  (`volumes/<uuid>.jvvvol`), and a rebuildable search/evidence index
+  (`index.sqlite`).
+- Keep a version history in a content-addressed snapshot repository
+  (`.jvvvrepo`): a snapshot after rescanning one drive writes only that drive's
+  data, and any snapshot can be restored as a whole catalogue or one drive at a
+  time.
 - Browse indexed folders and files offline.
 - Search by filename, partial filename, extension, and folder name across all
   volumes, with optional relative-path matching in **Settings > Preferences**.
@@ -79,36 +84,83 @@ python -m jvvv
 ```
 
 JVVV starts without opening a catalogue. Use **File > New Catalogue** to create
-a `.jvvv` file, or **File > Open Catalogue** to open an existing one. The file
-is a valid SQLite database and contains the full catalogue. A catalogue saved
-by the previous schema version (11) is upgraded in place the first time it is
-opened: the upgrade only adds the offline-preview table and columns, runs in one
-transaction, and is rolled back completely if anything fails. Older schema
-versions are refused without being modified. Read-only openings (for example a
-catalogue on read-only media) cannot upgrade, so open such a catalogue normally
-once first.
+a `.jvvv` folder, or **File > Open Catalogue** to open an existing one (pick the
+folder; picking the `catalogue.sqlite` inside it works too).
 
-Use **File > Create Catalogue Backup…** to save the open catalogue as a single
-ZIP. The backup stores irreducible catalogue state (including IDs,
-relationships, paths, hashes, media observations, user metadata, scan history,
-and ID high-water marks) while omitting only data JVVV can reconstruct safely,
-such as ordinary indexes, FTS search structures, canonical folder aggregates,
-volume counts, and current Backup Evidence results. Identical saved hash blobs
-are deduplicated. Noncanonical aggregate values and stale/old-rule evidence are
-retained as lossless exceptions rather than silently changed.
+### Catalogue folder layout
 
-JVVV catalogue backups do not include offline preview files. The per-file
-preview status recorded in the catalogue is backed up, but the preview
-directory itself may be many terabytes; to back up previews, copy the
-configured preview directory separately with your normal file-copy or backup
-software.
+```text
+MyArchive.jvvv/
+    catalogue.sqlite          registry: catalogue UUID and volume id <-> UUID
+    volumes/<uuid>.jvvvol     one self-contained SQLite file per volume
+    index.sqlite              search index, folder aggregates and Backup Evidence
+```
 
-Use **File > Restore Catalogue from Backup…** to validate the manifest,
-component inventory, SHA-256 checksum, SQLite integrity, schema, row counts, and
-relationships before creating anything at the chosen destination. JVVV builds
-and verifies a temporary catalogue, regenerates omitted data, and atomically
-replaces the destination only after the complete restore succeeds. The result
-is a normal `.jvvv` file.
+`catalogue.sqlite` and the volume files are the source of truth. Every change
+to a volume (a scan, a rename, an edited register entry, a new scan-history
+row) is written to that volume's file *before* the index commits, and every
+volume file carries a revision number and the SHA-256 digests of its canonical
+content. `index.sqlite` is a cache: on every open JVVV compares each volume
+file's revision with the one the index last synchronised and re-imports any
+volume that differs. Delete `index.sqlite` and it is rebuilt completely from
+the other two (Backup Evidence has to be analysed again afterwards, because it
+is derived data). A volume file that is missing from `volumes/` is reported
+and the catalogue refuses to open until it is put back or restored from a
+snapshot; a volume file that is not registered is left alone and listed under
+**Catalogue > Catalogue Info**.
+
+### Snapshots: version history and backup
+
+Use **File > Create Snapshot…** to record the catalogue in its snapshot
+repository, a `.jvvvrepo` folder that by default sits next to the catalogue
+(**Snapshot History > Change Location…** moves it). A snapshot is a small JSON
+manifest listing every volume with its metadata row and the digests of two
+blobs: its *content* (folders, files, media details, preview status) and its
+*scan history*. Blobs are stored once, named by the SHA-256 of their canonical
+stream, so a volume whose contents did not change since the last snapshot is
+recorded without being read. Rescanning one drive and taking a snapshot writes
+one new blob of a few megabytes in a couple of seconds; taking twenty snapshots
+of an unchanged archive costs twenty manifests.
+
+**File > Snapshot History…** lists every snapshot with what changed since the
+previous one (drives added, removed, rescanned, or whose details were edited),
+shows the drives inside a snapshot, and offers:
+
+- **Restore Catalogue…** — either replace the open catalogue with the snapshot
+  (it is closed, rebuilt from the snapshot in a temporary folder, swapped into
+  place and reopened) or restore to a new location.
+- **Restore Selected Volume…** — roll one drive back to its state in that
+  snapshot inside the open catalogue; a drive deleted since is registered
+  again.
+- **Delete Snapshot**, **Prune Unreferenced Blobs** (reclaim space held only
+  by deleted snapshots) and **Verify Repository** (re-hash every blob and check
+  that every snapshot is complete).
+
+**File > Restore Catalogue from Snapshot…** works without an open catalogue:
+choose any repository folder, pick a snapshot, and choose where to build the
+restored `.jvvv` folder. Every blob is verified against its digest while the
+volume files are rebuilt; the search index is regenerated; the destination is
+replaced only after the whole restore succeeded. A restored catalogue
+re-snapshots to exactly the same blobs as the original.
+
+Snapshots do not include offline preview files. The per-file preview status
+recorded in the catalogue is included, but the preview directory itself may be
+many terabytes; to back up previews, copy the configured preview directory
+separately with your normal file-copy or backup software.
+
+### Converting a single-file catalogue from an earlier JVVV
+
+Earlier JVVV versions stored the whole catalogue in one `.jvvv` SQLite file.
+Opening such a file (or choosing **File > Convert Legacy Catalogue File…**)
+offers to convert it: the file is checkpointed and copied page-for-page into the
+new folder's `index.sqlite` (so every row, id, search structure and Backup
+Evidence result survives), the registry and one volume file per drive are
+written, each volume file is verified against the index, and only then is the
+original renamed to `Name.jvvv.legacy` and the folder moved into place. Nothing
+is deleted; remove the `.legacy` file yourself once you have opened the
+converted catalogue and taken a first snapshot. Only schema version 12 (the
+last single-file version) is converted; older files must be opened once with the
+previous release first.
 
 ## Usage
 
@@ -311,10 +363,13 @@ pytest
 ```
 
 The automated tests cover database initialization and current-schema validation,
-the in-place upgrade of schema-version-11 catalogues (row-for-row preservation,
-rollback on failure, read-only handling), volume operations, streaming hashes,
+the catalogue folder format (truth-first writes, revision tracking, index
+rebuild, crash recovery of interrupted deletions, external volume-file changes,
+canonical serialisation), the snapshot repository (deduplication, deltas,
+full and single-volume restore, prune, verify, cancellation), the conversion
+of single-file schema-12 catalogues, volume operations, streaming hashes,
 media inspection, scan cancellation/change review and rollback, hash-first backup
-evidence, semantic backup/restore integrity and atomicity, offline browsing,
+evidence, offline browsing,
 search, and the offline preview system (profile IDs, preview-root validation,
 image generation for standard formats, HEIC and synthetic DNG camera RAW files
 including embedded-preview extraction, demosaic fallback and orientation, video
@@ -344,4 +399,4 @@ pyinstaller --name JVVV --onefile --windowed --collect-all PySide6 --collect-dat
 ```
 
 The generated application will be in `dist/`. Catalogue records are saved in
-the `.jvvv` files users create or open.
+the `.jvvv` folders users create or open.
