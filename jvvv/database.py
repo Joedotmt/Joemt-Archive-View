@@ -15,6 +15,7 @@ from .backup_analysis import ANALYSIS_SCHEMA_SQL, ANALYSIS_TABLE_COLUMNS
 from .catalogue_format import (
     CATALOGUE_DB_NAME,
     CATALOGUE_EXTENSION,
+    CATALOGUE_FORMAT_VERSION,
     INDEX_APPLICATION_ID,
     INDEX_DB_NAME,
     CatalogueLayout,
@@ -35,6 +36,7 @@ from .catalogue_format import (
     validate_registry,
     volume_uuid_from_file,
 )
+from .content_hash import DEFAULT_HASH_ALGORITHM, HASH_LENGTHS, content_hash_hex, normalize_hash_algorithm
 from .folder_statistics import calculate_folder_statistics
 from . import volume_store
 from .volume_store import ImportResult, VolumeStoreError
@@ -779,11 +781,74 @@ class Database:
         return registry_meta(self._registry())
 
     def set_catalogue_meta(self, key: str, value: str) -> None:
+        if key == "hash_algorithm":
+            self.set_hash_algorithm(value)
+            return
+        if key == "hash_algorithm_locked":
+            raise CatalogueError("The catalogue hash lock cannot be changed manually.")
         if self.read_only:
             raise CatalogueError("The catalogue is open read-only.")
         registry = self._registry()
         with registry:
             set_registry_meta(registry, key, value)
+
+    @property
+    def hash_algorithm(self) -> str:
+        # Immutable once populated; avoid a registry query on every file write.
+        if not getattr(self, "_hash_algorithm_frozen", False):
+            meta = self.catalogue_meta()
+            self._hash_algorithm = normalize_hash_algorithm(
+                meta.get("hash_algorithm", DEFAULT_HASH_ALGORITHM)
+            )
+            self._hash_algorithm_frozen = (
+                meta.get("hash_algorithm_locked") == "1"
+                or int(meta.get("next_volume_id", "1")) > 1
+            )
+        return self._hash_algorithm
+
+    @property
+    def hash_algorithm_locked(self) -> bool:
+        meta = self.catalogue_meta()
+        return bool(
+            meta.get("hash_algorithm_locked") == "1"
+            or registry_next_volume_id(self._registry()) > 1
+            or self.connection.execute("SELECT 1 FROM volumes LIMIT 1").fetchone()
+        )
+
+    def set_hash_algorithm(self, algorithm: str) -> None:
+        algorithm = normalize_hash_algorithm(algorithm)
+        if self.read_only:
+            raise CatalogueError("The catalogue is open read-only.")
+        registry = self._registry()
+        with registry:
+            registry.execute("BEGIN IMMEDIATE")
+            current = normalize_hash_algorithm(
+                registry_meta(registry).get("hash_algorithm", DEFAULT_HASH_ALGORITHM)
+            )
+            if algorithm != current and self.hash_algorithm_locked:
+                raise CatalogueError(
+                    "The hash algorithm is permanently locked after the first volume is added. "
+                    "Create a new catalogue to use a different algorithm."
+                )
+            set_registry_meta(registry, "hash_algorithm", algorithm)
+            set_registry_meta(registry, "format_version", str(CATALOGUE_FORMAT_VERSION))
+            registry.execute(f"PRAGMA user_version = {CATALOGUE_FORMAT_VERSION}")
+        self._hash_algorithm = algorithm
+
+    def lock_hash_algorithm(self) -> str:
+        if self.read_only:
+            raise CatalogueError("The catalogue is open read-only.")
+        registry = self._registry()
+        with registry:
+            registry.execute("BEGIN IMMEDIATE")
+            algorithm = normalize_hash_algorithm(
+                registry_meta(registry).get("hash_algorithm", DEFAULT_HASH_ALGORITHM)
+            )
+            set_registry_meta(registry, "hash_algorithm", algorithm)
+            set_registry_meta(registry, "hash_algorithm_locked", "1")
+        self._hash_algorithm = algorithm
+        self._hash_algorithm_frozen = True
+        return algorithm
 
     def catalogue_uuid(self) -> str:
         return self.catalogue_meta().get("catalogue_uuid", "")
@@ -1452,6 +1517,20 @@ class Database:
     def _import_entry(self, entry: RegistryEntry) -> ImportResult:
         path = self.layout.volume_file(entry.uuid)
         try:
+            source = volume_store.open_volume_file(path, read_only=True)
+            try:
+                incompatible = source.execute(
+                    "SELECT 1 FROM files WHERE content_hash IS NOT NULL AND "
+                    "(content_hash_algorithm IS NULL OR content_hash_algorithm != ? "
+                    "OR length(content_hash) != ?) LIMIT 1",
+                    (self.hash_algorithm, HASH_LENGTHS[self.hash_algorithm]),
+                ).fetchone()
+                if incompatible:
+                    raise InvalidCatalogueError(
+                        f"{path.name} contains hashes that do not match this catalogue's algorithm."
+                    )
+            finally:
+                source.close()
             return volume_store.import_volume(self.connection, entry.volume_id, entry.uuid, path)
         except (VolumeStoreError, CatalogueLayoutError) as exc:
             raise InvalidCatalogueError(f"{path.name}: {exc}") from exc
@@ -1867,6 +1946,7 @@ class Database:
                 ),
             )
             self._upsert_volume_register(conn, volume_id, register or {})
+            self.lock_hash_algorithm()
             self._created[volume_id] = volume_uuid
             self._mark_dirty(volume_id, DIRTY_CONTENT)
             return volume_id
@@ -2303,8 +2383,10 @@ class Database:
         normalized_algorithm = str(content_hash_algorithm or "").strip().casefold() or None
         if (normalized_hash is None) != (normalized_algorithm is None):
             raise ValueError("A content hash and its algorithm must be stored together.")
-        if normalized_algorithm == "sha256" and len(normalized_hash or b"") != 32:
-            raise ValueError("A SHA-256 content hash must contain exactly 32 bytes.")
+        if normalized_hash is not None:
+            content_hash_hex(normalized_hash, normalized_algorithm)
+            if normalized_algorithm != self.hash_algorithm:
+                raise ValueError("The file hash algorithm must match the catalogue hash algorithm.")
         cur = self.connection.execute(
             """
             INSERT INTO files (
@@ -2420,6 +2502,21 @@ class Database:
             ),
         )
 
+    def folder_media_metadata(self, folder_id: int) -> dict[str, sqlite3.Row]:
+        """Load previous media facts and hashes once before scanning a folder."""
+        return {
+            row["relative_path"]: row
+            for row in self.connection.execute(
+                """
+                SELECT f.relative_path, f.content_hash, f.content_hash_algorithm, m.*
+                FROM files f
+                JOIN file_media_metadata m ON m.file_id = f.id
+                WHERE f.folder_id = ? AND f.missing = 0
+                """,
+                (folder_id,),
+            )
+        }
+
     def get_file_media_metadata(self, file_id: int) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM file_media_metadata WHERE file_id = ?",
@@ -2439,7 +2536,7 @@ class Database:
         ``preview_duration_ms``, ``generated_at``, ``error_stage`` and
         ``error_message``.  Passing ``None`` removes any stored status.  The
         preview file location is never stored: it is derived from the current
-        preview root, the profile ID, and the file's SHA-256.
+        preview root, the profile ID, and the file's content hash.
         """
 
         self._mark_file_dirty(int(file_id))
@@ -2461,8 +2558,7 @@ class Database:
         source_hash = status.get("source_hash")
         if source_hash is not None:
             source_hash = bytes(source_hash)
-            if len(source_hash) != 32:
-                raise ValueError("A preview source hash must be a 32-byte SHA-256 digest.")
+            content_hash_hex(source_hash, self.hash_algorithm)
         self.connection.execute(
             """
             INSERT INTO file_preview_status (
@@ -2551,7 +2647,7 @@ class Database:
         return {str(row["status"]): int(row["total"]) for row in rows}
 
     def prepare_content_hash_lookup(self, extensions: Iterable[str]) -> int:
-        """Build a connection-local index of SHA-256 digests for some extensions.
+        """Build a connection-local index of content hashes for some extensions.
 
         Used by the preview cache manager to decide whether a preview file on
         disk is referenced by this catalogue.  The lookup lives in a temporary
@@ -2585,16 +2681,18 @@ class Database:
                 SELECT content_hash
                 FROM files
                 WHERE content_hash IS NOT NULL
-                  AND content_hash_algorithm = 'sha256'
+                  AND content_hash_algorithm = ?
                   AND lower(extension) IN ({placeholders})
                 """,
-                normalized,
+                [self.hash_algorithm, *normalized],
             )
             return int(
                 cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
             )
 
-    def content_hash_referenced(self, digest: bytes) -> bool:
+    def content_hash_referenced(self, digest: bytes, algorithm: str | None = None) -> bool:
+        if algorithm is not None and normalize_hash_algorithm(algorithm) != self.hash_algorithm:
+            return False
         row = self.connection.execute(
             "SELECT 1 FROM temp.preview_referenced_hashes WHERE digest = ? LIMIT 1",
             (bytes(digest),),

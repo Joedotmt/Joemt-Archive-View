@@ -1,13 +1,14 @@
 """Hash-addressed offline preview store (spec §4, §6, §12, §14, §18, §22).
 
+SHA-256 hash names are plain hex; other algorithms use algorithm-hex.
 Layout under the user-selected preview root::
 
-    <root>/images/<image-profile-id>/<hh>/<sha256hex>.jpg
-    <root>/videos/<video-profile-id>/<hh>/<sha256hex>.mp4
+    <root>/images/<image-profile-id>/<hh>/<hash-name>.jpg
+    <root>/videos/<video-profile-id>/<hh>/<hash-name>.mp4
 
-``hh`` is the first two hex characters of the source file's SHA-256, so no
+``hh`` is the first two hex characters of the source file's content hash, so no
 single directory accumulates a huge number of files.  Paths are fully
-deterministic from (root, media kind, profile ID, SHA-256): two catalogues
+deterministic from (root, media kind, profile ID, algorithm, content hash): two catalogues
 that share a root share previews, and previews copied between disks are
 recognised immediately (spec §25, §47).
 
@@ -40,6 +41,7 @@ from jvvv.preview_config import (
     preview_extension_for,
 )
 from jvvv.utils import format_size
+from .content_hash import DEFAULT_HASH_ALGORITHM, HASH_LENGTHS, content_hash_hex, normalize_hash_algorithm
 
 
 CancelCallback = Callable[[], bool]
@@ -95,14 +97,8 @@ ROOT_CHECK_NAME = "jvvv-preview-root-check"
 PROGRESS_INTERVAL = 1000
 
 _KIND_DIRECTORIES: dict[str, str] = {"image": "images", "video": "videos"}
-_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _PREFIX_DIRECTORY_RE = re.compile(r"^[0-9a-f]{2}$")
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
-_PREVIEW_NAME_RE = re.compile(
-    r"^([0-9a-f]{64})\.("
-    + "|".join(sorted(re.escape(ext) for ext in set(PREVIEW_EXTENSIONS.values())))
-    + r")$"
-)
 _DISK_FULL_ERRNOS = frozenset(
     code for code in (errno.ENOSPC, getattr(errno, "EDQUOT", None)) if code is not None
 )
@@ -202,29 +198,17 @@ def os_error_detail(exc: BaseException) -> str:
     return text or type(exc).__name__
 
 
-def sha256_hex(digest: bytes | str) -> str:
-    """Normalise a SHA-256 given as 32 raw bytes or 64 hex characters to lowercase hex."""
+def hash_hex(digest: bytes | str, algorithm: str = DEFAULT_HASH_ALGORITHM) -> str:
+    """Validate a content digest and report configuration errors consistently."""
+    try:
+        return content_hash_hex(digest, algorithm)
+    except ValueError as exc:
+        raise PreviewError(STAGE_CONFIGURATION, str(exc)) from exc
 
-    if isinstance(digest, (bytes, bytearray, memoryview)):
-        raw = bytes(digest)
-        if len(raw) != 32:
-            raise PreviewError(
-                STAGE_CONFIGURATION,
-                f"A SHA-256 digest must be 32 bytes long, not {len(raw)}.",
-            )
-        return raw.hex()
-    if isinstance(digest, str):
-        if _SHA256_HEX_RE.fullmatch(digest):
-            return digest.lower()
-        raise PreviewError(
-            STAGE_CONFIGURATION,
-            "A SHA-256 hash must be exactly 64 hexadecimal characters.",
-            detail=repr(digest) if len(digest) <= 80 else f"{len(digest)} characters",
-        )
-    raise PreviewError(
-        STAGE_CONFIGURATION,
-        f"A SHA-256 hash must be bytes or text, not {type(digest).__name__}.",
-    )
+
+def sha256_hex(digest: bytes | str) -> str:
+    """Compatibility wrapper for existing SHA-256 preview callers."""
+    return hash_hex(digest)
 
 
 def _raise_if_cancelled(cancel_callback: CancelCallback | None) -> None:
@@ -307,6 +291,7 @@ class PreviewFailure:
     stage: str
     message: str
     detail: str = ""
+    hash_algorithm: str = DEFAULT_HASH_ALGORITHM
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -320,6 +305,7 @@ class PreviewFailure:
             volume_label=_text(values.get("volume_label")),
             media_kind=_text(values.get("media_kind")),
             sha256=_optional_text(values.get("sha256")),
+            hash_algorithm=normalize_hash_algorithm(str(values.get("hash_algorithm") or DEFAULT_HASH_ALGORITHM)),
             preview_path=_optional_text(values.get("preview_path")),
             profile_id=_text(values.get("profile_id")),
             stage=_text(values.get("stage")),
@@ -346,6 +332,7 @@ class PreviewEntry:
     profile_id: str
     sha256: str
     size_bytes: int
+    hash_algorithm: str = DEFAULT_HASH_ALGORITHM
 
 
 @dataclass(frozen=True)
@@ -389,7 +376,7 @@ def ensure_source_snapshot(
 
     The scanner hashes a file, stores its record, probes its media details and
     only then asks for a preview.  A file replaced inside that window must not
-    be previewed under the old SHA-256 (spec §9, §32), so generators compare
+    be previewed under the old content hash (spec §9, §32), so generators compare
     their own fresh ``lstat`` against the snapshot taken when the hash was
     computed before they read a single byte.
     """
@@ -419,8 +406,8 @@ STALE_TEMPORARY_AGE_SECONDS = 24 * 60 * 60
 class PreviewCache:
     """Hash-addressed preview store. Root layout (spec §4, §6)::
 
-        <root>/images/<image-profile-id>/<hh>/<sha256hex>.jpg
-        <root>/videos/<video-profile-id>/<hh>/<sha256hex>.mp4  (hh = first two hex chars)
+        <root>/images/<image-profile-id>/<hh>/<hash-name>.jpg
+        <root>/videos/<video-profile-id>/<hh>/<hash-name>.mp4  (hh = first two hex chars)
     """
 
     def __init__(
@@ -428,11 +415,14 @@ class PreviewCache:
         root: str | os.PathLike[str],
         image_profile: ImagePreviewProfile,
         video_profile: VideoPreviewProfile,
+        *,
+        hash_algorithm: str = DEFAULT_HASH_ALGORITHM,
     ) -> None:
         # Keep the text so an empty selection can be reported; never resolve()
         # the path, UNC and mapped-drive roots must stay exactly as given.
         self.root_text = os.fspath(root)
         self.root = Path(self.root_text).expanduser()
+        self.hash_algorithm = normalize_hash_algorithm(hash_algorithm)
         self.image_profile = image_profile
         self.video_profile = video_profile
 
@@ -469,8 +459,11 @@ class PreviewCache:
         profile_id: str | None = None,
     ) -> Path:
         directory = self.profile_directory(media_kind, profile_id)
-        digest = sha256_hex(sha256)
-        return directory / digest[:2] / f"{digest}.{_extension_for(media_kind)}"
+        digest = hash_hex(sha256, self.hash_algorithm)
+        # Preserve all legacy SHA-256 paths. Other algorithms have explicit
+        # prefixes so equal hex strings in a shared store can never alias.
+        prefix = "" if self.hash_algorithm == DEFAULT_HASH_ALGORITHM else self.hash_algorithm + "-"
+        return directory / digest[:2] / f"{prefix}{digest}.{_extension_for(media_kind)}"
 
     def temporary_path(self, final_path: Path) -> Path:
         final_path = Path(final_path)
@@ -482,10 +475,22 @@ class PreviewCache:
 
     @staticmethod
     def parse_preview_name(name: str) -> tuple[str, str] | None:
-        match = _PREVIEW_NAME_RE.fullmatch(name)
-        if match is None:
+        parsed = PreviewCache.parse_content_preview_name(name)
+        return (parsed[1], parsed[2]) if parsed else None
+
+    @staticmethod
+    def parse_content_preview_name(name: str) -> tuple[str, str, str] | None:
+        stem, dot, extension = name.rpartition(".")
+        if not dot or extension not in {"jpg", "mp4"}:
             return None
-        return match.group(1), match.group(2)
+        algorithm = DEFAULT_HASH_ALGORITHM
+        if "-" in stem:
+            algorithm, stem = stem.split("-", 1)
+            if algorithm == DEFAULT_HASH_ALGORITHM:
+                return None  # SHA-256 retains its unprefixed legacy layout.
+        if algorithm not in HASH_LENGTHS or not re.fullmatch(r"[0-9a-f]{%d}" % (HASH_LENGTHS[algorithm]*2), stem):
+            return None
+        return algorithm, stem, extension
 
     # -- writing --------------------------------------------------------------
     def ensure_parent(self, final_path: Path) -> None:
@@ -671,6 +676,7 @@ class PreviewCache:
                     media_kind=media_kind,
                     profile_id=current_id,
                     sha256=parsed,
+                    hash_algorithm=self.parse_content_preview_name(entry.name)[0],
                     size_bytes=size,
                 )
 

@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Iterator, NamedTuple, Sequence, TYPE
 
 if TYPE_CHECKING:
     from .database import Database
+from .content_hash import HASH_LABELS, HASH_LENGTHS
 
 
 RULES_VERSION = 4
@@ -30,9 +31,8 @@ MAX_STORED_OTHER_VOLUME_IDS = 64
 # and drives holding strong evidence first. Weak-only drives are listed only
 # when no drive holds strong evidence, and then only the best one.
 MAX_STORED_FOLDER_DRIVE_MATCHES = 32
-CONTENT_HASH_LENGTHS = {
-    "sha256": 32,
-}
+CONTENT_HASH_LENGTHS = HASH_LENGTHS
+_CONTENT_HASH_ALIASES = {key.replace("_", ""): key for key in CONTENT_HASH_LENGTHS}
 IGNORED_SYSTEM_SCAN_ROOTS = {
     "$recycle.bin",
     "recycler",
@@ -62,7 +62,7 @@ FOLDER_EVIDENCE_UNKNOWN_SCAN = (
 )
 FOLDER_EVIDENCE_TRUSTED_HASHED = (
     "A complete hash-aware structure matches on another drive: exact "
-    "SHA-256 content hashes, descendant filenames, and the content-bearing "
+    "content hashes, descendant filenames, and the content-bearing "
     "folder layout all match. The folder name also matches. Known "
     "operating-system metadata is excluded."
 )
@@ -112,7 +112,7 @@ FOLDER_EVIDENCE_SINGLE = (
     "No descendant metadata match was found on another drive in this catalogue."
 )
 
-FILE_EVIDENCE_HASH_VERIFIED = "An exact SHA-256 content hash matches on another drive."
+FILE_EVIDENCE_HASH_VERIFIED = "An exact content hash matches on another drive."
 FILE_EVIDENCE_HASH_VERIFIED_EXTRA_DRIVES = (
     " Additional drives have metadata-only evidence because a "
     "comparable saved hash was unavailable there."
@@ -128,7 +128,7 @@ FILE_EVIDENCE_NAME_SIZE_ONLY = (
     "time differs or is missing, so it is a lead rather than a confirmed copy."
 )
 FILE_EVIDENCE_HASH_CONFLICT = (
-    "Comparable SHA-256 content hashes differ even though the filename "
+    "Comparable content hashes differ even though the filename "
     "and size metadata match. The records are not treated as copies."
 )
 FILE_EVIDENCE_COMPETING = (
@@ -150,7 +150,7 @@ ITEM_EVIDENCE_MISSING = "This catalogue record is marked missing."
 # strength of evidence. One-to-one pairing is kept only for coverage arithmetic.
 FOLDER_EVIDENCE_FULL_MATCH_HASHED = (
     "The whole folder matches on another drive: same folder name, same layout, "
-    "and every file's name, size and saved SHA-256 hash."
+    "and every file's name, size and saved content hash."
 )
 FOLDER_EVIDENCE_FULL_MATCH_PARTLY_HASHED = (
     "The whole folder matches on another drive by folder name, layout, file names "
@@ -283,6 +283,8 @@ def folder_reason_key(evidence_text: str | None) -> str:
     text = str(evidence_text or "").strip()
     if not text:
         return ""
+    # Existing saved analyses used SHA-256-specific prose.
+    text = text.replace("SHA-256 content hash", "content hash").replace("saved SHA-256 hash", "saved content hash")
     text, _ = _strip_known_suffixes(text, _FOLDER_SUFFIXES)
     if text.startswith(FOLDER_EVIDENCE_STRUCTURE_REPEATS_PREFIX):
         return "structure_repeats"
@@ -301,6 +303,7 @@ def file_reason_key(evidence_text: str | None) -> str:
     text = str(evidence_text or "").strip()
     if not text:
         return ""
+    text = text.replace("SHA-256 content hash", "content hash")
     text, _ = _strip_known_suffixes(text, _FILE_NOTES)
     if text.startswith(FILE_EVIDENCE_HASH_VERIFIED):
         return "hash_verified"
@@ -936,6 +939,7 @@ def _normalized_content_hash(
     so legacy and partially hashed catalogues retain the metadata fallback.
     """
     normalized_algorithm = re.sub(r"[^a-z0-9]", "", str(algorithm or "").casefold())
+    normalized_algorithm = _CONTENT_HASH_ALIASES.get(normalized_algorithm, normalized_algorithm)
     expected_length = CONTENT_HASH_LENGTHS.get(normalized_algorithm)
     if expected_length is None or digest is None:
         return None
@@ -3710,7 +3714,7 @@ class BackupAnalysisEngine:
             MatchLocation(
                 volume_id,
                 "likely",
-                "Exact SHA-256 content hash match from the saved scan.",
+                "Exact content hash match from the saved scan.",
                 is_stale=status.is_stale,
                 analysed_at=status.analysed_at,
             )
@@ -3978,7 +3982,7 @@ class BackupAnalysisEngine:
                 if error["scan_id"] is not None and _is_ignored_system_scan_path(
                     error["path"]
                 ) and not str(error["message"] or "").startswith(
-                    "SHA-256 hash unavailable:"
+                    tuple(f"{label} hash unavailable:" for label in HASH_LABELS.values())
                 ):
                     scan_id = int(error["scan_id"])
                     ignored_by_scan[scan_id] = ignored_by_scan.get(scan_id, 0) + 1

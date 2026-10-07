@@ -48,7 +48,7 @@ from .preview_cache import (
     PreviewResult,
     classify_os_error,
     os_error_detail,
-    sha256_hex,
+    hash_hex,
 )
 from .preview_config import (
     PREVIEW_MEDIA_KINDS,
@@ -88,6 +88,8 @@ MODE_DISABLED = "disabled"
 MODE_ENABLED = "enabled"
 MODE_SKIPPED_PREFLIGHT = "skipped-preflight"
 
+from .content_hash import DEFAULT_HASH_ALGORITHM
+
 STAGE_STORAGE_UNAVAILABLE = "storage-unavailable"
 SCAN_OUTCOME_COMPLETED_WITH_WARNINGS = "completed_with_warnings"
 
@@ -106,10 +108,11 @@ class PreviewStatistics:
     bytes_written: int = 0
     storage_skipped: int = 0
     corrupt_replaced: int = 0
-    hash_unavailable: int = 0  # media files skipped because no SHA-256 was recorded (spec §9)
+    hash_unavailable: int = 0  # media files skipped because no content hash was recorded (spec §9)
     root: str = ""  # the preview root this scan wrote to (spec §15)
     storage_unavailable_reason: str | None = None
     message: str = ""
+    interrupted: bool = False
     failures: list[PreviewFailure] = field(default_factory=list)
 
     @property
@@ -130,7 +133,7 @@ class PreviewStatistics:
 
     @property
     def has_problems(self) -> bool:
-        return bool(self.total_failed or self.storage_skipped or self.storage_unavailable_reason)
+        return bool(self.total_failed or self.storage_skipped or self.storage_unavailable_reason or self.interrupted)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +151,7 @@ class PreviewStatistics:
             "root": self.root,
             "storage_unavailable_reason": self.storage_unavailable_reason,
             "message": self.message,
+            "interrupted": self.interrupted,
             "failures": [failure.as_dict() for failure in self.failures],
         }
 
@@ -175,6 +179,7 @@ class PreviewStatistics:
             root=str(data.get("root") or ""),
             storage_unavailable_reason=str(reason) if reason else None,
             message=str(data.get("message") or ""),
+            interrupted=bool(data.get("interrupted", False)),
             failures=failures,
         )
 
@@ -228,7 +233,7 @@ class PreviewStatistics:
             lines.extend(
                 [
                     "",
-                    "Images/videos not attempted because no SHA-256 could be recorded:",
+                    "Images/videos not attempted because no content hash could be recorded:",
                     f"  {self.hash_unavailable:,}",
                 ]
             )
@@ -242,6 +247,8 @@ class PreviewStatistics:
             )
             if self.storage_unavailable_reason:
                 lines.append(f"  Reason: {self.storage_unavailable_reason}")
+        if self.interrupted:
+            lines.extend(["", self.message or "Offline preview generation was interrupted."])
         return "\n".join(lines)
 
 
@@ -264,6 +271,7 @@ def scan_outcome(status: str, statistics: PreviewStatistics | Mapping[str, Any] 
             or int(statistics.get("video_failed") or 0)
             or int(statistics.get("storage_skipped") or 0)
             or statistics.get("storage_unavailable_reason")
+            or statistics.get("interrupted")
         )
     return SCAN_OUTCOME_COMPLETED_WITH_WARNINGS if problems else status
 
@@ -309,9 +317,11 @@ def preview_report_message(statistics: PreviewStatistics) -> str:
     if statistics.hash_unavailable:
         count = statistics.hash_unavailable
         parts.append(
-            f"{count:,} image/video file{'s' if count != 1 else ''} had no SHA-256 recorded, "
+            f"{count:,} image/video file{'s' if count != 1 else ''} had no content hash recorded, "
             "so no preview was attempted."
         )
+    if statistics.interrupted:
+        parts.append(statistics.message or "Offline preview generation was interrupted.")
     return " ".join(parts)
 
 
@@ -635,15 +645,18 @@ def preflight_preview_configuration(settings: PreviewSettings) -> PreviewValidat
 # --------------------------------------------------------------------------
 
 
-def status_record_for(result: PreviewResult, content_hash: bytes | None) -> dict[str, Any] | None:
+def status_record_for(
+    result: PreviewResult, content_hash: bytes | None,
+    hash_algorithm: str = DEFAULT_HASH_ALGORITHM,
+) -> dict[str, Any] | None:
     """Translate a :class:`PreviewResult` into ``file_preview_status`` values."""
 
     source_hash: bytes | None = None
     if content_hash is not None:
         try:
-            source_hash = bytes.fromhex(sha256_hex(content_hash))
+            source_hash = bytes.fromhex(hash_hex(content_hash, hash_algorithm))
         except PreviewError:
-            # Only a real 32-byte SHA-256 may be stored; anything else is left
+            # Only a correctly sized digest may be stored; anything else is left
             # blank rather than making the catalogue write fail.
             source_hash = None
     if result.status in {PREVIEW_GENERATED, PREVIEW_REUSED}:
@@ -706,7 +719,7 @@ def hash_unavailable_status_record(media_kind: str, profile_id: str) -> dict[str
         "source_hash": None,
         "error_stage": STAGE_HASH_UNAVAILABLE,
         "error_message": (
-            "No SHA-256 hash could be recorded for this file, so no preview was attempted."
+            "No content hash could be recorded for this file, so no preview was attempted."
         ),
     }
 
@@ -736,7 +749,9 @@ class PreviewFileInfo:
     message: str
 
 
-def preview_cache_for(settings: PreviewSettings) -> PreviewCache | None:
+def preview_cache_for(
+    settings: PreviewSettings, hash_algorithm: str = DEFAULT_HASH_ALGORITHM,
+) -> PreviewCache | None:
     root = settings.root_path
     if root is None:
         return None
@@ -745,7 +760,7 @@ def preview_cache_for(settings: PreviewSettings) -> PreviewCache | None:
         settings.video.validate()
     except PreviewConfigError:
         return None
-    return PreviewCache(root, settings.image, settings.video)
+    return PreviewCache(root, settings.image, settings.video, hash_algorithm=hash_algorithm)
 
 
 @lru_cache(maxsize=512)
@@ -782,6 +797,7 @@ def inspect_preview_file(
     settings: PreviewSettings,
     media_kind: str,
     content_hash: bytes | str | None,
+    hash_algorithm: str = DEFAULT_HASH_ALGORITHM,
 ) -> PreviewFileInfo | None:
     """Locate and validate the preview for a file without any generator.
 
@@ -791,11 +807,11 @@ def inspect_preview_file(
 
     if media_kind not in PREVIEW_MEDIA_KINDS or content_hash is None:
         return None
-    cache = preview_cache_for(settings)
+    cache = preview_cache_for(settings, hash_algorithm)
     if cache is None:
         return None
     try:
-        digest = sha256_hex(content_hash)
+        digest = hash_hex(content_hash, hash_algorithm)
         path = cache.preview_path(media_kind, digest)
         profile_id = cache.profile_id(media_kind)
     except PreviewError:
@@ -857,6 +873,7 @@ class PreviewService:
         image_generator: Any | None = None,
         video_generator: Any | None = None,
         log_callback: LogCallback | None = None,
+        hash_algorithm: str = DEFAULT_HASH_ALGORITHM,
     ) -> None:
         settings.validate(require_root=True)
         self.settings = settings
@@ -864,6 +881,7 @@ class PreviewService:
             settings.root_path or Path(settings.root_directory),
             settings.image,
             settings.video,
+            hash_algorithm=hash_algorithm,
         )
         self.ffmpeg_path = ffmpeg_path or find_ffmpeg(settings.ffmpeg_path_or_none)
         self.image_generator = image_generator or ImagePreviewGenerator(self.cache)
@@ -911,6 +929,7 @@ class PreviewService:
             volume_label=volume_label or "",
             media_kind=media_kind,
             sha256=digest,
+            hash_algorithm=self.cache.hash_algorithm,
             preview_path=str(destination) if destination is not None else None,
             profile_id=profile_id,
             stage=error.stage,
@@ -1009,7 +1028,7 @@ class PreviewService:
             )
         profile_id = self.cache.profile_id(media_kind)
         try:
-            digest = sha256_hex(content_hash)
+            digest = hash_hex(content_hash, self.cache.hash_algorithm)
         except PreviewError as exc:
             return self._record_failure(
                 exc,

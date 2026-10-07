@@ -318,6 +318,7 @@ def make_service(
 
 def make_scanner(db: Database, service: PreviewService | None = None, **kwargs) -> VolumeScanner:
     kwargs.setdefault("media_extractor", StubMediaExtractor())
+    kwargs.setdefault("progress_interval", 0)
     return VolumeScanner(db, preview_service=service, **kwargs)
 
 
@@ -1023,7 +1024,7 @@ def test_hash_unavailable_records_missing_status_without_calling_generators(
         assert row["source_hash"] is None
         assert row["media_kind"] == kind
         assert row["profile_id"] == cache.profile_id(kind)
-        assert "SHA-256" in row["error_message"]
+        assert "content hash" in row["error_message"]
     assert preview_files_under(cache.root) == []
     assert temporaries_under(cache.root) == []
 
@@ -1031,7 +1032,7 @@ def test_hash_unavailable_records_missing_status_without_calling_generators(
 # ---------------------------------------------------------------------------
 # Cancellation
 # ---------------------------------------------------------------------------
-def test_cancellation_inside_a_generator_rolls_back_and_leaves_no_temporaries(
+def test_cancellation_inside_a_generator_keeps_catalogue_and_leaves_no_temporaries(
     catalogue, source, tmp_path
 ):
     write_test_image(source / "Photos" / "zeta.png", 320, 240, "png")
@@ -1064,18 +1065,20 @@ def test_cancellation_inside_a_generator_rolls_back_and_leaves_no_temporaries(
         cancel_callback=lambda: cancel_state["cancelled"],
     ).scan(volume_id)
 
-    assert result.status == "cancelled"
-    assert result.message == "Scan cancelled."
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.indexed
+    assert "preview generation was cancelled" in result.message
     assert [path.name for path in generator.calls] == ["alpha.png"]
     assert temporaries_under(cache.root) == []
     assert preview_files_under(cache.root) == []
-    assert count_rows(catalogue, "files") == files_before
-    assert set(file_rows(catalogue)) == {"Docs/notes.txt", "Photos/zeta.png"}
+    assert count_rows(catalogue, "files") == files_before + 2
+    assert set(file_rows(catalogue)) == {"Docs/notes.txt", "Photos/zeta.png", "Photos/alpha.png", "Photos/beta.png"}
     assert count_rows(catalogue, "file_preview_status") == 0
     assert result.preview["image_generated"] == 0
     assert result.preview["image_failed"] == 0
     history = catalogue.list_scan_history(volume_id)[0]
-    assert history["status"] == "cancelled"
+    assert history["status"] == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert "preview generation was cancelled" in history["message"]
     assert history["preview_mode"] == "enabled"
     assert history["image_previews_generated"] == 0
 
@@ -1111,8 +1114,8 @@ def test_cancellation_during_real_image_encoding_discards_the_temporary_file(
         cancel_callback=should_cancel,
     ).scan(volume_id)
 
-    assert result.status == "cancelled"
-    assert result.message == "Scan cancelled."
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert "preview generation was cancelled" in result.message
     assert state["checks"] == 4
     assert [path.name for path in service.image_generator.calls] == ["alpha.png"]
     assert any(message == "Creating image preview · Photos/alpha.png" for message in messages)
@@ -1120,12 +1123,12 @@ def test_cancellation_during_real_image_encoding_discards_the_temporary_file(
     assert temporaries_under(cache.root) == []
     assert not cache.preview_path("image", alpha_hash).exists()
     assert preview_files_under(cache.root) == []
-    assert count_rows(catalogue, "files") == 0
+    assert count_rows(catalogue, "files") == 2
     assert count_rows(catalogue, "file_preview_status") == 0
     assert result.preview["image_generated"] == 0
     assert result.preview["image_failed"] == 0
     assert result.preview["failures"] == []
-    assert catalogue.list_scan_history(volume_id)[0]["status"] == "cancelled"
+    assert catalogue.list_scan_history(volume_id)[0]["status"] == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
 
 
 # ---------------------------------------------------------------------------
@@ -1160,9 +1163,9 @@ def test_progress_messages_name_the_preview_phase_and_relay_encode_progress(
     assert messages.index("Creating video preview · Videos/clip.mp4") < messages.index(
         "Creating video preview · Videos/clip.mp4 · 50% of preview encode"
     )
-    # Counters accompany every preview message: the file is not yet counted as seen.
+    # Every file has already been indexed before preview generation begins.
     video_events = [event for event in events if event[2].startswith("Creating video preview")]
-    assert all(files == 3 for files, _folders, _message in video_events)
+    assert all(files == result.files_seen for files, _folders, _message in video_events)
 
 
 # ---------------------------------------------------------------------------
@@ -1191,9 +1194,9 @@ def test_discarded_rescan_keeps_previous_preview_status_rows(catalogue, source, 
     assert result.status == "discarded"
     assert len(reviews) == 1
     assert reviews[0].files_changed == 1
-    assert result.preview["image_generated"] == 1
-    assert result.preview["image_reused"] == 1
-    assert result.preview["video_reused"] == 1
+    assert result.preview["image_generated"] == 0
+    assert result.preview["image_reused"] == 0
+    assert result.preview["video_reused"] == 0
     after = preview_rows(catalogue)
     assert set(after) == set(before)
     for relative_path, row in before.items():
@@ -1203,9 +1206,8 @@ def test_discarded_rescan_keeps_previous_preview_status_rows(catalogue, source, 
         assert after[relative_path]["generated_at"] == row["generated_at"]
     assert after["Photos/alpha.png"]["source_hash"] == old_hash
     assert file_rows(catalogue)["Photos/alpha.png"]["content_hash"] == old_hash
-    # The preview for the new content was published before the review; it may
-    # legitimately stay on disk, and the old preview is untouched.
-    assert cache.preview_path("image", new_hash).is_file()
+    # Declining the update does no preview work; the old preview is untouched.
+    assert not cache.preview_path("image", new_hash).exists()
     assert cache.preview_path("image", old_hash).is_file()
     assert temporaries_under(cache.root) == []
     history = catalogue.list_scan_history(volume_id)[0]
@@ -1456,9 +1458,9 @@ def test_media_files_without_a_hash_are_counted_in_the_preview_report(catalogue,
     assert result.preview["hash_unavailable"] == 2
     assert service.statistics.hash_unavailable == 2
     summary = service.statistics.summary_text(service.statistics.root)
-    assert "no SHA-256 could be recorded" in summary and "\n  2" in summary
+    assert "no content hash could be recorded" in summary and "\n  2" in summary
     history = catalogue.list_scan_history(volume_id)[0]
-    assert "2 image/video files had no SHA-256 recorded, so no preview was attempted." in history["message"]
+    assert "2 image/video files had no content hash recorded, so no preview was attempted." in history["message"]
 
 
 def test_a_preview_root_inside_the_scanned_volume_is_not_catalogued(catalogue, source, tmp_path):
@@ -1490,3 +1492,76 @@ def test_a_preview_root_inside_the_scanned_volume_is_not_catalogued(catalogue, s
     assert set(file_rows(catalogue)) == {"Photos/alpha.png"}, "the preview store must not be indexed"
     assert count_rows(catalogue, "files") == 1
     assert len(preview_files_under(cache.root)) == 1, "no preview of a preview"
+
+
+def test_catalogue_is_committed_and_readable_before_previews(catalogue, source, tmp_path):
+    import sqlite3
+
+    make_media_tree(source)
+    service, _ = make_service(tmp_path)
+    volume_id = catalogue.create_volume("Drive", str(source))
+    ready = []
+    index_path = catalogue.connection.execute("PRAGMA database_list").fetchone()[2]
+
+    def assert_visible():
+        with sqlite3.connect(index_path) as reader:
+            assert reader.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 4
+            assert reader.execute("SELECT status FROM scan_history ORDER BY id DESC LIMIT 1").fetchone()[0] == "completed"
+
+    def on_ready():
+        assert not catalogue.connection.in_transaction
+        assert service.image_generator.calls == []
+        assert service.video_generator.calls == []
+        assert_visible()
+        ready.append(True)
+
+    original_generate = service.image_generator.generate
+
+    def generate(*args, **kwargs):
+        assert ready == [True]
+        assert_visible()
+        return original_generate(*args, **kwargs)
+
+    service.image_generator.generate = generate
+    result = make_scanner(catalogue, service, catalogue_ready_callback=on_ready).scan(volume_id)
+    assert result.status == "completed"
+    assert ready == [True]
+    assert result.preview["image_generated"] == 2
+
+
+def test_cancelling_preview_phase_keeps_already_finished_previews(catalogue, source, tmp_path):
+    write_test_image(source / "alpha.png", 320, 240, "png")
+    write_test_image(source / "beta.png", 640, 480, "png")
+    service, cache = make_service(tmp_path)
+    volume_id = catalogue.create_volume("Drive", str(source))
+    result = make_scanner(
+        catalogue, service,
+        cancel_callback=lambda: service.statistics.image_generated >= 1,
+    ).scan(volume_id)
+    assert result.indexed
+    assert result.status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
+    assert result.preview["interrupted"]
+    assert result.preview["image_generated"] == 1
+    assert count_rows(catalogue, "files") == 2
+    assert count_rows(catalogue, "file_preview_status") == 1
+    assert preview_rows(catalogue)["alpha.png"]["status"] == "available"
+    assert len(preview_files_under(cache.root)) == 1
+    assert temporaries_under(cache.root) == []
+
+
+def test_source_changed_after_catalogue_commit_is_not_previewed(catalogue, source, tmp_path):
+    from jvvv.preview_cache import STAGE_SOURCE_CHANGED
+
+    path = source / "alpha.png"
+    write_test_image(path, 320, 240, "png")
+    original_hash = sha256_of(path)
+    service, cache = make_service(tmp_path)
+    volume_id = catalogue.create_volume("Drive", str(source))
+    result = make_scanner(
+        catalogue, service,
+        catalogue_ready_callback=lambda: write_test_image(path, 640, 480, "png"),
+    ).scan(volume_id)
+    assert result.indexed
+    assert result.preview["image_failed"] == 1
+    assert preview_rows(catalogue)["alpha.png"]["error_stage"] == STAGE_SOURCE_CHANGED
+    assert not cache.preview_path("image", original_hash).exists()

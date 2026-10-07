@@ -1062,7 +1062,7 @@ def test_preview_unavailable_reason_explains_each_situation(tmp_path):
 
     assert MainWindow.preview_unavailable_reason(
         reason_window(enabled), "image", None, {"id": 1, "content_hash": None}
-    ) == "No SHA-256 hash is recorded for this file, so no preview path can be derived."
+    ) == "No content hash is recorded for this file, so no preview path can be derived."
 
     assert MainWindow.preview_unavailable_reason(
         reason_window(enabled), "image", None, hashed_row
@@ -1450,7 +1450,7 @@ def test_preview_property_rows_when_nothing_was_stored_depend_on_the_enabled_fla
     )
 
     unhashed = dict(preview_property_rows({"content_hash": None}, settings, "image"))
-    assert unhashed["Offline preview"].startswith("Not available — no SHA-256 hash is recorded")
+    assert unhashed["Offline preview"].startswith("Not available — no content hash is recorded")
     assert "Preview stored at" not in unhashed
 
 
@@ -1657,7 +1657,7 @@ def test_search_selection_disables_the_preview_button_with_a_reason_when_missing
     MainWindow.on_search_selection_changed(window)
     assert not button.isEnabled()
     assert button.toolTip() == (
-        "No SHA-256 hash is recorded for this file, so no preview path can be derived."
+        "No content hash is recorded for this file, so no preview path can be derived."
     )
 
 
@@ -2079,6 +2079,8 @@ def fake_scan_result(preview: dict) -> SimpleNamespace:
         hash_errors=0,
         media_files=2,
         media_metadata_collected=2,
+        media_metadata_reused=0,
+        phase_seconds={},
         preview=preview,
     )
 
@@ -2797,3 +2799,69 @@ def test_start_delete_temporaries_runs_the_worker_and_reports_the_outcome(tmp_pa
     window._preview_store_ready = lambda: False
     MainWindow.start_delete_temporaries(window)
     assert len(started) == 1, "nothing starts while another store operation or scan is running"
+
+
+def test_catalogue_ready_refreshes_browser_and_changes_cancel_action(main_window, monkeypatch):
+    window = main_window
+    refreshed = []
+    monkeypatch.setattr(window, "refresh_after_catalogue_write", lambda: refreshed.append(True))
+    window.on_scan_catalogue_ready()
+    assert refreshed == [True]
+    assert window.scan_preview_phase
+    assert window.stop_scan_button.text() == "Cancel Previews"
+    assert "kept" in window.stop_scan_button.toolTip()
+    assert "ready to browse" in window.statusBar().currentMessage()
+    window.clear_scan_worker()
+    assert not window.scan_preview_phase
+    assert window.stop_scan_button.text() == "Cancel Scan"
+
+
+def test_interrupted_preview_summary_preserves_successful_indexing(main_window, monkeypatch, tmp_path):
+    window = main_window
+    boxes = MessageBoxCapture(monkeypatch)
+    monkeypatch.setattr(window, "refresh_after_catalogue_write", lambda: None)
+    statistics = PreviewStatistics(
+        mode=MODE_ENABLED, root=str(tmp_path), interrupted=True,
+        image_generated=1, message="Catalogue updated. Offline previews cancelled.",
+    )
+    restored = PreviewStatistics.from_dict(statistics.as_dict())
+    assert restored.interrupted
+    assert scan_outcome("completed", restored.as_dict()) == "completed_with_warnings"
+    window.on_scan_finished(scan_result(statistics))
+    assert window.scan_progress.format() == "Completed; previews interrupted"
+    assert boxes.boxes[-1].windowTitle() == "Offline Previews Interrupted"
+
+
+@pytest.mark.parametrize("algorithm", ["sha256", "blake3", "xxh3_128"])
+def test_catalogue_hash_dropdown_lock_states(app, algorithm):
+    dialog = PreferencesDialog(False, DEFAULT_THEME_STYLE, DEFAULT_COLOR_MODE, DEFAULT_ACCENT_COLOR)
+    try:
+        assert not dialog.hash_algorithm_combo.isEnabled()
+        dialog.set_catalogue_hash_settings(algorithm, locked=False)
+        assert dialog.selected_hash_algorithm() == algorithm
+        assert dialog.hash_algorithm_combo.isEnabled()
+        dialog.set_catalogue_hash_settings(algorithm, locked=True)
+        assert not dialog.hash_algorithm_combo.isEnabled()
+        assert "even if all volumes" in dialog.hash_algorithm_explanation.text()
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_hash_choice_is_saved_only_when_preferences_are_accepted(main_window, tmp_path, monkeypatch, accepted):
+    db = Database(tmp_path / "hash-choice.jvvv")
+    main_window.db = db
+    main_window.preview_settings = PreviewSettings()
+
+    def choose_hash(dialog):
+        assert dialog.hash_algorithm_combo.isEnabled()
+        dialog.hash_algorithm_combo.setCurrentIndex(dialog.hash_algorithm_combo.findData("xxh3_128"))
+        return QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(PreferencesDialog, "exec", choose_hash)
+    try:
+        main_window.show_preferences()
+        assert db.hash_algorithm == ("xxh3_128" if accepted else "sha256")
+    finally:
+        main_window.db = None
+        db.close()

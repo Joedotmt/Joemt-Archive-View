@@ -3,4 +3,6 @@ Pillow>=11.0
 pillow-heif>=1.0
 rawpy>=0.24
 numpy>=1.26
+blake3>=1.0
+xxhash>=3.5
 pytest>=8.0

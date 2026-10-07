@@ -68,6 +68,7 @@ from .volume_store import (
     volume_file_counts,
     write_blob,
 )
+from .content_hash import DEFAULT_HASH_ALGORITHM, normalize_hash_algorithm
 
 
 REPOSITORY_EXTENSION = ".jvvvrepo"
@@ -78,7 +79,7 @@ BLOBS_DIR_NAME = "blobs"
 SNAPSHOTS_DIR_NAME = "snapshots"
 BLOB_EXTENSION = ".blob"
 SNAPSHOT_FORMAT = "jvvv-snapshot"
-SNAPSHOT_FORMAT_VERSION = 1
+SNAPSHOT_FORMAT_VERSION = 2
 SNAPSHOT_FILE_EXTENSION = ".json"
 CATALOGUE_META_REPOSITORY_KEY = "snapshot_repository"
 CATALOGUE_META_REPOSITORY_UUID_KEY = "snapshot_repository_uuid"
@@ -176,6 +177,8 @@ class SnapshotManifest:
     catalogue_name: str
     next_volume_id: int
     volumes: tuple[VolumeSnapshotRecord, ...]
+    hash_algorithm: str = DEFAULT_HASH_ALGORITHM
+    hash_algorithm_locked: bool = False
 
     @property
     def volume_count(self) -> int:
@@ -208,6 +211,8 @@ class SnapshotManifest:
                 "uuid": self.catalogue_uuid,
                 "name": self.catalogue_name,
                 "next_volume_id": self.next_volume_id,
+                "hash_algorithm": self.hash_algorithm,
+                "hash_algorithm_locked": self.hash_algorithm_locked,
             },
             "totals": {
                 "volumes": self.volume_count,
@@ -222,7 +227,7 @@ class SnapshotManifest:
         if data.get("format") != SNAPSHOT_FORMAT:
             raise InvalidRepositoryError("The file is not a JVVV snapshot manifest.")
         version = int(data.get("format_version", 0))
-        if version != SNAPSHOT_FORMAT_VERSION:
+        if version not in (1, SNAPSHOT_FORMAT_VERSION):
             raise InvalidRepositoryError(
                 f"The snapshot uses manifest version {version}; this build reads "
                 f"version {SNAPSHOT_FORMAT_VERSION}."
@@ -236,6 +241,8 @@ class SnapshotManifest:
                 catalogue_uuid=str(catalogue.get("uuid") or ""),
                 catalogue_name=str(catalogue.get("name") or ""),
                 next_volume_id=int(catalogue.get("next_volume_id") or 1),
+                hash_algorithm=normalize_hash_algorithm(catalogue.get("hash_algorithm", DEFAULT_HASH_ALGORITHM)),
+                hash_algorithm_locked=bool(catalogue.get("hash_algorithm_locked", False)),
                 volumes=tuple(
                     VolumeSnapshotRecord.from_json(item) for item in data.get("volumes", [])
                 ),
@@ -673,6 +680,8 @@ class SnapshotRepository:
             catalogue_name=catalogue_name,
             next_volume_id=next_volume_id,
             volumes=tuple(records),
+            hash_algorithm=normalize_hash_algorithm(registry_values.get("hash_algorithm", DEFAULT_HASH_ALGORITHM)),
+            hash_algorithm_locked=bool(registry_values.get("hash_algorithm_locked") == "1" or next_volume_id > 1 or entries),
         )
         _write_json_atomic(self.snapshot_path(manifest.snapshot_id), manifest.to_json())
         if not stored_uuid or meta.get("catalogue_name") != catalogue_name:
@@ -895,6 +904,9 @@ class SnapshotRepository:
             )
             registry = open_registry_db(layout.catalogue_db)
             try:
+                with registry:
+                    set_registry_meta(registry, "hash_algorithm", manifest.hash_algorithm)
+                    set_registry_meta(registry, "hash_algorithm_locked", "1" if manifest.hash_algorithm_locked else "0")
                 total = len(manifest.volumes)
                 for position, record in enumerate(manifest.volumes, start=1):
                     _check_cancel(cancel_callback)
@@ -1008,6 +1020,18 @@ class SnapshotRepository:
         layout = CatalogueLayout(Path(catalogue_path).expanduser())
         if not layout.exists():
             raise SnapshotError(f"The catalogue folder does not exist: {layout.root}")
+        registry_check = open_registry_db(layout.catalogue_db, read_only=True)
+        try:
+            target_algorithm = normalize_hash_algorithm(
+                validate_registry(registry_check).get("hash_algorithm", DEFAULT_HASH_ALGORITHM)
+            )
+        finally:
+            registry_check.close()
+        if manifest.hash_algorithm != target_algorithm:
+            raise SnapshotError(
+                "The snapshot uses a different hash algorithm from this catalogue. "
+                "Restore the complete snapshot as a separate catalogue instead."
+            )
         _emit(progress_callback, "volume", 0, 1, f"Restoring {record.drive_id or record.name or record.uuid}")
         target = layout.volume_file(record.uuid)
         current = volume_store.current_revision(target)

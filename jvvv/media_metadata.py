@@ -107,6 +107,25 @@ class MediaMetadata:
     def audio_codec(self) -> str | None:
         return ", ".join(self.audio_codecs) or None
 
+    @classmethod
+    def from_db_row(cls, row: Mapping[str, object]) -> MediaMetadata:
+        """Restore reusable facts without changing their original probe date."""
+        return cls(
+            status=row["status"],
+            media_kind=row["media_kind"],
+            source=row["source"],
+            container_format=row["container"],
+            duration_ms=row["duration_ms"],
+            width=row["width"],
+            height=row["height"],
+            video_codecs=tuple(str(row["video_codecs"] or "").split(", ")) if row["video_codecs"] else (),
+            audio_codecs=tuple(str(row["audio_codecs"] or "").split(", ")) if row["audio_codecs"] else (),
+            sample_rate_hz=row["sample_rate_hz"],
+            channels=row["channels"],
+            bit_rate=row["bit_rate"],
+            message=row["message"] or "",
+        )
+
     def as_db_values(self) -> dict[str, object]:
         """Return scalar values that can be passed directly to SQLite."""
 

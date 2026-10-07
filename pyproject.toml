@@ -14,6 +14,8 @@ dependencies = [
   "pillow-heif>=1.0",
   "rawpy>=0.24",
   "numpy>=1.26",
+  "blake3>=1.0",
+  "xxhash>=3.5",
 ]
 
 [tool.setuptools.packages.find]

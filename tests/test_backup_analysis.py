@@ -235,10 +235,10 @@ def test_exact_hash_verifies_renamed_and_relocated_file(tmp_path):
         assert status.verified_volume_ids == (target_id,)
         assert status.strong_volume_ids == (target_id,)
         assert status.possible_volume_ids == ()
-        assert "exact sha-256 content hash" in status.evidence_text.casefold()
+        assert "exact content hash" in status.evidence_text.casefold()
         matches = engine.file_matches(source_files["Original/report.psd"])
         assert len(matches) == 1
-        assert "exact sha-256" in matches[0].evidence_text.casefold()
+        assert "exact content hash" in matches[0].evidence_text.casefold()
     finally:
         db.close()
 

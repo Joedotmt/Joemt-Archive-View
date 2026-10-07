@@ -22,6 +22,7 @@ import uuid as uuid_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from .content_hash import DEFAULT_HASH_ALGORITHM, normalize_hash_algorithm
 
 
 CATALOGUE_EXTENSION = ".jvvv"
@@ -34,7 +35,7 @@ VOLUME_TEMP_MARKER = ".tmp-"
 CATALOGUE_LOCK_SUFFIX = ".lock"
 
 CATALOGUE_FORMAT = "jvvv-catalogue-directory"
-CATALOGUE_FORMAT_VERSION = 1
+CATALOGUE_FORMAT_VERSION = 2
 # application_id values make the three SQLite files self-identifying.
 CATALOGUE_APPLICATION_ID = 0x4A565643  # "JVVC"
 VOLUME_APPLICATION_ID = 0x4A56564C  # "JVVL"
@@ -223,6 +224,8 @@ def create_registry_db(path: Path, *, catalogue_uuid: str, created_at: str) -> N
                 ("catalogue_uuid", catalogue_uuid),
                 ("created_at", created_at),
                 ("next_volume_id", "1"),
+                ("hash_algorithm", DEFAULT_HASH_ALGORITHM),
+                ("hash_algorithm_locked", "0"),
             ],
         )
         connection.commit()
@@ -268,13 +271,17 @@ def validate_registry(connection: sqlite3.Connection) -> dict[str, str]:
         version = int(meta.get("format_version", "0"))
     except ValueError:
         version = 0
-    if version != CATALOGUE_FORMAT_VERSION:
+    if version not in (1, CATALOGUE_FORMAT_VERSION):
         raise CatalogueLayoutError(
             f"The catalogue registry uses format version {version}; this build supports "
             f"version {CATALOGUE_FORMAT_VERSION}."
         )
     if not is_valid_uuid(meta.get("catalogue_uuid", "")):
         raise CatalogueLayoutError("The catalogue registry has no valid catalogue UUID.")
+    try:
+        normalize_hash_algorithm(meta.get("hash_algorithm", DEFAULT_HASH_ALGORITHM))
+    except ValueError as exc:
+        raise CatalogueLayoutError(str(exc)) from exc
     return meta
 
 
@@ -324,6 +331,7 @@ def register_volume(
         (int(volume_id), volume_uuid, added_at),
     )
     set_registry_meta(connection, "next_volume_id", str(int(volume_id) + 1))
+    set_registry_meta(connection, "hash_algorithm_locked", "1")
 
 
 def unregister_volume(connection: sqlite3.Connection, volume_id: int) -> None:

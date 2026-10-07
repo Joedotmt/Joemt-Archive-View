@@ -33,7 +33,7 @@ JVVV. There is no server or cloud component.
 - Run scans on a Qt worker thread so the interface remains responsive.
 - Cancel scans and record inaccessible files/folders as scan errors.
 - Read every accessible regular file during a scan or rescan and store its full
-  SHA-256 content hash. Hashing is streamed and cancellable; partial scan data
+  content hash (SHA-256, BLAKE3, or XXH3-128). Hashing is streamed and cancellable; partial scan data
   is rolled back.
 - Store image dimensions with the built-in Qt reader, WAV duration/audio details
   with Python's built-in reader, and broader audio/video duration, codec,
@@ -43,7 +43,7 @@ JVVV. There is no server or cloud component.
   also exist on other registered drives, without reconnecting or rescanning them.
 - Show explicit copy-evidence states that answer "does this exist on another
   drive, and how sure are we?": aqua **Hash verified** (proven identical by
-  SHA-256), green **Same size & time** (contents not compared), amber **Name and
+  content hash), green **Same size & time** (contents not compared), amber **Name and
   size** and **Content differs** for files; **Full match (hashed / partly hashed
   / no hashes)**, **All files hash-verified / All files found**, **Found by name
   & size only**, **Partial**, and **Not confirmed · structure repeats** for
@@ -59,7 +59,7 @@ JVVV. There is no server or cloud component.
   them as missing user content.
 - Optionally generate offline previews while scanning: JPEG previews for images
   and silent H.264 MP4 proxies for videos, stored under a user-chosen directory
-  and named by each file's SHA-256 and preview profile so duplicates, renamed
+  and named by each file's content hash, algorithm, and preview profile so duplicates, renamed
   files, and several catalogues sharing one directory reuse a single preview.
   Every preview that could not be created is reported at the end of the scan.
 
@@ -162,13 +162,28 @@ separately with your normal file-copy or backup software.
 5. Use the search bar to search across all indexed volumes.
 6. Use **Scan** again to refresh an existing catalogue.
 
+Choose **Settings > Preferences > Catalogue hashing** before adding the first
+volume. The dropdown offers **SHA-256** (the default), **BLAKE3**, and
+**XXH3-128**. One algorithm applies to every drive in the catalogue and locks
+permanently as soon as its first volume is added, even before scanning. Deleting
+all volumes does not unlock it. Existing catalogues retain SHA-256; use a new
+catalogue to choose another algorithm. The choice and lock also survive snapshot
+restores and index rebuilds. SHA-256 and BLAKE3 are cryptographic; XXH3-128 is
+non-cryptographic. A matching hash is extremely strong evidence of equal content,
+but hash collisions are possible.
+
 Scanning now reads the complete contents of every accessible regular file and
-recalculates its SHA-256, even when its size and timestamp appear unchanged.
+recalculates its content hash, even when its size and timestamp appear unchanged.
 This catches same-size changes and makes content identity independent of the
 filename, folder, or date, but it also means scans can take roughly as long as
 reading all data on the drive. The scan bar and Scan Log report hashing progress,
-bytes read, and files whose hash could not be recorded. Cancelling or declining a
-rescan restores the previously applied hashes and catalogue records atomically.
+bytes read, and files whose hash could not be recorded. Cancelling during indexing
+or declining a rescan restores the previously applied hashes and catalogue records
+atomically. Once indexing is committed, the catalogue is ready to browse while
+offline previews run in a separate background phase. **Cancel Previews** stops that
+phase and keeps the updated catalogue and completed previews. The Scan Log reports
+indexing time (including hashing and media inspection), preview time, total time,
+and the number of media records reused.
 If a file keeps changing or disappears while it is being hashed, it is skipped
 and reported as an incomplete scan area instead of saving a known-stale snapshot.
 
@@ -176,21 +191,23 @@ Media details are descriptive and are never used as file identity. Image sizes
 (including HEIC/HEIF and camera RAW files, after EXIF orientation) and WAV
 details require no additional software. For broader audio/video details,
 install FFmpeg and make its `ffprobe` executable available on `PATH`; otherwise
-Properties explicitly says that those details were not collected. If a later
-probe fails, earlier details are retained only when SHA-256 proves the content is
-unchanged, and Properties labels them as partial with the latest failure reason.
+Properties explicitly says that those details were not collected. Rescans reuse
+complete media details only after a freshly calculated content hash indicates the content
+is unchanged. Missing, partial, failed, or unavailable details are probed again.
+If a retry fails, earlier useful details are retained only when the hash matches,
+and Properties labels them as partial with the latest failure reason.
 
 Use **Catalogue > Backup Evidence** to compare records already stored in the
 catalogue. This analysis reads the `.jvvv` database only: it does not access or
 rescan source drives and does not reread file contents. **Hash verified** means
-the full-file SHA-256 values previously recorded by scans are identical, even if
+the full-file content hashes previously recorded by scans are identical, even if
 the files have different names, paths, or timestamps. Re-run the analysis when
 the application marks its results as outdated after catalogue contents change.
 
 The colour of an item answers "does this exist on another drive, and how sure
 are we?", never how the coverage arithmetic paired it, so two identical records
 on the same drive always get the same label. Aqua with a double tick is
-**Hash verified**: proven identical by SHA-256. Green with a tick is
+**Hash verified**: matching full-file content hashes. Green with a tick is
 **Same size & time**: the normalized filename, exact byte size and modified time
 (within 2 seconds, or an exact one-hour clock offset for names that are not
 generic) agree, but contents were not compared. Amber with a dash is a lead to
@@ -274,7 +291,10 @@ presets. Each combination is a *preview profile* whose ID appears in Settings
 (for example `jpeg-max1600-q82` and `h264-1fps-240p-crf35-veryfast`). Previews
 live under `<preview directory>/images/<image profile>/<hh>/<sha256>.jpg` and
 `<preview directory>/videos/<video profile>/<hh>/<sha256>.mp4`, where `hh` is
-the first two hex characters of the file's SHA-256. Changing settings creates a
+the first two hex characters of the file's content hash. SHA-256 retains these
+legacy filenames. BLAKE3 and XXH3-128 use `blake3-<hash>` and
+`xxh3_128-<hash>` filenames respectively, keeping algorithms separate in a shared
+preview directory. Changing settings creates a
 new profile directory; nothing from an older profile is deleted or converted
 automatically, and changing the preview directory does not move existing
 previews.
@@ -292,13 +312,15 @@ onto neutral grey, downsizes to the configured maximum without ever upscaling,
 and writes a JPEG that carries only the ICC profile — no EXIF, XMP, comments or
 other source metadata. Decoding is refused above 600 megapixels.
 
-During a scan, previews are generated only after a file's SHA-256 has been
-recorded and the file has passed the stability checks; a source that changes
+Preview generation starts after catalogue indexing and change review are complete.
+Jobs are processed sequentially on the background scan worker, using a temporary
+disk queue to bound memory use. Every preview requires a recorded content hash and a
+source that passed the stability checks; a source that changes
 between hashing and preview generation is reported as a failure rather than
 previewed under the old hash. If the preview directory lies inside the volume
 being scanned it is skipped, so previews are never catalogued as archive
 content. An existing preview with
-the same SHA-256 and profile is validated and reused; a corrupt one (including
+the same content hash, algorithm, and profile is validated and reused; a corrupt one (including
 an MP4 proxy truncated by an interrupted copy) is regenerated and the scan
 report records how many were replaced. Output is always written to a temporary file in the target
 directory, validated (JPEG decode, or an MP4 structure check for a video
@@ -334,7 +356,7 @@ duration, size, and location, or why the last scan could not create it.
 **Catalogue > Preview Cache…** shows the preview directory, its free space, the
 current profiles, and (after **Scan Preview Store**) how many image and video
 previews it holds and how much space they use. **Show Unreferenced Previews**
-lists files under the current profiles whose SHA-256 is not referenced by the
+lists files under the current profiles whose content hash and algorithm are not referenced by the
 open catalogue. Because other catalogues may share the same directory, nothing
 is deleted automatically: select the entries you want to remove and confirm
 **Delete Selected Unreferenced Previews**. The list is cleared whenever the

@@ -11,6 +11,8 @@ widgets; they only emit signals.
 
 from __future__ import annotations
 
+from .content_hash import HASH_LABELS
+
 import os
 import threading
 from collections.abc import Callable
@@ -94,11 +96,11 @@ WORKER_PROGRESS_INTERVAL = 1000
 DELETE_PROGRESS_INTERVAL = 100
 
 FAILURE_COLUMNS: tuple[str, ...] = ("#", "Path", "Type", "Profile", "Stage", "Error", "Detail")
-UNREFERENCED_COLUMNS: tuple[str, ...] = ("", "Type", "Profile", "SHA-256", "Size", "Path")
+UNREFERENCED_COLUMNS: tuple[str, ...] = ("", "Type", "Profile", "Content hash", "Size", "Path")
 
 UNREFERENCED_HEADING_TEXT = "Not referenced by this catalogue"
 UNREFERENCED_EXPLANATION_TEXT = (
-    "These preview files are not referenced by any SHA-256 recorded in the open "
+    "These preview files are not referenced by any content hash recorded in the open "
     "catalogue under the current preview profiles. Another catalogue sharing the "
     "same preview directory may still use these files, so nothing is deleted "
     "automatically: tick the previews you want to remove and confirm the deletion."
@@ -724,7 +726,7 @@ class PreviewFailuresDialog(QDialog):
                 if failure.preview_path:
                     tooltip_lines.append(f"Expected preview: {failure.preview_path}")
                 if failure.sha256:
-                    tooltip_lines.append(f"SHA-256: {failure.sha256}")
+                    tooltip_lines.append(f"{HASH_LABELS[failure.hash_algorithm]}: {failure.sha256}")
                 tooltip = "\n".join(tooltip_lines)
                 number_item = _readonly_item(str(row + 1))
                 number_item.setTextAlignment(
@@ -836,7 +838,7 @@ class PreviewCacheDialog(QDialog):
         )
         self.unreferenced_button = QPushButton("Show Unreferenced Previews")
         self.unreferenced_button.setToolTip(
-            "List previews under the current profiles whose SHA-256 is not recorded "
+            "List previews under the current profiles whose content hash is not recorded "
             "in the open catalogue"
         )
         self.temporaries_button = QPushButton("Delete Temporary Files")
@@ -1061,7 +1063,8 @@ class PreviewCacheDialog(QDialog):
                 table.setItem(row, 0, check)
                 table.setItem(row, 1, _readonly_item(_media_kind_label(entry.media_kind)))
                 table.setItem(row, 2, _readonly_item(entry.profile_id))
-                table.setItem(row, 3, _readonly_item(entry.sha256, entry.sha256))
+                hash_text = f"{HASH_LABELS[entry.hash_algorithm]}: {entry.sha256}"
+                table.setItem(row, 3, _readonly_item(hash_text, hash_text))
                 size_item = _readonly_item(format_size(int(entry.size_bytes)), f"{int(entry.size_bytes):,} bytes")
                 size_item.setTextAlignment(
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -1331,7 +1334,7 @@ class PreviewStoreStatisticsWorker(_CancellableWorker):
 
 
 class UnreferencedPreviewWorker(_CancellableWorker):
-    """List previews under the current profiles whose SHA-256 this catalogue does not record.
+    """List previews under the current profiles whose content hash this catalogue does not record.
 
     The catalogue is opened read-only and its hashes are indexed in a temporary
     SQLite table, so neither the store nor the catalogue is loaded into memory.
@@ -1357,7 +1360,7 @@ class UnreferencedPreviewWorker(_CancellableWorker):
         try:
             cache = _cache_for(self.settings)
             _require_store(cache)
-            # Read-only: the catalogue is never modified. The SHA-256 lookup is a
+            # Read-only: the catalogue is never modified. The content hash lookup is a
             # connection-local TEMP table that Database manages itself.
             db = Database(self.db_path, initialize=False, create=False, read_only=True)
             try:
@@ -1377,7 +1380,7 @@ class UnreferencedPreviewWorker(_CancellableWorker):
                             cancel_callback=self.is_cancelled,
                         ):
                             examined += 1
-                            if not db.content_hash_referenced(bytes.fromhex(entry.sha256)):
+                            if not db.content_hash_referenced(bytes.fromhex(entry.sha256), entry.hash_algorithm):
                                 total_found += 1
                                 if len(entries) < MAX_UNREFERENCED_ROWS:
                                     entries.append(entry)

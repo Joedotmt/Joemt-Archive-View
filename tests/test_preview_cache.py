@@ -353,6 +353,7 @@ def test_preview_failure_round_trips_through_dict_and_json():
     restored = PreviewFailure.from_dict(json.loads(json.dumps(values)))
     assert restored == failure
     assert set(values) == {
+        "hash_algorithm",
         "source_name",
         "relative_path",
         "volume_id",

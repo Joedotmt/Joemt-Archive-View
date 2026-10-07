@@ -857,7 +857,7 @@ def test_cache_dialog_unreferenced_table_and_delete_flow(app, tmp_path):
     assert table.item(0, 1).text() == "Image"
     assert table.item(2, 1).text() == "Video"
     assert table.item(0, 2).text() == settings.image.profile_id
-    assert table.item(0, 3).text() == sha_hex("a")
+    assert table.item(0, 3).text() == "SHA-256: " + sha_hex("a")
     assert table.item(2, 4).text() == "3.0 GB"
     assert table.item(0, 5).text() == str(entries[0].path)
     assert table.item(0, 0).checkState() == Qt.CheckState.Unchecked
@@ -893,7 +893,7 @@ def test_cache_dialog_unreferenced_table_and_delete_flow(app, tmp_path):
 
     dialog.remove_entries([str(entries[0].path)])
     assert table.rowCount() == 2
-    assert table.item(0, 3).text() == sha_hex("b")
+    assert table.item(0, 3).text() == "SHA-256: " + sha_hex("b")
     assert not dialog.delete_button.isEnabled()
     assert "2 preview(s)" in dialog.unreferenced_count_label.text()
 

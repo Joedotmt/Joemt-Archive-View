@@ -661,13 +661,13 @@ def test_scan_persists_builtin_wave_media_details(tmp_path):
         db.close()
 
 
-def test_unchanged_media_keeps_previous_details_when_latest_probe_fails(tmp_path):
+def test_partial_unchanged_media_keeps_previous_details_when_latest_probe_fails(tmp_path):
     source = tmp_path / "drive"
     source.mkdir()
     media_path = source / "clip.mp4"
     media_path.write_bytes(b"unchanged video content")
-    complete = MediaMetadata(
-        status="complete",
+    partial = MediaMetadata(
+        status="partial",
         media_kind="video",
         source="ffprobe",
         container_format="mov,mp4",
@@ -688,7 +688,7 @@ def test_unchanged_media_keeps_previous_details_when_latest_probe_fails(tmp_path
         volume_id = db.create_volume("Drive", str(source))
         first = VolumeScanner(
             db,
-            media_extractor=SimpleNamespace(inspect=lambda *_args, **_kwargs: complete),
+            media_extractor=SimpleNamespace(inspect=lambda *_args, **_kwargs: partial),
         ).scan(volume_id)
         assert first.status == "completed"
         file_id = db.connection.execute("SELECT id FROM files").fetchone()["id"]

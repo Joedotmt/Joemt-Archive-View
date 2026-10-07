@@ -210,7 +210,7 @@ def test_browser_other_copy_column_has_header_and_row_explanations():
         Qt.Orientation.Horizontal,
         Qt.ItemDataRole.ToolTipRole,
     )
-    assert "SHA-256" in header_tooltip
+    assert "content hashes" in header_tooltip
     assert "Aqua (double tick)" in header_tooltip
     assert model.data(model.index(0, 1)) == "No copy found"
     assert "No matching copy" in model.data(

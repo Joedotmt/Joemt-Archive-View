@@ -1473,7 +1473,7 @@ def test_hash_unavailable_status_record():
     assert record["status"] == DB_STATUS_MISSING and record["status"] in PREVIEW_STATUS_VALUES
     assert record["source_hash"] is None
     assert record["error_stage"] == STAGE_HASH_UNAVAILABLE
-    assert "SHA-256" in record["error_message"]
+    assert "content hash" in record["error_message"]
 
 
 # ---------------------------------------------------------------------------
@@ -1843,7 +1843,7 @@ def test_statistics_round_trip_hash_unavailable_count_and_root():
 
     assert PreviewStatistics.from_dict(stats.as_dict()) == stats
     text = stats.summary_text(stats.root)
-    assert "Images/videos not attempted because no SHA-256 could be recorded:" in text
+    assert "Images/videos not attempted because no content hash could be recorded:" in text
     assert "\n  2" in text
     assert PreviewStatistics.from_dict({}).hash_unavailable == 0
     assert PreviewStatistics.from_dict({}).root == ""
@@ -1858,7 +1858,7 @@ def test_preview_report_message_covers_failures_regenerations_and_unhashed_files
 
     assert message.startswith("Catalogue indexing succeeded, but 1 offline preview was not created.")
     assert "2 existing previews failed validation and were regenerated." in message
-    assert "1 image/video file had no SHA-256 recorded, so no preview was attempted." in message
+    assert "1 image/video file had no content hash recorded, so no preview was attempted." in message
     assert preview_report_message(PreviewStatistics(mode=MODE_ENABLED)) == ""
     single = preview_report_message(PreviewStatistics(mode=MODE_ENABLED, corrupt_replaced=1))
     assert single == "1 existing preview failed validation and was regenerated."

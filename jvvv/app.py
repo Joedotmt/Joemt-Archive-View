@@ -91,6 +91,7 @@ from .backup_analysis import (
     folder_reason_key,
 )
 from .catalogue_format import CATALOGUE_DB_NAME
+from .content_hash import DEFAULT_HASH_ALGORITHM, HASH_LABELS
 from .database import (
     ARCHIVE_STATUSES,
     CATALOGUE_EXTENSION,
@@ -219,8 +220,9 @@ CATALOGUE_PROBE_UNAVAILABLE = 2
 CATALOGUE_PROBE_INVALID = 3
 PREVIEW_PROGRESS_PREFIXES = ("Creating image preview", "Creating video preview")
 SCAN_PROGRESS_DETAIL_PREFIXES = (
-    "Hashing SHA-256",
+    "Hashing ",
     "Reading media details",
+    "Catalogue ready",
     *PREVIEW_PROGRESS_PREFIXES,
 )
 
@@ -269,7 +271,10 @@ def preview_property_rows(
     except Exception:  # pragma: no cover - settings are validated on load
         current_profile_id = "invalid"
     content_hash = record_field("content_hash")
-    info = inspect_preview_file(preview_settings, media_kind, content_hash)
+    info = inspect_preview_file(
+        preview_settings, media_kind, content_hash,
+        record_field("content_hash_algorithm") or DEFAULT_HASH_ALGORITHM,
+    )
     stored_status = str(record_field("preview_status") or "").casefold()
     stored_profile = str(record_field("preview_profile_id") or "")
     stored_stage = str(record_field("preview_error_stage") or "")
@@ -283,7 +288,7 @@ def preview_property_rows(
     )
 
     if content_hash is None:
-        summary = "Not available — no SHA-256 hash is recorded for this file, so no preview path can be derived"
+        summary = "Not available — no content hash is recorded for this file, so no preview path can be derived"
     elif info is not None and info.exists and info.valid:
         summary = "Available"
     elif info is not None and info.exists and not info.valid:
@@ -582,7 +587,7 @@ EXECUTABLE_EXTENSIONS = {"exe", "msi", "app", "bat", "cmd", "com", "sh", "run", 
 
 BACKUP_METADATA_DISCLAIMER = (
     "This analysis reads the saved catalogue only, not the connected drives. "
-    "Hash-verified means full-file SHA-256 values recorded during scans match; "
+    "Hash-verified means full-file content hashes recorded during scans match; "
     "metadata-only matches are not byte-for-byte verification."
 )
 BACKUP_FOLDER_RULE_SENTENCE = (
@@ -592,7 +597,7 @@ BACKUP_FOLDER_RULE_SENTENCE = (
 BACKUP_COLUMN_HEADER_TOOLTIP = (
     "Whether another catalogue drive holds a copy of this item, judged from the "
     "saved catalogue. The colour says how sure the evidence is.\n"
-    "Aqua (double tick): proven identical by SHA-256 hash. Green (tick): a file with "
+    "Aqua (double tick): matched by full-file content hashes. Green (tick): a file with "
     "the same name, size and modified time, a folder with the same folder name, "
     "layout, file names and sizes, or a folder whose every file was found elsewhere "
     "by name, size and modified time; contents were not compared. Amber (dash): a lead "
@@ -748,7 +753,7 @@ FOLDER_REASON_LABELS: dict[str, tuple[str, str]] = {
     "full_match_hashed": (
         "verified",
         "The whole folder matches on the other drive: same folder name, same layout, "
-        "and every file's name, size and saved SHA-256 hash.",
+        "and every file's name, size and saved content hash.",
     ),
     "full_match_partly_hashed": (
         "strong",
@@ -1181,8 +1186,8 @@ def item_backup_display(
             )
             text = f"Hash verified · {plural_other_drives(shown_verified)}"
             lines = [
-                "The full-file SHA-256 recorded during scanning is identical on another "
-                "drive, so the contents are proven the same."
+                "The full-file content hash recorded during scanning is identical on another "
+                "drive, indicating matching contents."
             ]
             if strong_count:
                 lines.append(
@@ -1221,7 +1226,7 @@ def item_backup_display(
             text = "Content differs · same name and size"
             lines = [
                 "A file with the same name and size exists on another drive, but the "
-                "saved SHA-256 hashes differ, so it is a different version or a damaged "
+                "saved content hashes differ, so it is a different version or a damaged "
                 "copy, not a copy. Look at it before relying on it."
             ]
         elif raw_state in NONE_ENGINE_STATES or reason in {"", "name_size_only", "time_match"}:
@@ -3028,7 +3033,7 @@ class BackupEvidenceDialog(QDialog):
 
         explanation = QLabel(
             "This compares records already saved in the catalogue. It does not reconnect "
-            "or rescan drives or read file contents. Hash verified means SHA-256 values "
+            "or rescan drives or read file contents. Hash verified means content hashes "
             "recorded during scans match; Same size & time means name, size and "
             "modified time agree without a hash, so contents were not compared."
         )
@@ -3048,7 +3053,7 @@ class BackupEvidenceDialog(QDialog):
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         legend = QLabel(
-            "Aqua (double tick) — proven identical by SHA-256: Hash verified for a file; "
+            "Aqua (double tick) — matched by full-file content hashes: Hash verified for a file; "
             "Full match (hashed) or All files hash-verified for a folder\n"
             "Green (tick) — contents not compared: for a file, the same name, size and "
             "modified time (Same size & time); for a folder, the same folder name, "
@@ -3062,8 +3067,8 @@ class BackupEvidenceDialog(QDialog):
         legend.setWordWrap(True)
         rules = QLabel(
             "What the labels mean:\n"
-            "• Hash verified: the full-file SHA-256 values recorded during scans are "
-            "identical, so the contents are proven the same. Names, paths and "
+            "• Hash verified: the full-file content hashes recorded during scans are "
+            "identical, indicating matching contents. Names, paths and "
             "timestamps may differ.\n"
             "• Same size & time: filename, exact size and modified time (within 2 "
             "seconds, or an exact one-hour clock offset for names that are not generic) "
@@ -4124,6 +4129,17 @@ class PreferencesDialog(QDialog):
         self.setWindowTitle(f"Preferences - {APP_NAME}")
         self.setMinimumWidth(520)
 
+        hashing_group = QGroupBox("Catalogue hashing")
+        self.hash_algorithm_combo = QComboBox()
+        for algorithm, label in HASH_LABELS.items():
+            self.hash_algorithm_combo.addItem(label, algorithm)
+        self.hash_algorithm_explanation = QLabel()
+        self.hash_algorithm_explanation.setWordWrap(True)
+        hashing_form = QFormLayout(hashing_group)
+        hashing_form.addRow("Hash algorithm:", self.hash_algorithm_combo)
+        hashing_form.addRow(self.hash_algorithm_explanation)
+        self.set_catalogue_hash_settings(DEFAULT_HASH_ALGORITHM, locked=False, catalogue_open=False)
+
         search_group = QGroupBox("Search")
         self.include_paths_check = QCheckBox(
             "Include file and folder paths in searches"
@@ -4195,6 +4211,7 @@ class PreferencesDialog(QDialog):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.addWidget(appearance_group)
         content_layout.addWidget(search_group)
+        content_layout.addWidget(hashing_group)
         content_layout.addWidget(self.preview_widget)
         content_layout.addStretch(1)
 
@@ -4207,6 +4224,31 @@ class PreferencesDialog(QDialog):
         layout.addWidget(scroll, 1)
         layout.addWidget(buttons)
         self.resize(620, 760)
+
+    def set_catalogue_hash_settings(
+        self, algorithm: str, *, locked: bool, catalogue_open: bool = True, read_only: bool = False,
+    ) -> None:
+        self.hash_algorithm_combo.setCurrentIndex(self.hash_algorithm_combo.findData(algorithm))
+        self.hash_algorithm_combo.setEnabled(catalogue_open and not locked and not read_only)
+        if not catalogue_open:
+            text = "Open or create a catalogue to choose its hash algorithm."
+        elif read_only and not locked:
+            text = "This catalogue is open read-only. Reopen it for editing to choose its hash algorithm."
+        elif locked:
+            text = (
+                "Locked for this catalogue. The algorithm cannot change after the first volume "
+                "is added, even if all volumes are later deleted."
+            )
+        else:
+            text = (
+                "Used by every drive in this catalogue. Choose before adding the first volume; "
+                "the choice then locks permanently. All options read every byte. "
+                "SHA-256 and BLAKE3 are cryptographic; XXH3-128 prioritises speed."
+            )
+        self.hash_algorithm_explanation.setText(text)
+
+    def selected_hash_algorithm(self) -> str:
+        return str(self.hash_algorithm_combo.currentData())
 
     def preview_settings(self) -> PreviewSettings:
         return self.preview_widget.settings()
@@ -4357,7 +4399,7 @@ class HelpDialog(QDialog):
             ("2. Add a volume",
              "Choose <b>New Volume</b>, select a connected drive or folder, "
              "and it scans automatically. Scans read every file to record a full "
-             "SHA-256 content hash, so large drives take longer. "
+             "content hash, so large drives take longer. "
              "Scan it again later to review and apply catalogue changes."),
             ("3. Browse offline",
              "Select a saved volume to explore its folder tree, even when the "
@@ -4368,7 +4410,7 @@ class HelpDialog(QDialog):
             ("5. Review copy evidence",
              "Choose <b>Catalogue &gt; Backup Evidence</b> to compare saved evidence. "
              "The analysis does not reconnect, rescan, or reread file contents. It first "
-             "uses SHA-256 values recorded by scans, then clearly labels metadata-only "
+             "uses content hashes recorded by scans, then clearly labels metadata-only "
              "fallbacks when a comparable hash is unavailable."),
             ("6. Snapshots: version history and backup",
              "Choose <b>File &gt; Create Snapshot</b> to record the whole catalogue in "
@@ -4389,7 +4431,7 @@ class HelpDialog(QDialog):
              "<b>Generate offline previews while scanning</b>. JVVV immediately tests "
              "the directory, the image encoder, and FFmpeg's H.264 (libx264) encoder; "
              "if anything fails, the box turns itself back off and the exact problem is "
-             "shown. Previews are named by each file's SHA-256 and preview profile, so "
+             "shown. Previews are named by each file's content hash and preview profile, so "
              "duplicates, renamed files, and several catalogues sharing one directory "
              "reuse the same preview. After a scan, JVVV reports every preview that "
              "could not be created. Use <b>Open Preview</b> / <b>Play Preview</b> in "
@@ -4518,6 +4560,7 @@ def _wait_for_worker_thread(
 
 
 class ScanWorker(QObject):
+    catalogue_ready = Signal()
     progress = Signal(int, int, str)
     stats_progress = Signal(int, int, str, int, int)
     review_requested = Signal(dict)
@@ -4577,6 +4620,7 @@ class ScanWorker(QObject):
                 preview_callback=self.request_review,
                 preview_service=self._build_preview_service(),
                 preview_statistics=preview_statistics,
+                catalogue_ready_callback=self.catalogue_ready.emit,
             )
             result = scanner.scan(self.volume_id)
             self.finished.emit(
@@ -4593,6 +4637,8 @@ class ScanWorker(QObject):
                     "media_files": result.media_files,
                     "media_metadata_collected": result.media_metadata_collected,
                     "preview": result.preview or {},
+                    "media_metadata_reused": result.media_metadata_reused,
+                    "phase_seconds": result.phase_seconds,
                 }
             )
         except Exception:
@@ -6227,6 +6273,15 @@ class MainWindow(QMainWindow):
             original_appearance[2],
             self,
         )
+        hash_settings = getattr(dialog, "set_catalogue_hash_settings", None)
+        if callable(hash_settings):
+            catalogue = getattr(self, "db", None)
+            hash_settings(
+                catalogue.hash_algorithm if catalogue is not None else DEFAULT_HASH_ALGORITHM,
+                locked=catalogue.hash_algorithm_locked if catalogue is not None else False,
+                read_only=catalogue.read_only if catalogue is not None else False,
+                catalogue_open=catalogue is not None,
+            )
         preview_signal = getattr(dialog, "appearance_changed", None)
         if preview_signal is not None:
             preview_signal.connect(
@@ -6250,6 +6305,20 @@ class MainWindow(QMainWindow):
             MainWindow.apply_appearance(self, *original_appearance)
             return
 
+        hash_changed = False
+        hash_getter = getattr(dialog, "selected_hash_algorithm", None)
+        catalogue = getattr(self, "db", None)
+        if catalogue is not None and callable(hash_getter):
+            chosen = hash_getter()
+            if chosen != catalogue.hash_algorithm:
+                try:
+                    catalogue.set_hash_algorithm(chosen)
+                    hash_changed = True
+                except (CatalogueError, ValueError) as exc:
+                    QMessageBox.warning(self, "Catalogue Hashing", str(exc))
+                    MainWindow.apply_appearance(self, *original_appearance)
+                    return
+
         include_paths = dialog.include_paths()
         theme_style = dialog.theme_style()
         color_mode = dialog.color_mode()
@@ -6269,7 +6338,7 @@ class MainWindow(QMainWindow):
         if preview_changed:
             MainWindow.persist_preview_settings(self, new_preview_settings)
         if not search_changed and not appearance_changed:
-            if preview_changed:
+            if preview_changed or hash_changed:
                 self.statusBar().showMessage("Preferences saved.", 3000)
             return
 
@@ -6329,14 +6398,17 @@ class MainWindow(QMainWindow):
         file_row = self.db.get_file(target.item_id)
         if file_row is None:
             return media_kind, None, None
-        info = inspect_preview_file(self.preview_settings, media_kind, file_row["content_hash"])
+        info = inspect_preview_file(
+            self.preview_settings, media_kind, file_row["content_hash"],
+            file_row["content_hash_algorithm"] or DEFAULT_HASH_ALGORITHM,
+        )
         return media_kind, info, file_row
 
     def preview_unavailable_reason(self, media_kind: str, info, file_row) -> str:
         if self.preview_settings.root_path is None:
             return "No preview storage directory is configured in Settings > Preferences."
         if file_row is not None and file_row["content_hash"] is None:
-            return "No SHA-256 hash is recorded for this file, so no preview path can be derived."
+            return "No content hash is recorded for this file, so no preview path can be derived."
         if info is None:
             return "The offline preview location could not be determined."
         if not info.exists:
@@ -8415,12 +8487,12 @@ class MainWindow(QMainWindow):
         self.scan_progress.setRange(0, 0)
         if preview_settings is not None:
             self.scan_progress.setFormat(
-                "Starting scan · SHA-256 hashing enabled · offline previews enabled..."
+                "Starting scan · content hashing enabled · offline previews enabled..."
             )
         else:
-            self.scan_progress.setFormat("Starting scan · SHA-256 hashing enabled...")
+            self.scan_progress.setFormat("Starting scan · content hashing enabled...")
         self.scan_progress.setToolTip(
-            "Scans read every regular file to record a full SHA-256 content hash. "
+            "Scans read every regular file to record a full content hash. "
             "Media details are collected when supported."
             + (
                 " Offline previews are generated or reused for images and videos."
@@ -8430,6 +8502,8 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage("Scanning and hashing file contents...")
         self.scan_cancel_requested = False
+        self.scan_preview_phase = False
+        self.stop_scan_button.setText("Cancel Scan")
         self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
         self._set_scan_running_ui(True)
 
@@ -8439,6 +8513,7 @@ class MainWindow(QMainWindow):
             preview_settings=preview_settings,
             preview_skip_reason=preview_skip_reason,
         )
+        self.scan_worker.catalogue_ready.connect(self.on_scan_catalogue_ready)
         self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.stats_progress.connect(self.on_scan_stats_progress)
         self.scan_worker.review_requested.connect(self.on_scan_review_requested)
@@ -8530,14 +8605,26 @@ class MainWindow(QMainWindow):
         if hasattr(self, "scan_log"):
             self.scan_log.appendPlainText(message)
 
+    @Slot()
+    def on_scan_catalogue_ready(self) -> None:
+        self.scan_preview_phase = True
+        self.refresh_after_catalogue_write()
+        self.stop_scan_button.setText("Cancel Previews")
+        self.stop_scan_button.setToolTip("Stop offline previews; the updated catalogue will be kept.")
+        self.statusBar().showMessage("Catalogue updated and ready to browse. Generating offline previews…")
+
     def cancel_scan(self) -> None:
         if self.scan_worker is None or self.scan_cancel_requested:
             return
         self.scan_cancel_requested = True
         self.scan_worker.cancel()
         self.stop_scan_button.setEnabled(False)
-        self.scan_progress.setFormat("Cancelling scan...")
-        self.statusBar().showMessage("Cancelling scan...")
+        message = (
+            "Cancelling previews; catalogue update kept..."
+            if getattr(self, "scan_preview_phase", False) else "Cancelling scan..."
+        )
+        self.scan_progress.setFormat(message)
+        self.statusBar().showMessage(message)
 
     @Slot(int, int, str)
     def on_scan_progress(self, files_seen: int, folders_seen: int, current_path: str) -> None:
@@ -8606,7 +8693,7 @@ class MainWindow(QMainWindow):
             details.extend(
                 [
                     "",
-                    f"SHA-256 unavailable for {hash_errors:,} files. Applying this update "
+                    f"Content hash unavailable for {hash_errors:,} files. Applying this update "
                     "will clear any older hash for those records; they will use clearly "
                     "labelled metadata-only evidence until a later successful rescan.",
                 ]
@@ -8682,7 +8769,8 @@ class MainWindow(QMainWindow):
         preview_warning = status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
         # Spec §15: never a generic "completed" when previews failed.
         self.scan_progress.setFormat(
-            "Completed with preview errors" if preview_warning else status.title()
+            "Completed; previews interrupted" if statistics.interrupted
+            else "Completed with preview errors" if preview_warning else status.title()
         )
         hash_errors = int(result.get("hash_errors", 0))
         access_errors = max(0, int(result.get("errors_count", 0)) - hash_errors)
@@ -8702,15 +8790,26 @@ class MainWindow(QMainWindow):
             preview_text = " Offline previews skipped (preflight failed)."
         self.statusBar().showMessage(
             f"Scan {status.replace('_', ' ')}: {result.get('files_seen', 0)} files, "
-            f"{result.get('files_hashed', 0)} SHA-256 hashes "
+            f"{result.get('files_hashed', 0)} content hashes "
             f"({format_size(int(result.get('bytes_hashed', 0)))} read), "
             f"{result.get('media_metadata_collected', 0)}/"
-            f"{result.get('media_files', 0)} media probes succeeded, "
+            f"{result.get('media_files', 0)} media details available "
+            f"({result.get('media_metadata_reused', 0)} reused), "
             f"{access_errors} incomplete/access issues, {hash_errors} hash unavailable."
             f"{preview_text}",
             8000,
         )
         self.refresh_after_catalogue_write()
+        timings = result.get("phase_seconds") or {}
+        if timings:
+            self.on_scan_log_message(
+                "Scan timing: indexing {:.2f}s (hashing {:.2f}s, media {:.2f}s), "
+                "previews {:.2f}s, total {:.2f}s. Media details reused: {}.".format(
+                    timings.get("indexing", 0), timings.get("hashing", 0),
+                    timings.get("media", 0), timings.get("previews", 0),
+                    timings.get("total", 0), result.get("media_metadata_reused", 0),
+                )
+            )
         self.report_preview_results(status, statistics)
 
     def report_preview_results(self, status: str, statistics: PreviewStatistics) -> None:
@@ -8725,7 +8824,11 @@ class MainWindow(QMainWindow):
         root = statistics.root or self.preview_settings.root_directory or None
         summary = statistics.summary_text(root)
         box = QMessageBox(self)
-        if statistics.has_problems:
+        if statistics.interrupted:
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Offline Previews Interrupted")
+            headline = "Catalogue indexing completed. Offline preview generation was interrupted."
+        elif statistics.has_problems:
             box.setIcon(QMessageBox.Icon.Warning)
             box.setWindowTitle("Scan Completed with Preview Errors")
             headline = (
@@ -8783,6 +8886,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def clear_scan_worker(self) -> None:
+        self.scan_preview_phase = False
+        self.stop_scan_button.setText("Cancel Scan")
+        self.stop_scan_button.setToolTip("")
         self.scan_worker = None
         self.scan_thread = None
         self.scan_cancel_requested = False
@@ -9417,9 +9523,7 @@ class MainWindow(QMainWindow):
             stored_hash_algorithm = str(
                 record_field("content_hash_algorithm") or ""
             ).casefold()
-            hash_algorithm = {
-                "sha256": "SHA-256",
-            }.get(stored_hash_algorithm, stored_hash_algorithm.upper())
+            hash_algorithm = HASH_LABELS.get(stored_hash_algorithm, stored_hash_algorithm.upper())
             if raw_hash is not None and hash_algorithm:
                 hash_text = f"{hash_algorithm} · {bytes(raw_hash).hex()}"
             else:
@@ -10062,7 +10166,7 @@ class MainWindow(QMainWindow):
                 f"{access_errors} incomplete/access issues"
             )
             lines.append(
-                f"  SHA-256: {int(row['files_hashed'] or 0):,} files, "
+                f"  Content hashes: {int(row['files_hashed'] or 0):,} files, "
                 f"{format_size(int(row['bytes_hashed'] or 0))} read, "
                 f"{hash_errors:,} unavailable"
             )
@@ -10071,7 +10175,7 @@ class MainWindow(QMainWindow):
                 media_collected = int(row["media_metadata_collected"] or 0)
                 lines.append(
                     f"  Media inspection: {media_collected:,} of {media_files:,} recognized "
-                    f"media files returned complete or partial details this scan; "
+                    f"media files have complete or partial details (new or reused); "
                     f"{max(0, media_files - media_collected):,} unavailable"
                 )
             if row["files_added"] is not None:
@@ -10208,7 +10312,7 @@ class MainWindow(QMainWindow):
         self._start_preview_store_worker(
             worker,
             "unreferenced",
-            "Comparing the preview store with this catalogue's SHA-256 hashes…",
+            "Comparing the preview store with this catalogue's content hashes…",
         )
 
     def start_delete_previews(self, paths: list) -> None:
