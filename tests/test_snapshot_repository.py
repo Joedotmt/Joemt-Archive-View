@@ -45,6 +45,79 @@ def test_default_repository_sits_beside_the_catalogue(tmp_path):
     assert repository_path_for_catalogue(tmp_path / "Archive.jvvv", None) == tmp_path / "Archive.jvvvrepo"
 
 
+@pytest.mark.parametrize("change", ["content", "metadata", "history", "add", "remove"])
+def test_has_changes_compares_every_kind_of_snapshot_content(tmp_path, change):
+    catalogue, first, second = build_catalogue(tmp_path)
+    repository = SnapshotRepository.create(default_repository_path(catalogue))
+    assert repository.has_changes(catalogue)  # No snapshot yet.
+    repository.create_snapshot(catalogue)
+    assert not repository.has_changes(catalogue)
+    db = open_catalogue(catalogue)
+    try:
+        if change == "content":
+            populate(db, second, "new", 3)
+        elif change == "metadata":
+            db.update_volume(first, "Renamed drive", str(tmp_path), None)
+        elif change == "history":
+            scan = db.start_scan(first)
+            db.finish_scan(scan, "completed", 30, 3, 0)
+        elif change == "add":
+            db.create_volume("New drive", str(tmp_path), {"drive_id": "AID-003"})
+        else:
+            db.delete_volume(first)
+    finally:
+        db.close()
+    assert repository.has_changes(catalogue)
+    repository.create_snapshot(catalogue)
+    assert not repository.has_changes(catalogue)
+
+
+def test_has_changes_ignores_repository_links_and_rebuilt_index(tmp_path, monkeypatch):
+    from jvvv.snapshot_repository import repository_link_settings
+
+    catalogue, _, _ = build_catalogue(tmp_path)
+    repository = SnapshotRepository.create(default_repository_path(catalogue))
+    repository.create_snapshot(catalogue)
+    db = open_catalogue(catalogue)
+    try:
+        for key, value in repository_link_settings(catalogue, repository.path).items():
+            db.set_catalogue_meta(key, value)
+    finally:
+        db.close()
+    (catalogue / "index.sqlite").unlink()
+    open_catalogue(catalogue).close()
+    # The close-time comparison must not serialise/hash the file catalogue.
+    monkeypatch.setattr(
+        "jvvv.snapshot_repository.iter_canonical_bytes",
+        lambda *args: pytest.fail("Change detection must use stored digests"),
+    )
+    assert not repository.has_changes(catalogue)
+
+
+def test_has_changes_checks_catalogue_hash_settings_and_missing_blobs(tmp_path):
+    db = create_catalogue(tmp_path / "Empty")
+    catalogue = db.layout.root
+    repository = SnapshotRepository.create(default_repository_path(catalogue))
+    repository.create_snapshot(catalogue)
+    assert not repository.has_changes(catalogue)
+    db.set_hash_algorithm("sha256" if db.hash_algorithm != "sha256" else "blake3")
+    assert repository.has_changes(catalogue)
+    db.create_volume("Drive", str(tmp_path))
+    db.close()
+    snapshot = repository.create_snapshot(catalogue)
+    assert not repository.has_changes(catalogue)
+    repository.blob_path(next(iter(snapshot.manifest.blob_digests))).unlink()
+    assert repository.has_changes(catalogue)
+
+
+def test_has_changes_after_restore_ignores_revision_and_directory_name(tmp_path):
+    catalogue, _, _ = build_catalogue(tmp_path)
+    repository = SnapshotRepository.create(default_repository_path(catalogue))
+    snapshot = repository.create_snapshot(catalogue)
+    restored = repository.restore_snapshot(snapshot.manifest.snapshot_id, tmp_path / "Restored")
+    assert not repository.has_changes(restored.catalogue_path)
+
+
 def test_first_snapshot_writes_every_volume_and_unchanged_volumes_are_free(tmp_path):
     catalogue, first, second = build_catalogue(tmp_path)
     repository = SnapshotRepository.create(tmp_path / "Archive.jvvvrepo")

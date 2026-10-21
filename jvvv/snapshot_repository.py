@@ -553,6 +553,55 @@ class SnapshotRepository:
         delta.removed.extend(before.values())
         return delta
 
+    def has_changes(self, catalogue_path: str | Path) -> bool:
+        """Compare saved catalogue state with the latest snapshot without hashing files.
+
+        Repository links, the index and preview files are not snapshot content.
+        Read only the registry and the small metadata rows in each volume file.
+        """
+        manifest = self.latest_snapshot()
+        if manifest is None:
+            return True
+        layout = CatalogueLayout(Path(catalogue_path).expanduser())
+        registry = open_registry_db(layout.catalogue_db, read_only=True)
+        try:
+            values = validate_registry(registry)
+            entries = read_registry(registry)
+            next_volume_id = registry_next_volume_id(registry)
+        finally:
+            registry.close()
+        if (
+            values["catalogue_uuid"] != manifest.catalogue_uuid
+            or next_volume_id != manifest.next_volume_id
+            or normalize_hash_algorithm(values.get("hash_algorithm", DEFAULT_HASH_ALGORITHM))
+            != manifest.hash_algorithm
+            or bool(values.get("hash_algorithm_locked") == "1" or next_volume_id > 1 or entries)
+            != manifest.hash_algorithm_locked
+        ):
+            return True
+        previous = {record.uuid: record for record in manifest.volumes}
+        if len(entries) != len(previous):
+            return True
+        for entry in entries:
+            old = previous.get(entry.uuid)
+            if old is None or old.volume_id != entry.volume_id:
+                return True
+            connection = open_volume_file(layout.volume_file(entry.uuid), read_only=True)
+            try:
+                meta = read_volume_meta(connection)
+                if (
+                    meta.uuid != entry.uuid
+                    or meta.content_digest != old.content_blob
+                    or meta.history_digest != old.history_blob
+                    or read_volume_row(connection) != old.volume
+                    or not self.has_blob(old.content_blob)
+                    or not self.has_blob(old.history_blob)
+                ):
+                    return True
+            finally:
+                connection.close()
+        return False
+
     def create_snapshot(
         self,
         catalogue_path: str | Path,

@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -4749,6 +4750,18 @@ class _RepositoryWorker(_CancellableWorker):
         )
 
 
+class _SnapshotCloseProgressDialog(QProgressDialog):
+    @Slot(object, object, str)
+    def update_progress(self, completed: object, total: object, message: str) -> None:
+        if self.wasCanceled():
+            return
+        self.setLabelText(message or "Creating snapshot…")
+        maximum = max(0, int(total or 0))
+        self.setRange(0, 1000 if maximum else 0)
+        if maximum:
+            self.setValue(min(1000, max(0, int(completed or 0)) * 1000 // maximum))
+
+
 def snapshot_worker(repository_path: Path, catalogue_path: Path, label: str) -> _RepositoryWorker:
     def operation(*, progress_callback, cancel_callback) -> SnapshotResult:
         repository = SnapshotRepository.open_or_create(repository_path)
@@ -5252,6 +5265,9 @@ class MainWindow(QMainWindow):
         self.repository_thread: QThread | None = None
         self.repository_worker: _RepositoryWorker | None = None
         self.repository_operation = ""
+        self._catalogue_close_in_progress = False
+        self._snapshot_close_pending = False
+        self._snapshot_close_succeeded = False
         self.pending_restored_catalogue_path: Path | None = None
         self.pending_restored_status_message = "Catalogue restored and opened."
         self.snapshot_history_dialog: SnapshotHistoryDialog | None = None
@@ -7222,7 +7238,12 @@ class MainWindow(QMainWindow):
     def on_snapshot_finished(self, result: SnapshotResult) -> None:
         self.scan_progress.setFormat("Snapshot created")
         # The first snapshot (or one into a freshly created repository) links it.
-        self.record_repository_link(result.repository_path)
+        linked = self.record_repository_link(result.repository_path)
+        if getattr(self, "_snapshot_close_pending", False):
+            self._snapshot_close_succeeded = linked
+            self.statusBar().showMessage("Snapshot created.", 5000)
+            self.refresh_snapshot_history_dialog()
+            return
         manifest = result.manifest
         changed = result.volumes_written
         corrected = ""
@@ -7678,6 +7699,91 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Opening catalogue...")
 
     def close_catalogue(self, show_status: bool = True) -> bool:
+        # Closing can enter a modal event loop while the snapshot worker runs.
+        # Ignore a second close request until that first decision has completed.
+        if self._catalogue_close_in_progress:
+            return False
+        self._catalogue_close_in_progress = True
+        try:
+            return self._close_catalogue(show_status)
+        finally:
+            self._catalogue_close_in_progress = False
+
+    def _confirm_snapshot_before_close(self) -> bool:
+        if self.db is None or self.catalogue_path is None or self.db.read_only:
+            return True
+        text = (
+            "Your changes are saved in the local catalogue, but haven't been "
+            "recorded in the snapshot repository."
+        )
+        try:
+            link = self.repository_link()
+            if link is not None and link.linked:
+                if not SnapshotRepository(link.path).has_changes(self.catalogue_path):
+                    return True
+            elif link is not None and link.offline:
+                text = (
+                    "Your changes are saved in the local catalogue. The snapshot "
+                    "repository is offline, so their snapshot status could not be checked."
+                )
+        except Exception as exc:
+            text = (
+                "Your changes are saved in the local catalogue, but their snapshot "
+                f"status could not be checked.\n\n{exc}"
+            )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Create Snapshot Before Closing?")
+        box.setText("Create a snapshot before closing?")
+        box.setInformativeText(text)
+        create = box.addButton("Create Snapshot && Close", QMessageBox.ButtonRole.AcceptRole)
+        skip = box.addButton("Close Without Snapshot", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(create)
+        box.setEscapeButton(cancel)
+        box.exec()
+        if box.clickedButton() is skip:
+            return True
+        if box.clickedButton() is not create:
+            return False
+        repository = self.ensure_repository_for_snapshot()
+        if repository is None:
+            return False
+        return self._create_snapshot_before_close(repository)
+
+    def _create_snapshot_before_close(self, repository: Path) -> bool:
+        """Wait responsively for a snapshot, then let the original close continue."""
+        worker = snapshot_worker(repository, self.catalogue_path, "")
+        loop = QEventLoop(self)
+        dialog = _SnapshotCloseProgressDialog("Creating snapshot…", "Cancel", 0, 0, self)
+        dialog.setWindowTitle("Create Snapshot Before Closing")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+
+        # Cancellation only sets a flag; it must not wait for the worker's busy
+        # event loop. Progress updates belong to the dialog's GUI thread.
+        dialog.canceled.connect(worker.cancel, Qt.ConnectionType.DirectConnection)
+        worker.progress.connect(dialog.update_progress)
+        worker.finished.connect(dialog.hide)
+        worker.cancelled.connect(dialog.hide)
+        worker.failed.connect(dialog.hide)
+        self._snapshot_close_pending = True
+        self._snapshot_close_succeeded = False
+        try:
+            self._start_repository_worker(worker, "snapshot")
+            self.repository_thread.finished.connect(loop.quit)
+            dialog.show()
+            loop.exec()
+            return self._snapshot_close_succeeded and not dialog.wasCanceled()
+        finally:
+            self._snapshot_close_pending = False
+            dialog.hide()
+            dialog.deleteLater()
+            loop.deleteLater()
+
+    def _close_catalogue(self, show_status: bool) -> bool:
         if not self._stop_repository_for_close():
             return False
         if self.db is None:
@@ -7701,6 +7807,9 @@ class MainWindow(QMainWindow):
         if not self._stop_search_for_catalogue_close():
             return False
         if not self._stop_preview_store_for_close():
+            return False
+
+        if not self._confirm_snapshot_before_close():
             return False
 
         db = self.db

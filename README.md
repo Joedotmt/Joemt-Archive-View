@@ -111,6 +111,14 @@ snapshot; a volume file that is not registered is left alone and listed under
 
 ### Snapshots: version history and backup
 
+When closing a catalogue, exiting the app, or switching catalogues, JVVV offers
+**Create Snapshot & Close**, **Close Without Snapshot**, and **Cancel** if the
+catalogue differs from its latest snapshot (or has no snapshots yet). Changes
+remain saved in the local catalogue even when you close without a snapshot.
+Creating a snapshot keeps the catalogue open until it succeeds; cancelling or
+a failure leaves the catalogue open. If the repository is offline or cannot
+be checked, the prompt explains that its snapshot status is unknown.
+
 Use **File > Create Snapshot…** to record the catalogue in its snapshot
 repository, a `.jvvvrepo` folder that by default sits next to the catalogue
 If you later move or rename that folder, the catalogue shows the repository as
