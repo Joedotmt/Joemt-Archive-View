@@ -240,53 +240,6 @@ def test_restore_requires_explicit_overwrite_and_replaces_atomically(tmp_path):
         db.close()
 
 
-def test_restore_a_single_volume_into_the_live_catalogue(tmp_path):
-    catalogue, first, second = build_catalogue(tmp_path)
-    repository = SnapshotRepository.create(tmp_path / "Archive.jvvvrepo")
-    snapshot = repository.create_snapshot(catalogue, label="before")
-    second_uuid = next(record.uuid for record in snapshot.manifest.volumes if record.volume_id == second)
-
-    db = open_catalogue(catalogue)
-    # populate() reuses one scanned_at, so the earlier 8 files of drive B survive: 30 + 8 + 20.
-    populate(db, second, "c", 20)
-    assert count_rows(db, "files") == 58
-    db.close()
-
-    result = repository.restore_volume(snapshot.manifest.snapshot_id, second_uuid, catalogue)
-    assert result.volume_id == second and not result.registered
-
-    db = open_catalogue(catalogue)
-    try:
-        assert [item for item, _ in db.last_reconcile.imported] == [second]
-        assert count_rows(db, "files") == 38
-        assert db.get_volume(second)["indexed_file_count"] == 8
-        db.verify_volume_file(second)
-    finally:
-        db.close()
-
-
-def test_restore_a_deleted_volume_registers_it_again(tmp_path):
-    catalogue, first, second = build_catalogue(tmp_path)
-    repository = SnapshotRepository.create(tmp_path / "Archive.jvvvrepo")
-    snapshot = repository.create_snapshot(catalogue)
-    first_uuid = next(record.uuid for record in snapshot.manifest.volumes if record.volume_id == first)
-
-    db = open_catalogue(catalogue)
-    db.delete_volume(first)
-    db.close()
-
-    result = repository.restore_volume(snapshot.manifest.snapshot_id, first_uuid, catalogue)
-    assert result.registered and result.volume_id == first
-
-    db = open_catalogue(catalogue)
-    try:
-        assert sorted(row["name"] for row in db.list_volumes()) == ["Drive A", "Drive B"]
-        assert db.get_volume(first)["uuid"] == first_uuid
-        assert count_rows(db, "files") == 38
-    finally:
-        db.close()
-
-
 def test_delete_prune_and_verify(tmp_path):
     catalogue, first, second = build_catalogue(tmp_path)
     repository = SnapshotRepository.create(tmp_path / "Archive.jvvvrepo")

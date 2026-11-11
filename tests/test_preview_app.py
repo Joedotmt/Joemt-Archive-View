@@ -1,4 +1,4 @@
-"""MainWindow / PreferencesDialog integration tests for offline previews.
+"""MainWindow / PreferencesDialog integration tests for previews.
 
 Covers spec §49 "UI tests" together with the scan-start preflight (§27),
 end-of-scan reporting (§15/§16/§17), external-only opening (§19/§44/§45),
@@ -11,6 +11,7 @@ of ``tests/test_app.py``; behaviour that needs real widgets uses an offscreen
 from __future__ import annotations
 
 import functools
+from dataclasses import replace
 import hashlib
 import os
 import pathlib
@@ -26,13 +27,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QMessageBox, QWidget  # noqa: E402
 
 from preview_fixtures import write_test_image, write_tiny_mp4  # noqa: E402
 
 import jvvv.app as app_module  # noqa: E402
 from jvvv.app import (  # noqa: E402
     CatalogueItemRef,
+    CatalogueSettingsDialog,
     HelpDialog,
     MainWindow,
     PreferencesDialog,
@@ -56,6 +58,7 @@ from jvvv.preview_cache import (  # noqa: E402
 from jvvv.preview_config import (  # noqa: E402
     BACKUP_POLICY_TEXT,
     PREVIEW_SETTING_KEYS,
+    PREVIEWS_FFMPEG_PATH_SETTING,
     ImagePreviewProfile,
     PreviewSettings,
     VideoPreviewProfile,
@@ -71,7 +74,7 @@ from jvvv.preview_service import (  # noqa: E402
     scan_outcome,
     skipped_preflight_statistics,
 )
-from jvvv.preview_ui import OfflinePreviewSettingsWidget, PreviewFailuresDialog  # noqa: E402
+from jvvv.preview_ui import PreviewFailuresDialog  # noqa: E402
 from jvvv.theme import (  # noqa: E402
     ADOBE_THEME,
     DARK_MODE,
@@ -88,7 +91,7 @@ GENERIC_MISSING_REASON = (
     "No preview exists at the expected location. Rescan the volume to generate it."
 )
 DEFAULT_PREVIEW_BUTTON_TOOLTIP = (
-    "Open the offline preview in the operating system's default application"
+    "Open the preview in the operating system's default application"
 )
 INVALID_PREVIEW_REASON_PREFIX = "The preview file exists but is not valid: "
 
@@ -112,6 +115,13 @@ def main_window(app, tmp_path, monkeypatch):
         yield window
     finally:
         window.close()
+
+
+@pytest.fixture
+def catalogue_window(main_window, tmp_path):
+    main_window.db = Database(tmp_path / "settings-catalogue.jvvv")
+    main_window._set_catalogue_open(True)
+    return main_window
 
 
 def digest_for(seed: str) -> bytes:
@@ -541,7 +551,7 @@ def test_load_preview_settings_defaults_to_disabled_when_nothing_is_stored(tmp_p
     assert loaded.video.profile_id == "h264-1fps-240p-crf35-veryfast"
 
 
-def test_save_and_load_preview_settings_round_trip_through_an_ini_file(tmp_path):
+def test_app_preview_settings_persist_only_the_local_ffmpeg_path(tmp_path):
     ini = tmp_path / "jvvv.ini"
     stored = PreviewSettings(
         enabled=True,
@@ -557,17 +567,17 @@ def test_save_and_load_preview_settings_round_trip_through_an_ini_file(tmp_path)
 
     assert ini.is_file()
     reader = QSettings(str(ini), QSettings.Format.IniFormat)
-    assert all(reader.contains(key) for key in PREVIEW_SETTING_KEYS)
+    assert reader.contains(PREVIEWS_FFMPEG_PATH_SETTING)
+    assert not any(reader.contains(key) for key in PREVIEW_SETTING_KEYS
+                   if key != PREVIEWS_FFMPEG_PATH_SETTING)
     loaded = load_preview_settings(reader)
-    assert loaded == stored
-    assert loaded.image.profile_id == "jpeg-max4096-q92"
-    assert loaded.video.profile_id == "h264-0.5fps-720p-crf28-fast"
+    assert loaded == PreviewSettings(ffmpeg_path=stored.ffmpeg_path)
 
     # Disabling persists too, and the other values survive it.
     save_preview_settings(reader, stored.with_enabled(False))
     reloaded = load_preview_settings(QSettings(str(ini), QSettings.Format.IniFormat))
     assert reloaded.enabled is False
-    assert reloaded.output_signature() == stored.output_signature()
+    assert reloaded == loaded
 
 
 def test_preview_open_label_distinguishes_images_from_videos():
@@ -576,109 +586,13 @@ def test_preview_open_label_distinguishes_images_from_videos():
 
 
 # ---------------------------------------------------------------------------
-# PreferencesDialog (spec §1, §2, §35)
+# CatalogueSettingsDialog (spec §1, §2, §35)
 # ---------------------------------------------------------------------------
-def test_preferences_dialog_exposes_the_preview_widget_and_its_settings(app, tmp_path):
-    initial = enabled_settings(
-        tmp_path, video=VideoPreviewProfile(fps=2.0, max_height=720, crf=28, preset="fast")
-    )
-    dialog = PreferencesDialog(
-        False, DEFAULT_THEME_STYLE, DEFAULT_COLOR_MODE, DEFAULT_ACCENT_COLOR, None, initial
-    )
-    try:
-        assert isinstance(dialog.preview_widget, OfflinePreviewSettingsWidget)
-        assert dialog.preview_settings() == initial
-        assert dialog.preview_widget.enable_check.isChecked()
-        assert dialog.preview_widget.video_profile_label.text() == (
-            "Current video profile: h264-2fps-720p-crf28-fast"
-        )
-
-        replacement = PreviewSettings(root_directory=str(tmp_path / "other"))
-        dialog.set_preview_settings(replacement)
-        assert dialog.preview_settings() == replacement
-        assert not dialog.preview_widget.enable_check.isChecked()
-        assert dialog.preview_widget.image_profile_label.text() == (
-            "Current image profile: jpeg-max1600-q82"
-        )
-    finally:
-        dialog.close()
-
-    # Spec §49: the checkbox defaults off when no configuration is supplied.
-    plain = PreferencesDialog(False, DEFAULT_THEME_STYLE, DEFAULT_COLOR_MODE, DEFAULT_ACCENT_COLOR)
-    try:
-        assert not plain.preview_widget.enable_check.isChecked()
-        assert plain.preview_settings() == PreviewSettings()
-    finally:
-        plain.close()
-
-
-class SaveValidationWidget:
-    def __init__(self, outcome) -> None:
-        self.outcome = outcome
-        self.calls = 0
-
-    def validate_for_save(self):
-        self.calls += 1
-        return self.outcome
-
-
-def test_preferences_dialog_accept_keeps_the_dialog_open_when_save_validation_fails(
-    app, tmp_path, monkeypatch
-):
-    warnings = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "warning",
-        lambda parent, title, text, *args: warnings.append((parent, title, text)),
-    )
-    settings = enabled_settings(tmp_path)
-    dialog = PreferencesDialog(False, DEFAULT_THEME_STYLE, DEFAULT_COLOR_MODE, DEFAULT_ACCENT_COLOR)
-    try:
-        dialog.show()
-
-        failing = SaveValidationWidget((settings, make_report(settings, passed=False)))
-        dialog.preview_widget = failing
-        dialog.accept()
-        assert failing.calls == 1
-        assert dialog.isVisible()
-        assert dialog.result() != QDialog.DialogCode.Accepted
-        assert len(warnings) == 1
-        parent, title, text = warnings[0]
-        assert parent is dialog
-        assert title == "Offline Previews"
-        assert "last known-good configuration was restored" in text
-        assert "Validation failed." in text
-        assert FAILED_STEP_LABEL in text and FAILED_STEP_DETAIL in text
-        assert "Offline previews could not be enabled." not in text
-
-        passing = SaveValidationWidget((settings, make_report(settings, passed=True)))
-        dialog.preview_widget = passing
-        dialog.accept()
-        assert passing.calls == 1
-        assert not dialog.isVisible()
-        assert dialog.result() == QDialog.DialogCode.Accepted
-        assert len(warnings) == 1
-    finally:
-        dialog.close()
-
-    # No validation needed (disabled or unchanged) also closes.
-    dialog = PreferencesDialog(False, DEFAULT_THEME_STYLE, DEFAULT_COLOR_MODE, DEFAULT_ACCENT_COLOR)
-    try:
-        dialog.show()
-        dialog.preview_widget = SaveValidationWidget((PreviewSettings(), None))
-        dialog.accept()
-        assert not dialog.isVisible()
-        assert dialog.result() == QDialog.DialogCode.Accepted
-        assert len(warnings) == 1
-    finally:
-        dialog.close()
-
-
 # ---------------------------------------------------------------------------
 # MainWindow.show_preferences / persist_preview_settings
 # ---------------------------------------------------------------------------
-def test_show_preferences_persists_changed_preview_settings(monkeypatch, tmp_path):
-    new_settings = enabled_settings(tmp_path)
+def test_show_preferences_persists_changed_ffmpeg_path(monkeypatch, tmp_path):
+    new_settings = PreviewSettings(ffmpeg_path=str(tmp_path / "ffmpeg.exe"))
 
     class FakePreferencesDialog:
         def __init__(self, include_paths, theme_style, color_mode, accent_color, parent):
@@ -709,11 +623,11 @@ def test_show_preferences_persists_changed_preview_settings(monkeypatch, tmp_pat
 
     assert window.preview_settings == new_settings
     expected = new_settings.as_mapping()
-    for key in PREVIEW_SETTING_KEYS:
-        assert ("setting", key, expected[key]) in window.settings.events
+    key = PREVIEWS_FFMPEG_PATH_SETTING
+    assert ("setting", key, expected[key]) in window.settings.events
     assert ("sync",) in window.settings.events
-    assert set(window.settings.written_keys()) == set(PREVIEW_SETTING_KEYS)
-    assert window.status_bar.messages == [("Preferences saved.", 3000)]
+    assert set(window.settings.written_keys()) == {PREVIEWS_FFMPEG_PATH_SETTING}
+    assert window.status_bar.messages == [("App settings saved.", 3000)]
 
 
 def test_show_preferences_does_not_persist_unchanged_preview_settings(monkeypatch, tmp_path):
@@ -789,88 +703,6 @@ def test_show_preferences_still_works_with_a_dialog_that_has_no_preview_support(
     assert ("setting", SEARCH_INCLUDE_PATHS_SETTING, True) in window.settings.events
     assert not any(key.startswith("previews/") for key in window.settings.written_keys())
     assert not hasattr(window, "preview_settings")
-
-
-def test_show_preferences_seeds_the_widget_and_persists_a_validated_enable_immediately(
-    monkeypatch, tmp_path
-):
-    validated_settings = enabled_settings(tmp_path)
-    dialogs = []
-
-    class FakeWidget:
-        def __init__(self):
-            self.seeded = []
-            self.validated = FakeSignal()
-
-        def set_settings(self, settings):
-            self.seeded.append(settings)
-
-    class FakePreferencesDialog:
-        def __init__(self, *args):
-            self.preview_widget = FakeWidget()
-            self.appearance_changed = FakeSignal()
-            dialogs.append(self)
-
-        def exec(self):
-            # The user ticks the box, validation passes, then cancels the dialog.
-            self.preview_widget.validated.emit(validated_settings)
-            return QDialog.DialogCode.Rejected
-
-    monkeypatch.setattr("jvvv.app.PreferencesDialog", FakePreferencesDialog)
-    monkeypatch.setattr(MainWindow, "apply_appearance", lambda self, *appearance: None)
-    current = PreviewSettings(root_directory=str(tmp_path / "old"))
-    window = make_preferences_window(preview_settings=current)
-
-    MainWindow.show_preferences(window)
-
-    assert dialogs[0].preview_widget.seeded == [current]
-    # Spec §2: a successful enable-validation is persisted even though the
-    # dialog was later cancelled.
-    assert window.preview_settings == validated_settings
-    assert ("setting", "previews/enabled", True) in window.settings.events
-    assert ("setting", "previews/root_directory", validated_settings.root_directory) in window.settings.events
-    assert ("sync",) in window.settings.events
-
-
-def test_persist_preview_settings_writes_qsettings_and_updates_an_open_cache_dialog(tmp_path):
-    ini = tmp_path / "jvvv.ini"
-
-    class FakeCacheDialog:
-        def __init__(self):
-            self.settings = []
-
-        def set_settings(self, settings):
-            self.settings.append(settings)
-
-    dialog = FakeCacheDialog()
-    refreshed = []
-    window = SimpleNamespace(
-        settings=QSettings(str(ini), QSettings.Format.IniFormat),
-        preview_settings=PreviewSettings(),
-        preview_cache_dialog=dialog,
-        on_search_selection_changed=lambda: refreshed.append(True),
-    )
-    new_settings = enabled_settings(
-        tmp_path, image=ImagePreviewProfile(max_dimension=1024, jpeg_quality=75)
-    )
-
-    MainWindow.persist_preview_settings(window, new_settings)
-
-    assert window.preview_settings == new_settings
-    assert dialog.settings == [new_settings]
-    assert refreshed == [True]
-    window.settings = None
-    assert load_preview_settings(QSettings(str(ini), QSettings.Format.IniFormat)) == new_settings
-
-    # Without an open cache dialog (or a search tab) it still persists.
-    bare = SimpleNamespace(
-        settings=QSettings(str(ini), QSettings.Format.IniFormat),
-        preview_settings=new_settings,
-        preview_cache_dialog=None,
-    )
-    MainWindow.persist_preview_settings(bare, PreviewSettings())
-    bare.settings = None
-    assert load_preview_settings(QSettings(str(ini), QSettings.Format.IniFormat)) == PreviewSettings()
 
 
 # ---------------------------------------------------------------------------
@@ -1058,7 +890,7 @@ def test_preview_unavailable_reason_explains_each_situation(tmp_path):
 
     assert MainWindow.preview_unavailable_reason(
         reason_window(PreviewSettings()), "image", None, hashed_row
-    ) == "No preview storage directory is configured in Settings > Preferences."
+    ) == "No preview storage directory is configured in Window > Preview Manager."
 
     assert MainWindow.preview_unavailable_reason(
         reason_window(enabled), "image", None, {"id": 1, "content_hash": None}
@@ -1066,7 +898,7 @@ def test_preview_unavailable_reason_explains_each_situation(tmp_path):
 
     assert MainWindow.preview_unavailable_reason(
         reason_window(enabled), "image", None, hashed_row
-    ) == "The offline preview location could not be determined."
+    ) == "The preview location could not be determined."
 
     failed = {"status": "failed", "error_message": "FFmpeg exited with code 1."}
     assert MainWindow.preview_unavailable_reason(
@@ -1083,7 +915,7 @@ def test_preview_unavailable_reason_explains_each_situation(tmp_path):
     assert MainWindow.preview_unavailable_reason(
         reason_window(disabled), "image", file_info(False), hashed_row
     ) == (
-        "No preview exists at the expected location and offline preview generation "
+        "No preview exists at the expected location and preview generation "
         "is disabled in Settings."
     )
 
@@ -1182,7 +1014,7 @@ def test_open_preview_for_a_vanished_file_explains_and_marks_the_status_missing(
         (
             window,
             "Preview Not Available",
-            f"The offline preview is not available.\n\n{GENERIC_MISSING_REASON}",
+            f"The preview is not available.\n\n{GENERIC_MISSING_REASON}",
         )
     ]
     row = catalogue.db.get_file_preview_status(file_id)
@@ -1207,7 +1039,7 @@ def test_open_preview_for_a_vanished_file_explains_and_marks_the_status_missing(
     )
     MainWindow.open_preview_for_target(window, catalogue.target(failed_id, "Videos/broken.mov"))
     assert infos[-1][2] == (
-        "The offline preview is not available.\n\n"
+        "The preview is not available.\n\n"
         "Preview generation failed during the last scan: FFmpeg exited with code 1."
     )
     assert catalogue.db.get_file_preview_status(failed_id)["status"] == "failed"
@@ -1258,7 +1090,7 @@ def test_open_preview_refuses_a_corrupt_preview_file_and_explains(monkeypatch, c
         assert parent is window
         assert title == "Preview Not Available"
         assert text.startswith(
-            "The offline preview is not available.\n\n" + INVALID_PREVIEW_REASON_PREFIX
+            "The preview is not available.\n\n" + INVALID_PREVIEW_REASON_PREFIX
         )
     # The file is present, just unreadable, so it is not recorded as missing:
     # the next scan detects the corruption and regenerates it (spec §11).
@@ -1272,7 +1104,7 @@ def test_open_preview_refuses_a_corrupt_preview_file_and_explains(monkeypatch, c
     write_corrupt_preview(settings, "video", video_digest)
     MainWindow.open_preview_for_target(window, catalogue.target(video_id, "Videos/corrupt.mp4"))
     assert infos[-1][2].startswith(
-        "The offline preview is not available.\n\n" + INVALID_PREVIEW_REASON_PREFIX
+        "The preview is not available.\n\n" + INVALID_PREVIEW_REASON_PREFIX
     )
     assert catalogue.db.get_file_preview_status(video_id) is None
 
@@ -1333,7 +1165,7 @@ def test_open_selected_search_preview_opens_the_selected_file_only(catalogue):
 # preview_property_rows (spec §20, §33, §46)
 # ---------------------------------------------------------------------------
 NOT_CONFIGURED_TEXT = (
-    "Not configured — choose a preview storage directory in Settings > Preferences "
+    "Not configured — choose a preview storage directory in Window > Preview Manager "
     "to generate previews while scanning"
 )
 
@@ -1440,13 +1272,13 @@ def test_preview_property_rows_when_nothing_was_stored_depend_on_the_enabled_fla
 
     disabled = dict(preview_property_rows(record, settings.with_enabled(False), "image"))
     assert disabled["Offline preview"] == (
-        "Not generated — offline preview generation is disabled in Settings"
+        "Not generated — preview generation is disabled in Settings"
     )
     assert "Preview status recorded" not in disabled
 
     enabled = dict(preview_property_rows(record, settings, "image"))
     assert enabled["Offline preview"] == (
-        "Not generated — rescan this volume with offline previews enabled"
+        "Not generated — rescan this volume with previews enabled"
     )
 
     unhashed = dict(preview_property_rows({"content_hash": None}, settings, "image"))
@@ -1469,7 +1301,7 @@ def test_preview_property_rows_flag_a_status_recorded_for_previous_content(tmp_p
 
     # The stale failure must not be presented as this content's failure.
     assert values["Offline preview"] == (
-        "Not generated — rescan this volume with offline previews enabled"
+        "Not generated — rescan this volume with previews enabled"
     )
     note = values["Preview status recorded"]
     assert note.startswith("failed")
@@ -1562,7 +1394,7 @@ def test_file_properties_add_offline_preview_rows_for_media_records(tmp_path):
     assert values["Media details"] == "Collected · ffprobe"
     assert values["Duration"] == "0:02.500"
     assert values["Dimensions"] == "1,920 × 1,080"
-    # ...and the offline preview block follows them.
+    # ...and the preview block follows them.
     assert values["Offline preview"] == "Available"
     assert values["Preview duration"] == "0:03.000"
     assert values["Preview stored at"] == str(preview)
@@ -1579,7 +1411,7 @@ def test_file_properties_add_offline_preview_rows_for_media_records(tmp_path):
     image_rows = dict(
         MainWindow.catalogue_item_property_rows(properties_window(preview_settings=settings), image_record)
     )
-    assert image_rows["Offline preview"] == "Not generated — rescan this volume with offline previews enabled"
+    assert image_rows["Offline preview"] == "Not generated — rescan this volume with previews enabled"
     assert image_rows["Preview profile"] == "JPEG · Max dimension: 1600 px · Quality: 82"
 
     text_record = media_record("notes.txt", "Docs/notes.txt", "txt", digest_for("notes"))
@@ -1804,7 +1636,7 @@ def test_scan_finished_with_preview_failures_reports_every_failure(main_window, 
     box = boxes.boxes[0]
     assert box.windowTitle() == "Scan Completed with Preview Errors"
     assert "Scan completed with preview errors." in box.text()
-    assert "Catalogue indexing succeeded, but some offline previews were not created." in box.text()
+    assert "Catalogue indexing succeeded, but some previews were not created." in box.text()
     summary = box.informativeText()
     assert summary.startswith("Offline Preview Summary")
     assert str(tmp_path / "previews") in summary
@@ -1885,7 +1717,7 @@ def test_scan_finished_with_all_previews_ok_shows_the_summary(main_window, monke
     assert len(boxes.boxes) == 1
     box = boxes.boxes[0]
     assert box.windowTitle() == "Offline Preview Summary"
-    assert box.text() == "Scan completed. All offline previews were generated or reused."
+    assert box.text() == "Scan completed. All previews were generated or reused."
     assert box.informativeText() == statistics.summary_text(str(tmp_path / "previews"))
     assert button_texts(box) == {"Close"}
 
@@ -1972,7 +1804,7 @@ def plan_window(settings: PreviewSettings, preflight_outcomes: list[bool], decis
         preview_settings=settings,
         run_preview_preflight=run_preflight,
         ask_preview_preflight_decision=ask,
-        show_preferences=lambda: opened_settings.append(True),
+        edit_preview_settings=lambda: opened_settings.append(True),
     )
     return window, asked, opened_settings
 
@@ -2003,11 +1835,11 @@ def test_plan_scan_previews_open_settings_re_evaluates_the_fixed_configuration(t
     fixed = enabled_settings(tmp_path)
     window, asked, opened_settings = plan_window(broken, [False, True], ["settings"])
 
-    def show_preferences():
+    def show_catalogue_settings():
         opened_settings.append(True)
         window.preview_settings = fixed
 
-    window.show_preferences = show_preferences
+    window.edit_preview_settings = show_catalogue_settings
 
     assert MainWindow.plan_scan_previews(window) == (fixed, None)
     assert len(asked) == 1
@@ -2017,11 +1849,11 @@ def test_plan_scan_previews_open_settings_re_evaluates_the_fixed_configuration(t
 def test_plan_scan_previews_open_settings_then_disabling_previews_scans_without_them(tmp_path):
     window, asked, opened_settings = plan_window(enabled_settings(tmp_path), [False], ["settings"])
 
-    def show_preferences():
+    def show_catalogue_settings():
         opened_settings.append(True)
         window.preview_settings = window.preview_settings.with_enabled(False)
 
-    window.show_preferences = show_preferences
+    window.edit_preview_settings = show_catalogue_settings
 
     assert MainWindow.plan_scan_previews(window) == (None, None)
     assert opened_settings == [True]
@@ -2033,7 +1865,8 @@ def test_preflight_decision_dialog_explains_the_problem_and_maps_its_buttons(app
     report = make_report(settings, passed=False, include_encode_tests=False)
     try:
         for click, expected in (
-            ("Open Settings", "settings"),
+            ("Preview Manager", "settings"),
+            ("App Settings", "app_settings"),
             ("Scan Without Previews", "without"),
             ("Cancel Scan", "cancel"),
             (None, "cancel"),
@@ -2054,9 +1887,9 @@ def test_preflight_decision_dialog_explains_the_problem_and_maps_its_buttons(app
             )
             assert box.detailedText() == report.report_text()
             # setDetailedText() adds Qt's own "Show Details..." toggle; the
-            # three decision buttons are exactly the ones the spec names.
+            # Settings links open the appropriate dialog; scan decisions remain explicit.
             decision_buttons = button_texts(box) - {"Show Details...", "Hide Details..."}
-            assert decision_buttons == {"Open Settings", "Scan Without Previews", "Cancel Scan"}
+            assert decision_buttons == {"Preview Manager", "App Settings", "Scan Without Previews", "Cancel Scan"}
             assert box.escapeButton().text() == "Cancel Scan"
             assert box.defaultButton().text() == "Cancel Scan"
     finally:
@@ -2293,11 +2126,11 @@ def test_snapshot_finished_message_states_the_preview_backup_policy(monkeypatch,
 # ---------------------------------------------------------------------------
 # Menu, help, cache manager plumbing (spec §22, §48)
 # ---------------------------------------------------------------------------
-def test_catalogue_menu_offers_the_preview_cache_manager(main_window):
+def test_window_menu_offers_the_offline_preview_manager(main_window):
     window = main_window
 
-    texts = [action.text() for action in window.catalogue_menu.actions()]
-    assert "Preview Cache…" in texts
+    texts = [action.text() for action in window.window_menu.actions()]
+    assert "Preview Manager" in texts
     assert window.preview_cache_action in window.catalogue_actions
     assert "preview" in window.preview_cache_action.toolTip().casefold()
     # Catalogue actions follow the open/closed state like the other entries.
@@ -2321,10 +2154,10 @@ def test_help_explains_offline_previews_and_the_backup_policy(app):
     finally:
         dialog.close()
 
-    assert "Offline previews" in html
-    assert "Generate offline previews while scanning" in html
+    assert "7. Previews" in html
+    assert "Generate previews while scanning" in html
     assert "Open Preview" in html and "Play Preview" in html
-    assert "Preview Cache" in html
+    assert "Preview Manager" in html
     assert "do not include offline preview files" in html
     assert "never displays or plays media" in html
 
@@ -2345,12 +2178,16 @@ def test_show_preview_cache_builds_one_dialog_and_wires_its_requests(monkeypatch
                 "delete_temporaries_requested",
                 "open_folder_requested",
                 "cancel_requested",
+                "settings_requested",
             ):
                 setattr(self, name, FakeSignal())
             created.append(self)
 
         def set_settings(self, settings):
             self.settings.append(settings)
+
+        def set_writable(self, writable):
+            self.writable = writable
 
         def show(self):
             self.shown += 1
@@ -2365,7 +2202,7 @@ def test_show_preview_cache_builds_one_dialog_and_wires_its_requests(monkeypatch
     first = enabled_settings(tmp_path)
     second = PreviewSettings(root_directory=str(tmp_path / "other"))
     window = SimpleNamespace(
-        db=object(),
+        db=SimpleNamespace(read_only=False),
         preview_settings=first,
         preview_cache_dialog=None,
         start_preview_store_scan=lambda: calls.append("scan"),
@@ -2374,6 +2211,9 @@ def test_show_preview_cache_builds_one_dialog_and_wires_its_requests(monkeypatch
         start_delete_temporaries=lambda: calls.append("temporaries"),
         open_preview_folder=lambda: calls.append("open"),
         cancel_preview_store_operation=lambda: calls.append("cancel"),
+        persist_preview_settings=lambda candidate: calls.append(("settings", candidate)),
+        show_preferences=lambda: calls.append("app settings"),
+        _catalogue_job_running=lambda: False,
     )
 
     MainWindow.show_preview_cache(window)
@@ -2829,12 +2669,12 @@ def test_interrupted_preview_summary_preserves_successful_indexing(main_window, 
     assert scan_outcome("completed", restored.as_dict()) == "completed_with_warnings"
     window.on_scan_finished(scan_result(statistics))
     assert window.scan_progress.format() == "Completed; previews interrupted"
-    assert boxes.boxes[-1].windowTitle() == "Offline Previews Interrupted"
+    assert boxes.boxes[-1].windowTitle() == "Previews Interrupted"
 
 
 @pytest.mark.parametrize("algorithm", ["sha256", "blake3", "xxh3_128"])
 def test_catalogue_hash_dropdown_lock_states(app, algorithm):
-    dialog = PreferencesDialog(False, DEFAULT_THEME_STYLE, DEFAULT_COLOR_MODE, DEFAULT_ACCENT_COLOR)
+    dialog = CatalogueSettingsDialog()
     try:
         assert not dialog.hash_algorithm_combo.isEnabled()
         dialog.set_catalogue_hash_settings(algorithm, locked=False)
@@ -2847,8 +2687,106 @@ def test_catalogue_hash_dropdown_lock_states(app, algorithm):
         dialog.close()
 
 
+def test_window_menu_opens_separate_app_and_catalogue_settings(catalogue_window, monkeypatch):
+    main_window = catalogue_window
+    opened = []
+
+    def inspect_app(dialog):
+        opened.append("app")
+        assert {group.title() for group in dialog.findChildren(QGroupBox)} == {
+            "Appearance", "Search", "FFmpeg",
+        }
+        assert not hasattr(dialog, "hash_algorithm_combo")
+        return QDialog.DialogCode.Rejected
+
+    def inspect_catalogue(dialog):
+        opened.append("catalogue")
+        assert not hasattr(dialog, "preview_widget")
+        assert not hasattr(dialog, "theme_combo")
+        assert not hasattr(dialog, "include_paths_check")
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(PreferencesDialog, "exec", inspect_app)
+    monkeypatch.setattr(CatalogueSettingsDialog, "exec", inspect_catalogue)
+    assert [action.text() for action in main_window.window_menu.actions()][:2] == [
+        "App Settings", "Catalogue Settings",
+    ]
+    main_window.preferences_action.trigger()
+    main_window.catalogue_settings_action.trigger()
+    assert opened == ["app", "catalogue"]
+
+
 @pytest.mark.parametrize("accepted", [True, False])
-def test_hash_choice_is_saved_only_when_preferences_are_accepted(main_window, tmp_path, monkeypatch, accepted):
+def test_app_settings_ffmpeg_change_preserves_preview_preferences(
+    main_window, tmp_path, monkeypatch, accepted
+):
+    initial = enabled_settings(
+        tmp_path, video=VideoPreviewProfile(fps=0.333, max_height=720, crf=28, preset="fast")
+    )
+    main_window.preview_settings = initial
+    save_preview_settings(main_window.settings, initial)
+    new_path = str(tmp_path / "different-ffmpeg.exe")
+
+    def change_ffmpeg(dialog):
+        assert dialog.preview_settings() == initial
+        dialog.ffmpeg_edit.setText(new_path)
+        return QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(PreferencesDialog, "exec", change_ffmpeg)
+    main_window.show_preferences()
+
+    expected = replace(initial, ffmpeg_path=new_path) if accepted else initial
+    assert main_window.preview_settings == expected
+    assert load_preview_settings(main_window.settings) == PreviewSettings(ffmpeg_path=expected.ffmpeg_path)
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_app_settings_validates_ffmpeg_changes_before_accepting(app, tmp_path, monkeypatch, passed):
+    initial = enabled_settings(tmp_path)
+    candidate = replace(initial, ffmpeg_path=str(tmp_path / "ffmpeg.exe"))
+    validated = []
+    warnings = []
+
+    def validate(settings, *, include_encode_tests):
+        assert include_encode_tests
+        validated.append(settings)
+        return make_report(settings, passed=passed)
+
+    monkeypatch.setattr(app_module, "validate_preview_configuration", validate)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    dialog = PreferencesDialog(
+        False, DEFAULT_THEME_STYLE, DEFAULT_COLOR_MODE, DEFAULT_ACCENT_COLOR,
+        preview_settings=initial,
+    )
+    try:
+        dialog.show()
+        dialog.ffmpeg_edit.setText(candidate.ffmpeg_path)
+        dialog.accept()
+        assert validated == [candidate]
+        assert (dialog.result() == QDialog.DialogCode.Accepted) == passed
+        assert dialog.isVisible() == (not passed)
+        assert dialog.preview_settings() == (candidate if passed else initial)
+        assert len(warnings) == (0 if passed else 1)
+        assert QApplication.overrideCursor() is None
+    finally:
+        dialog.close()
+
+
+def test_scan_preflight_can_open_app_settings_to_fix_ffmpeg(tmp_path):
+    broken = enabled_settings(tmp_path, ffmpeg_path=str(tmp_path / "missing.exe"))
+    fixed = replace(broken, ffmpeg_path="")
+    window, asked, _opened = plan_window(broken, [False, True], ["app_settings"])
+
+    def fix_ffmpeg():
+        window.preview_settings = fixed
+
+    window.show_preferences = fix_ffmpeg
+    assert MainWindow.plan_scan_previews(window) == (fixed, None)
+    assert len(asked) == 1
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_hash_choice_is_saved_only_when_catalogue_settings_are_accepted(main_window, tmp_path, monkeypatch, accepted):
     db = Database(tmp_path / "hash-choice.jvvv")
     main_window.db = db
     main_window.preview_settings = PreviewSettings()
@@ -2858,9 +2796,9 @@ def test_hash_choice_is_saved_only_when_preferences_are_accepted(main_window, tm
         dialog.hash_algorithm_combo.setCurrentIndex(dialog.hash_algorithm_combo.findData("xxh3_128"))
         return QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
 
-    monkeypatch.setattr(PreferencesDialog, "exec", choose_hash)
+    monkeypatch.setattr(CatalogueSettingsDialog, "exec", choose_hash)
     try:
-        main_window.show_preferences()
+        main_window.show_catalogue_settings()
         assert db.hash_algorithm == ("xxh3_128" if accepted else "sha256")
     finally:
         main_window.db = None

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import math
 import os
@@ -64,6 +64,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QStyle,
@@ -125,7 +126,6 @@ from .snapshot_repository import (
     SnapshotRepository,
     SnapshotResult,
     VerifyResult,
-    VolumeRestoreResult,
     inspect_relink_target,
     locate_repository_candidates,
     repository_link_settings,
@@ -141,7 +141,8 @@ from .media_metadata import (
 from .preview_cache import PreviewEntry, PreviewFailure, PreviewStoreStatistics
 from .preview_config import (
     BACKUP_POLICY_TEXT,
-    PREVIEW_SETTING_KEYS,
+    CATALOGUE_PREVIEW_SETTING_KEYS,
+    PREVIEWS_FFMPEG_PATH_SETTING,
     PreviewSettings,
 )
 from .preview_service import (
@@ -158,11 +159,11 @@ from .preview_service import (
     inspect_preview_file,
     preflight_preview_configuration,
     skipped_preflight_statistics,
+    validate_preview_configuration,
 )
 from .preview_ui import (
     DeletePreviewsWorker,
     DeleteTemporariesWorker,
-    OfflinePreviewSettingsWidget,
     PreviewCacheDialog,
     PreviewFailuresDialog,
     PreviewStoreStatisticsWorker,
@@ -208,6 +209,8 @@ VOLUME_CONNECTION_COLUMN = 7
 VOLUME_FULL_COLUMN = 18
 SEARCH_VOLUME_STATUS_COLUMN = 8
 LAST_CATALOGUE_PATH_SETTING = "catalogues/lastPath"
+RECENT_CATALOGUE_PATHS_SETTING = "catalogues/recentPaths"
+MAX_RECENT_CATALOGUES = 8
 SEARCH_INCLUDE_PATHS_SETTING = "search/includePaths"
 THEME_STYLE_SETTING = "appearance/themeStyle"
 COLOR_MODE_SETTING = "appearance/colorMode"
@@ -229,16 +232,41 @@ SCAN_PROGRESS_DETAIL_PREFIXES = (
 
 
 def load_preview_settings(settings: QSettings) -> PreviewSettings:
-    """Read the persisted offline-preview configuration (disabled by default)."""
+    """Read computer-specific preview options; catalogue preferences load on open."""
 
-    values = {key: settings.value(key) for key in PREVIEW_SETTING_KEYS}
-    return PreviewSettings.from_mapping(values)
+    return PreviewSettings.from_mapping({
+        PREVIEWS_FFMPEG_PATH_SETTING: settings.value(PREVIEWS_FFMPEG_PATH_SETTING),
+    })
 
 
 def save_preview_settings(settings: QSettings, preview_settings: PreviewSettings) -> None:
-    for key, value in preview_settings.as_mapping().items():
-        settings.setValue(key, value)
+    """Save the local FFmpeg path; preview generation preferences belong to a catalogue."""
+    settings.setValue(PREVIEWS_FFMPEG_PATH_SETTING, preview_settings.ffmpeg_path.strip())
     settings.sync()
+
+
+def load_recent_catalogue_paths(settings: QSettings) -> list[str]:
+    """Read recent locations without touching possibly offline drives."""
+    values = settings.value(RECENT_CATALOGUE_PATHS_SETTING)
+    if values is None:
+        values = [settings.value(LAST_CATALOGUE_PATH_SETTING, "", type=str)]
+    elif isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple)):
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip() or "\0" in value:
+            continue
+        path = os.path.abspath(os.path.expanduser(value.strip()))
+        key = os.path.normcase(path)
+        if key not in seen:
+            seen.add(key)
+            paths.append(path)
+        if len(paths) == MAX_RECENT_CATALOGUES:
+            break
+    return paths
 
 
 def preview_open_label(media_kind: str) -> str:
@@ -250,7 +278,7 @@ def preview_property_rows(
     preview_settings: PreviewSettings | None,
     media_kind: str,
 ) -> list[tuple[str, str]]:
-    """Properties rows describing the offline preview for an image or video."""
+    """Properties rows describing the preview for an image or video."""
 
     if media_kind not in {"image", "video"}:
         return []
@@ -261,7 +289,7 @@ def preview_property_rows(
             (
                 "Offline preview",
                 "Not configured — choose a preview storage directory in "
-                "Settings > Preferences to generate previews while scanning",
+                "Window > Preview Manager to generate previews while scanning",
             )
         )
         return rows
@@ -314,9 +342,9 @@ def preview_property_rows(
         if stored_message:
             summary += f" — {stored_message}"
     elif not preview_settings.enabled:
-        summary = "Not generated — offline preview generation is disabled in Settings"
+        summary = "Not generated — preview generation is disabled in Settings"
     else:
-        summary = "Not generated — rescan this volume with offline previews enabled"
+        summary = "Not generated — rescan this volume with previews enabled"
     rows.append(("Offline preview", summary))
     rows.append(("Preview profile", " · ".join(profile.describe())))
     if info is not None and info.exists and info.valid:
@@ -2598,7 +2626,7 @@ class VolumeDialog(_ValidatedDialog):
     def __init__(
         self,
         parent: QWidget | None = None,
-        title: str = "New Volume",
+        title: str = "Add Volume",
         volume=None,
         suggested_drive_id: str = "",
         master_options: list[Any] | None = None,
@@ -3028,7 +3056,7 @@ class BackupEvidenceDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Backup Evidence - saved catalogue evidence")
+        self.setWindowTitle("Backup Evidence")
         self.resize(980, 680)
         self.setMinimumSize(760, 520)
 
@@ -3555,7 +3583,7 @@ class BackupEvidenceDialog(QDialog):
                 meaning = "No applied scan data" if not applied else "See scan log"
             if preview_warnings:
                 outcome += " · preview errors"
-                meaning += "; some offline previews were not created (see the scan log)"
+                meaning += "; some previews were not created (see the scan log)"
             rows.append(
                 [
                     volume_references.get(volume_id, f"Volume {volume_id}"),
@@ -3573,7 +3601,7 @@ class BackupEvidenceDialog(QDialog):
 
 
 class SnapshotPickerDialog(QDialog):
-    """Choose one snapshot from a repository (used by Restore Catalogue from Snapshot)."""
+    """Choose the snapshot to use for a new catalogue."""
 
     def __init__(
         self,
@@ -3582,7 +3610,7 @@ class SnapshotPickerDialog(QDialog):
         manifests: list[SnapshotManifest],
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Choose Snapshot")
+        self.setWindowTitle("Create New Catalogue from Repository — Choose Snapshot")
         self.resize(720, 380)
         self.manifests = manifests
         self.selected: SnapshotManifest | None = None
@@ -3618,7 +3646,7 @@ class SnapshotPickerDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Restore…")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Choose New Catalogue Location…")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -3665,7 +3693,7 @@ class RelinkRepositoryDialog(QDialog):
         catalogue_uuid: str,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Relink Snapshot Repository")
+        self.setWindowTitle("Locate Snapshot Repository")
         self.resize(760, 420)
         self.link = link
         self.catalogue_uuid = catalogue_uuid
@@ -3709,7 +3737,7 @@ class RelinkRepositoryDialog(QDialog):
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Relink")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use This Repository")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
 
@@ -3807,33 +3835,55 @@ class RelinkRepositoryDialog(QDialog):
 
 
 class SnapshotHistoryDialog(QDialog):
-    """Version history of the open catalogue: browse, restore, delete, prune, verify."""
+    """Version history of the open catalogue: browse, create, delete, prune, verify."""
 
     def __init__(self, window: "MainWindow") -> None:
         super().__init__(window)
         self.window_ref = window
-        self.setWindowTitle("Snapshot History")
-        self.resize(960, 620)
+        self.setWindowTitle("Snapshot Manager")
+        self.resize(1040, 760)
         self.setModal(False)
         self.manifests: list[SnapshotManifest] = []
         self.repository_path: Path | None = None
         self.link: RepositoryLink | None = None
 
+        self.repository_group = QGroupBox("Repository")
+        self.repository_status_label = QLabel()
+        status_font = self.repository_status_label.font()
+        status_font.setBold(True)
+        self.repository_status_label.setFont(status_font)
         self.location_label = QLabel("")
         self.location_label.setWordWrap(True)
         self.location_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.stats_label = QLabel("")
         self.stats_label.setObjectName("mutedLabel")
         self.stats_label.setWordWrap(True)
-        self.relink_button = QPushButton("Relink…")
+        self.relink_button = QPushButton("Locate Repository…")
         self.relink_button.setToolTip(
             "Point the catalogue at its repository after the folder was moved or renamed"
         )
         self.relink_button.clicked.connect(self.relink)
-
+        self.refresh_button = QPushButton("Check Again")
+        self.refresh_button.setToolTip("Check the repository location again, for example after reconnecting its drive")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.repository_tools_button = QPushButton("Repository Tools")
+        tools_menu = QMenu(self.repository_tools_button)
+        self.verify_action = tools_menu.addAction("Verify Repository…")
+        self.verify_action.setToolTip("Check the integrity of all snapshots in this repository")
+        self.verify_action.triggered.connect(self.verify)
+        self.prune_action = tools_menu.addAction("Reclaim Unused Space…")
+        self.prune_action.setToolTip("Remove stored data no longer used by any snapshot")
+        self.prune_action.triggered.connect(self.prune)
+        self.repository_tools_button.setMenu(tools_menu)
         header = QHBoxLayout()
-        header.addWidget(self.location_label, 1)
+        header.addWidget(self.repository_status_label, 1)
         header.addWidget(self.relink_button)
+        header.addWidget(self.refresh_button)
+        header.addWidget(self.repository_tools_button)
+        repository_layout = QVBoxLayout(self.repository_group)
+        repository_layout.addLayout(header)
+        repository_layout.addWidget(self.location_label)
+        repository_layout.addWidget(self.stats_label)
 
         self.snapshot_table = QTableWidget(0, 5)
         self.snapshot_table.setHorizontalHeaderLabels(
@@ -3851,106 +3901,128 @@ class SnapshotHistoryDialog(QDialog):
             ["Drive ID", "Name", "Files", "Folders", "Change in this snapshot"]
         )
         self.volume_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.volume_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.volume_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.volume_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.volume_table.verticalHeader().setVisible(False)
         self.volume_table.horizontalHeader().setStretchLastSection(True)
-        self.volume_table.itemSelectionChanged.connect(self.update_buttons)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
-        snapshots_box = QGroupBox("Snapshots")
-        snapshots_layout = QVBoxLayout(snapshots_box)
-        snapshots_layout.addWidget(self.snapshot_table)
-        volumes_box = QGroupBox("Volumes in the selected snapshot")
-        volumes_layout = QVBoxLayout(volumes_box)
-        volumes_layout.addWidget(self.volume_table)
-        splitter.addWidget(snapshots_box)
-        splitter.addWidget(volumes_box)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-
+        self.snapshots_group = QGroupBox("Snapshots")
+        snapshots_layout = QVBoxLayout(self.snapshots_group)
         self.create_button = QPushButton("Create Snapshot…")
         self.create_button.setObjectName("primaryButton")
-        self.restore_button = QPushButton("Restore Catalogue…")
-        self.restore_volume_button = QPushButton("Restore Selected Volume…")
-        self.delete_button = QPushButton("Delete Snapshot")
-        self.prune_button = QPushButton("Prune Unreferenced Blobs")
-        self.verify_button = QPushButton("Verify Repository")
-        self.close_button = QPushButton("Close")
+        self.create_button.setToolTip("Save the current catalogue state in a new snapshot")
         self.create_button.clicked.connect(self.create_snapshot)
-        self.restore_button.clicked.connect(self.restore_catalogue)
-        self.restore_volume_button.clicked.connect(self.restore_volume)
+        snapshot_toolbar = QHBoxLayout()
+        snapshot_hint = QLabel("Saved states of this catalogue, newest first.")
+        snapshot_hint.setObjectName("mutedLabel")
+        snapshot_toolbar.addWidget(snapshot_hint, 1)
+        snapshot_toolbar.addWidget(self.create_button)
+        snapshots_layout.addLayout(snapshot_toolbar)
+        self.snapshot_empty_label = QLabel()
+        self.snapshot_empty_label.setWordWrap(True)
+        self.snapshot_empty_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        snapshots_layout.addWidget(self.snapshot_empty_label, 1)
+        snapshots_layout.addWidget(self.snapshot_table)
+        self.selected_snapshot_label = QLabel()
+        self.selected_snapshot_label.setWordWrap(True)
+        self.delete_button = QPushButton("Delete Selected Snapshot…")
+        self.delete_button.setToolTip("Delete the selected snapshot from this repository")
         self.delete_button.clicked.connect(self.delete_snapshot)
-        self.prune_button.clicked.connect(self.prune)
-        self.verify_button.clicked.connect(self.verify)
+        snapshot_actions = QHBoxLayout()
+        snapshot_actions.addWidget(self.selected_snapshot_label, 1)
+        snapshot_actions.addWidget(self.delete_button)
+        snapshots_layout.addLayout(snapshot_actions)
+
+        self.volumes_group = QGroupBox("Volumes in the selected snapshot")
+        volumes_layout = QVBoxLayout(self.volumes_group)
+        self.volume_context_label = QLabel("Select a snapshot to see its volumes.")
+        self.volume_context_label.setObjectName("mutedLabel")
+        self.volume_context_label.setWordWrap(True)
+        volumes_layout.addWidget(self.volume_context_label)
+        volumes_layout.addWidget(self.volume_table)
+        splitter.addWidget(self.snapshots_group)
+        splitter.addWidget(self.volumes_group)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+
+        self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.close)
-
         buttons = QHBoxLayout()
-        buttons.addWidget(self.create_button)
-        buttons.addWidget(self.restore_button)
-        buttons.addWidget(self.restore_volume_button)
-        buttons.addWidget(self.delete_button)
-        buttons.addStretch(1)
-        buttons.addWidget(self.prune_button)
-        buttons.addWidget(self.verify_button)
+        home_note = QLabel(
+            "To create another catalogue from a snapshot, return Home and choose "
+            "Create New Catalogue from Repository."
+        )
+        home_note.setObjectName("mutedLabel")
+        home_note.setWordWrap(True)
+        buttons.addWidget(home_note, 1)
         buttons.addWidget(self.close_button)
-
         layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(self.stats_label)
+        layout.addWidget(self.repository_group)
         layout.addWidget(splitter, 1)
         layout.addLayout(buttons)
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
 
     # -- data ----------------------------------------------------------
 
     def refresh(self) -> None:
         window = self.window_ref
+        previous = self.selected_manifest()
+        previous_id = previous.snapshot_id if previous is not None else None
         link = window.repository_link()
         self.link = link
         self.repository_path = link.path if link is not None and link.linked else None
         self.manifests = []
+        self._repository_loaded = False
         self.snapshot_table.setRowCount(0)
         self.volume_table.setRowCount(0)
         if link is None:
+            self.repository_status_label.setText("No catalogue open")
             self.location_label.setText("No catalogue is open.")
             self.stats_label.setText("")
             self.update_buttons()
             return
         if link.status == LINK_UNLINKED:
+            self.repository_status_label.setText("No repository yet")
             self.location_label.setText("No snapshot repository yet.")
             self.stats_label.setText(f"The first snapshot creates {link.recorded_path}.")
             self.update_buttons()
             return
         if link.status == LINK_MISSING:
+            self.repository_status_label.setText("Repository not found")
             self.location_label.setText(
                 f"Repository offline — last known location: {link.recorded_path}"
             )
             self.stats_label.setText(
-                "The folder is not there. Move it back, or use Relink… to point the catalogue "
-                "at its new location."
+                "Reconnect the repository's drive and choose Check Again, or choose "
+                "Locate Repository if the folder has moved."
             )
             self.update_buttons()
             return
         if link.status == LINK_WRONG:
+            self.repository_status_label.setText("Repository unavailable")
             self.location_label.setText(f"Repository offline — {link.recorded_path}")
             self.stats_label.setText(
-                f"The folder cannot be used: {link.detail}. Use Relink… to choose the right one."
+                f"The folder cannot be used: {link.detail}. Choose Locate Repository to find the correct folder."
             )
             self.update_buttons()
             return
         repository = SnapshotRepository(self.repository_path)
+        self.repository_status_label.setText("Repository available")
         self.location_label.setText(f"Repository: {self.repository_path}")
         try:
             self.manifests = repository.list_snapshots()
             statistics = repository.statistics()
         except Exception as exc:
+            self.repository_status_label.setText("Repository could not be read")
             self.stats_label.setText(f"The repository could not be read: {exc}")
             self.update_buttons()
             return
+        self._repository_loaded = True
         self.stats_label.setText(
-            f"{statistics.snapshot_count} snapshot(s), {statistics.blob_count} blob(s) using "
-            f"{format_size(statistics.blob_bytes)}; {statistics.unreferenced_blobs} unreferenced "
-            f"blob(s) ({format_size(statistics.unreferenced_bytes)}) can be pruned."
+            f"{statistics.snapshot_count} snapshot(s) · {format_size(statistics.blob_bytes)} stored · "
+            f"{format_size(statistics.unreferenced_bytes)} unused space can be reclaimed."
         )
         previous: SnapshotManifest | None = None
         deltas: dict[str, Any] = {}
@@ -3976,6 +4048,8 @@ class SnapshotHistoryDialog(QDialog):
                     parts.append(f"{len(delta.history_changed)} scan history")
                 if delta.metadata_changed:
                     parts.append(f"{len(delta.metadata_changed)} details edited")
+                if delta.preview_settings_changed:
+                    parts.append("preview settings")
                 change_text = ", ".join(parts)
             row = self.snapshot_table.rowCount()
             self.snapshot_table.insertRow(row)
@@ -3992,7 +4066,11 @@ class SnapshotHistoryDialog(QDialog):
                 self.snapshot_table.setItem(row, column, item)
         self.snapshot_table.resizeColumnsToContents()
         if self.snapshot_table.rowCount():
-            self.snapshot_table.selectRow(0)
+            selected_row = next((
+                row for row in range(self.snapshot_table.rowCount())
+                if self.snapshot_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == previous_id
+            ), 0)
+            self.snapshot_table.selectRow(selected_row)
         self.populate_selected()
 
     def selected_manifest(self) -> SnapshotManifest | None:
@@ -4002,15 +4080,22 @@ class SnapshotHistoryDialog(QDialog):
         snapshot_id = items[0].data(Qt.ItemDataRole.UserRole)
         return next((item for item in self.manifests if item.snapshot_id == snapshot_id), None)
 
-    def selected_volume(self) -> tuple[str, str] | None:
-        items = self.volume_table.selectedItems()
-        if not items:
-            return None
-        return items[0].data(Qt.ItemDataRole.UserRole), items[0].data(Qt.ItemDataRole.UserRole + 1)
-
     def populate_selected(self) -> None:
         self.volume_table.setRowCount(0)
         manifest = self.selected_manifest()
+        description = (
+            f"{display_db_time(manifest.created_at)}"
+            + (f" — {manifest.label}" if manifest.label else "")
+        ) if manifest is not None else ""
+        self.selected_snapshot_label.setText(
+            f"Selected snapshot: {description}" if manifest is not None else "No snapshot selected."
+        )
+        self.volume_context_label.setText(
+            f"From snapshot: {description}."
+            if manifest is not None and manifest.volumes else
+            "This snapshot contains no volumes." if manifest is not None else
+            "Select a snapshot to see its volumes."
+        )
         if manifest is not None:
             delta = getattr(self, "_deltas", {}).get(manifest.snapshot_id)
             changed: dict[str, str] = {}
@@ -4039,11 +4124,6 @@ class SnapshotHistoryDialog(QDialog):
                 )
                 for column, text in enumerate(values):
                     item = QTableWidgetItem(text)
-                    item.setData(Qt.ItemDataRole.UserRole, record.uuid)
-                    item.setData(
-                        Qt.ItemDataRole.UserRole + 1,
-                        volume_reference(record.drive_id or None, record.name or None),
-                    )
                     self.volume_table.setItem(row, column, item)
             self.volume_table.resizeColumnsToContents()
         self.update_buttons()
@@ -4052,13 +4132,36 @@ class SnapshotHistoryDialog(QDialog):
         link = self.link
         has_repository = link is not None and link.linked
         manifest = self.selected_manifest()
-        self.create_button.setEnabled(link is not None)
-        self.restore_button.setEnabled(manifest is not None)
-        self.restore_volume_button.setEnabled(manifest is not None and self.selected_volume() is not None)
-        self.delete_button.setEnabled(manifest is not None)
-        self.prune_button.setEnabled(has_repository)
-        self.verify_button.setEnabled(has_repository)
-        self.relink_button.setEnabled(link is not None and not link.linked)
+        window = self.window_ref
+        busy = window._catalogue_job_running() or window._catalogue_open_in_progress()
+        writable = window.db is not None and not window.db.read_only
+        first_snapshot = link is not None and (
+            link.status == LINK_UNLINKED or (getattr(self, "_repository_loaded", False) and not self.manifests)
+        )
+        self.create_button.setText("Create First Snapshot…" if first_snapshot else "Create Snapshot…")
+        self.create_button.setEnabled(
+            link is not None and (link.linked or link.status == LINK_UNLINKED) and writable and not busy
+        )
+        self.delete_button.setEnabled(manifest is not None and not busy)
+        self.delete_button.setVisible(manifest is not None)
+        self.selected_snapshot_label.setVisible(manifest is not None)
+        self.volumes_group.setVisible(manifest is not None)
+        self.prune_action.setEnabled(has_repository and not busy)
+        self.verify_action.setEnabled(has_repository and not busy)
+        self.repository_tools_button.setVisible(has_repository)
+        self.repository_tools_button.setEnabled(has_repository and not busy)
+        needs_location = link is not None and link.offline
+        self.relink_button.setVisible(needs_location)
+        self.relink_button.setEnabled(needs_location and writable and not busy)
+        self.refresh_button.setEnabled(not busy)
+        self.snapshot_empty_label.setVisible(not self.manifests)
+        self.snapshot_empty_label.setText(
+            "Create your first snapshot to start this catalogue's saved history." if first_snapshot else
+            "Locate the repository or reconnect its drive to view snapshots." if needs_location else
+            "No snapshots are available."
+        )
+        self.snapshot_table.setVisible(bool(self.manifests))
+        self.volume_table.setVisible(manifest is not None and bool(manifest.volumes))
 
     # -- actions --------------------------------------------------------
 
@@ -4068,36 +4171,6 @@ class SnapshotHistoryDialog(QDialog):
 
     def create_snapshot(self) -> None:
         self.window_ref.create_snapshot_from_menu()
-
-    def restore_catalogue(self) -> None:
-        manifest = self.selected_manifest()
-        if manifest is None or self.repository_path is None:
-            return
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Restore Catalogue")
-        box.setText(
-            f"Restore the snapshot taken {display_db_time(manifest.created_at)}"
-            + (f" ({manifest.label})" if manifest.label else "")
-            + "."
-        )
-        replace = box.addButton("Replace Current Catalogue", QMessageBox.ButtonRole.DestructiveRole)
-        elsewhere = box.addButton("Restore to New Location…", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is replace:
-            self.window_ref.restore_snapshot_over_open_catalogue(self.repository_path, manifest)
-        elif clicked is elsewhere:
-            self.window_ref.restore_snapshot_to_new_location(self.repository_path, manifest)
-
-    def restore_volume(self) -> None:
-        manifest = self.selected_manifest()
-        selected = self.selected_volume()
-        if manifest is None or selected is None or self.repository_path is None:
-            return
-        volume_uuid, label = selected
-        self.window_ref.restore_volume_from_snapshot(self.repository_path, manifest, volume_uuid, label)
 
     def delete_snapshot(self) -> None:
         manifest = self.selected_manifest()
@@ -4114,20 +4187,13 @@ class SnapshotHistoryDialog(QDialog):
             self.window_ref.verify_repository(self.repository_path)
 
 
-class PreferencesDialog(QDialog):
-    appearance_changed = Signal(str, str, str)
-
+class CatalogueSettingsDialog(QDialog):
     def __init__(
         self,
-        include_paths: bool,
-        theme_style: str,
-        color_mode: str,
-        accent_color: str,
         parent: QWidget | None = None,
-        preview_settings: PreviewSettings | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Preferences - {APP_NAME}")
+        self.setWindowTitle(f"Catalogue Settings - {APP_NAME}")
         self.setMinimumWidth(520)
 
         hashing_group = QGroupBox("Catalogue hashing")
@@ -4140,6 +4206,74 @@ class PreferencesDialog(QDialog):
         hashing_form.addRow("Hash algorithm:", self.hash_algorithm_combo)
         hashing_form.addRow(self.hash_algorithm_explanation)
         self.set_catalogue_hash_settings(DEFAULT_HASH_ALGORITHM, locked=False, catalogue_open=False)
+
+        persistence_note = QLabel(
+            "Hashing is saved in this catalogue. Configure previews in Window > Preview Manager."
+        )
+        persistence_note.setWordWrap(True)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(hashing_group)
+        content_layout.addWidget(persistence_note)
+        content_layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(content)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(scroll, 1)
+        layout.addWidget(buttons)
+        self.resize(560, 300)
+
+    def set_catalogue_hash_settings(
+        self, algorithm: str, *, locked: bool, catalogue_open: bool = True, read_only: bool = False,
+    ) -> None:
+        self.hash_algorithm_combo.setCurrentIndex(self.hash_algorithm_combo.findData(algorithm))
+        self.hash_algorithm_combo.setEnabled(catalogue_open and not locked and not read_only)
+        if not catalogue_open:
+            text = "Open or create a catalogue to choose its hash algorithm."
+        elif read_only and not locked:
+            text = "This catalogue is open read-only. Reopen it for editing to choose its hash algorithm."
+        elif locked:
+            text = (
+                "Locked for this catalogue. The algorithm cannot change after the first volume "
+                "is added, even if all volumes are later deleted."
+            )
+        else:
+            text = (
+                "Used by every drive in this catalogue. Choose before adding the first volume; "
+                "the choice then locks permanently. All options read every byte. "
+                "SHA-256 and BLAKE3 are cryptographic; XXH3-128 prioritises speed."
+            )
+        self.hash_algorithm_explanation.setText(text)
+
+    def selected_hash_algorithm(self) -> str:
+        return str(self.hash_algorithm_combo.currentData())
+
+class PreferencesDialog(QDialog):
+    """Application settings: appearance, search, and the local FFmpeg executable."""
+
+    appearance_changed = Signal(str, str, str)
+
+    def __init__(
+        self,
+        include_paths: bool,
+        theme_style: str,
+        color_mode: str,
+        accent_color: str,
+        parent: QWidget | None = None,
+        preview_settings: PreviewSettings | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"App Settings - {APP_NAME}")
+        self.setMinimumWidth(520)
 
         search_group = QGroupBox("Search")
         self.include_paths_check = QCheckBox(
@@ -4193,12 +4327,24 @@ class PreferencesDialog(QDialog):
         self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
         self.color_mode_combo.currentIndexChanged.connect(self.emit_appearance_changed)
 
-        # Offline previews (spec §1).  The widget validates itself when the
-        # user enables previews and rolls the checkbox back on failure.
-        self.preview_widget = OfflinePreviewSettingsWidget(
-            preview_settings or PreviewSettings(),
-            parent=self,
+        ffmpeg_group = QGroupBox("FFmpeg")
+        self.ffmpeg_edit = QLineEdit()
+        self.ffmpeg_edit.setPlaceholderText("Leave empty to search PATH for ffmpeg")
+        self.ffmpeg_browse_button = QPushButton("Browse...")
+        self.ffmpeg_browse_button.clicked.connect(self.browse_ffmpeg)
+        ffmpeg_row = QHBoxLayout()
+        ffmpeg_row.addWidget(self.ffmpeg_edit, 1)
+        ffmpeg_row.addWidget(self.ffmpeg_browse_button)
+        ffmpeg_form = QFormLayout(ffmpeg_group)
+        ffmpeg_form.addRow("FFmpeg executable (optional):", ffmpeg_row)
+        ffmpeg_note = QLabel(
+            "Used to generate video previews for all catalogues on this computer. "
+            "For preview quality and storage, open a catalogue and choose "
+            "Window > Preview Manager."
         )
+        ffmpeg_note.setWordWrap(True)
+        ffmpeg_form.addRow(ffmpeg_note)
+        self.set_preview_settings(preview_settings or PreviewSettings())
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -4212,8 +4358,7 @@ class PreferencesDialog(QDialog):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.addWidget(appearance_group)
         content_layout.addWidget(search_group)
-        content_layout.addWidget(hashing_group)
-        content_layout.addWidget(self.preview_widget)
+        content_layout.addWidget(ffmpeg_group)
         content_layout.addStretch(1)
 
         scroll = QScrollArea()
@@ -4224,57 +4369,42 @@ class PreferencesDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(scroll, 1)
         layout.addWidget(buttons)
-        self.resize(620, 760)
-
-    def set_catalogue_hash_settings(
-        self, algorithm: str, *, locked: bool, catalogue_open: bool = True, read_only: bool = False,
-    ) -> None:
-        self.hash_algorithm_combo.setCurrentIndex(self.hash_algorithm_combo.findData(algorithm))
-        self.hash_algorithm_combo.setEnabled(catalogue_open and not locked and not read_only)
-        if not catalogue_open:
-            text = "Open or create a catalogue to choose its hash algorithm."
-        elif read_only and not locked:
-            text = "This catalogue is open read-only. Reopen it for editing to choose its hash algorithm."
-        elif locked:
-            text = (
-                "Locked for this catalogue. The algorithm cannot change after the first volume "
-                "is added, even if all volumes are later deleted."
-            )
-        else:
-            text = (
-                "Used by every drive in this catalogue. Choose before adding the first volume; "
-                "the choice then locks permanently. All options read every byte. "
-                "SHA-256 and BLAKE3 are cryptographic; XXH3-128 prioritises speed."
-            )
-        self.hash_algorithm_explanation.setText(text)
-
-    def selected_hash_algorithm(self) -> str:
-        return str(self.hash_algorithm_combo.currentData())
+        self.resize(620, 540)
 
     def preview_settings(self) -> PreviewSettings:
-        return self.preview_widget.settings()
+        return replace(self._preview_settings, ffmpeg_path=self.ffmpeg_edit.text().strip())
 
     def set_preview_settings(self, preview_settings: PreviewSettings) -> None:
-        self.preview_widget.set_settings(preview_settings)
+        self._preview_settings = preview_settings
+        self.ffmpeg_edit.setText(preview_settings.ffmpeg_path)
 
     def accept(self) -> None:  # type: ignore[override]
-        # Spec §35: an enabled configuration that changed since it was last
-        # proven to work must be re-validated before it becomes active.  On
-        # failure the widget reverts to the last known-good configuration and
-        # the dialog stays open so the user can see what was restored.
-        widget = getattr(self, "preview_widget", None)
-        if widget is not None:
-            _settings, report = widget.validate_for_save()
-            if report is not None and not report.passed:
+        candidate = self.preview_settings()
+        if candidate.enabled and candidate != self._preview_settings:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                report = validate_preview_configuration(candidate, include_encode_tests=True)
+            finally:
+                QApplication.restoreOverrideCursor()
+            if not report.passed:
+                self.ffmpeg_edit.setText(self._preview_settings.ffmpeg_path)
                 QMessageBox.warning(
                     self,
-                    "Offline Previews",
-                    "The changed offline-preview configuration did not pass validation, so "
-                    "the last known-good configuration was restored.\n\n"
+                    "FFmpeg",
+                    "The FFmpeg executable did not pass preview validation, so "
+                    "the previous executable was restored.\n\n"
                     + report.failure_summary(heading="Validation failed."),
                 )
                 return
         super().accept()
+
+    def browse_ffmpeg(self) -> None:
+        current = self.ffmpeg_edit.text().strip()
+        start = str(Path(current).parent) if current else str(Path.home())
+        filters = "Executables (*.exe);;All files (*)" if os.name == "nt" else "All files (*)"
+        chosen, _filter = QFileDialog.getOpenFileName(self, "Select FFmpeg Executable", start, filters)
+        if chosen:
+            self.ffmpeg_edit.setText(chosen)
 
     def choose_accent_color(self) -> None:
         starting_color = self._accent_color
@@ -4392,13 +4522,18 @@ class HelpDialog(QDialog):
     def _help_html(self) -> str:
         sections = [
             ("1. Create a catalogue",
-             "Choose <b>File → New Catalogue</b> and pick a name. A catalogue is a "
+             "Start on <b>Home</b>: open a recent catalogue, choose <b>Open Catalogue</b>, "
+             "or choose <b>Create Empty Catalogue</b> and pick a name. "
+             "Use <b>Close Catalogue / Return Home</b> to return Home before opening another. "
+             "The <b>Window</b> menu opens settings, managers, catalogue information, and Help. "
+             "App Settings and Help are always available; catalogue windows appear while a catalogue is open. "
+             "A catalogue is a "
              "<code>.jvvv</code> folder: <code>catalogue.sqlite</code> lists the drives, "
              "<code>volumes/</code> holds one self-contained file per drive, and "
              "<code>index.sqlite</code> is the search and evidence index, which JVVV "
              "rebuilds from the other two whenever it is missing."),
             ("2. Add a volume",
-             "Choose <b>New Volume</b>, select a connected drive or folder, "
+             "Choose <b>File &gt; Add Volume</b>, select a connected drive or folder, "
              "and it scans automatically. Scans read every file to record a full "
              "content hash, so large drives take longer. "
              "Scan it again later to review and apply catalogue changes."),
@@ -4407,29 +4542,33 @@ class HelpDialog(QDialog):
              "original drive is disconnected."),
             ("4. Search",
              "Find files and folders by name or extension across the stored catalogue. "
-             "Path matching can be enabled under <b>Settings &gt; Preferences</b>."),
+             "Path matching can be enabled under <b>Window &gt; App Settings</b>."),
             ("5. Review copy evidence",
-             "Choose <b>Catalogue &gt; Backup Evidence</b> to compare saved evidence. "
+             "Choose <b>Window &gt; Backup Evidence</b> to compare saved evidence. "
              "The analysis does not reconnect, rescan, or reread file contents. It first "
              "uses content hashes recorded by scans, then clearly labels metadata-only "
              "fallbacks when a comparable hash is unavailable."),
             ("6. Snapshots: version history and backup",
-             "Choose <b>File &gt; Create Snapshot</b> to record the whole catalogue in "
+             "Open <b>Window &gt; Snapshot Manager</b> and choose <b>Create Snapshot</b> to record the whole catalogue in "
              "its snapshot repository (a <code>.jvvvrepo</code> folder, by default next "
              "to the catalogue). Only drives whose contents changed since the last "
              "snapshot are written, so taking a snapshot after rescanning one drive takes "
-             "seconds and a few megabytes. <b>File &gt; Snapshot History</b> lists every "
-             "snapshot, shows what changed, restores the whole catalogue or a single drive "
-             "to that point in time, deletes old snapshots, and prunes or verifies the "
-             "repository. <b>File &gt; Restore Catalogue from Snapshot</b> rebuilds a "
+             "seconds and a few megabytes. <b>Snapshot Manager</b> lists every "
+             "snapshot, shows what changed and the volumes it contains, "
+             "deletes old snapshots, and reclaims unused space or verifies the "
+             "repository. On <b>Home</b>, <b>Create New Catalogue from Repository</b> creates a "
              "catalogue folder from any repository. Snapshots do not include offline "
              "preview files; to back up previews, copy the configured preview directory "
              "separately with your normal file-copy or backup software."),
-            ("7. Offline previews",
-             "Under <b>Settings &gt; Preferences &gt; Offline Previews</b> choose a "
+            ("7. Previews",
+             "Under <b>Window &gt; Preview Manager &gt; Previews</b> choose a "
              "preview storage directory (any local, removable, or network location), "
              "pick the image and video quality you want to spend storage on, and tick "
-             "<b>Generate offline previews while scanning</b>. JVVV immediately tests "
+             "<b>Generate previews while scanning</b>. Set the FFmpeg executable "
+             "under <b>Window &gt; App Settings</b> if it is not on PATH. "
+             "Choose <b>Apply</b> to save preview preferences in this catalogue; "
+             "snapshots preserve them too. FFmpeg's executable stays local to this computer. "
+             "Enabling previews tests "
              "the directory, the image encoder, and FFmpeg's H.264 (libx264) encoder; "
              "if anything fails, the box turns itself back off and the exact problem is "
              "shown. Previews are named by each file's content hash and preview profile, so "
@@ -4438,7 +4577,7 @@ class HelpDialog(QDialog):
              "could not be created. Use <b>Open Preview</b> / <b>Play Preview</b> in "
              "an item's context menu to open the preview in your operating system's "
              "default image or video application — JVVV never displays or plays media "
-             "itself. <b>Catalogue &gt; Preview Cache</b> shows what the preview "
+             "itself. <b>Window &gt; Preview Manager</b> shows what the preview "
              "directory holds and lists previews not referenced by the open catalogue."),
         ]
         section_html = "".join(
@@ -4453,7 +4592,7 @@ class HelpDialog(QDialog):
             a {{ text-decoration: none; }}
         </style>
         <h1>Quick start</h1>
-        <p><b>New Catalogue → New Volume → Browse or Search</b></p>
+        <p><b>Home → Open or Create Catalogue → Browse or Search → Close Catalogue / Return Home</b></p>
         {section_html}
         <hr>
         <p><b>About</b><br>{APP_NAME} is GPLv3 open-source software by Joemt.<br>
@@ -4793,35 +4932,6 @@ def snapshot_restore_worker(
         )
 
     return _RepositoryWorker(operation, description="restore")
-
-
-def volume_restore_worker(
-    repository_path: Path,
-    snapshot_id: str,
-    volume_uuid: str,
-    catalogue_path: Path,
-) -> _RepositoryWorker:
-    def operation(*, progress_callback, cancel_callback) -> VolumeRestoreResult:
-        repository = SnapshotRepository.open(repository_path)
-        result = repository.restore_volume(
-            snapshot_id,
-            volume_uuid,
-            catalogue_path,
-            progress_callback=progress_callback,
-        )
-        # Re-import the restored file into the index through a separate
-        # connection; the main-window connection sees the commit on its next read.
-        db = open_catalogue(
-            catalogue_path,
-            check_same_thread=False,
-            progress_callback=lambda done, total, message: progress_callback(
-                SimpleProgress(done, total, message)
-            ),
-        )
-        db.close()
-        return result
-
-    return _RepositoryWorker(operation, description="volume restore")
 
 
 def repository_prune_worker(repository_path: Path) -> _RepositoryWorker:
@@ -5269,8 +5379,9 @@ class MainWindow(QMainWindow):
         self._snapshot_close_pending = False
         self._snapshot_close_succeeded = False
         self.pending_restored_catalogue_path: Path | None = None
-        self.pending_restored_status_message = "Catalogue restored and opened."
+        self.pending_restored_status_message = "New catalogue created from repository and opened."
         self.snapshot_history_dialog: SnapshotHistoryDialog | None = None
+        self._repository_prompt_key: tuple[object, str, str] | None = None
         self.backup_analysis_thread: QThread | None = None
         self.backup_analysis_worker: BackupAnalysisWorker | None = None
         self.backup_evidence_dialog: BackupEvidenceDialog | None = None
@@ -5309,6 +5420,9 @@ class MainWindow(QMainWindow):
         self.volume_connection_delegate = ResponsiveStatusDelegate(self)
         self.search_connection_delegate = ResponsiveStatusDelegate(self)
         self.catalogue_actions: list[QAction] = []
+        self._catalogue_ui_open = False
+        self._catalogue_ui_busy = False
+        self._catalogue_ui_loading = False
         self.catalogue_widgets: list[QWidget] = []
         self.scan_blocked_actions: list[QAction] = []
         self.scan_blocked_widgets: list[QWidget] = []
@@ -5337,7 +5451,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._set_catalogue_open(False)
-        QTimer.singleShot(0, self.open_last_catalogue)
 
     def eventFilter(self, source: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if (
@@ -5370,85 +5483,48 @@ class MainWindow(QMainWindow):
         self.app_menu_bar = self.menuBar()
         self.file_menu = self.app_menu_bar.addMenu("&File")
 
-        self.new_catalogue_action = QAction("New Catalogue\u2026", self)
-        self.new_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.New))
-        self.new_catalogue_action.triggered.connect(self.new_catalogue)
-        self.file_menu.addAction(self.new_catalogue_action)
-
         self.open_catalogue_action = QAction("Open Catalogue\u2026", self)
         self.open_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Open))
         self.open_catalogue_action.triggered.connect(self.open_catalogue_from_dialog)
         self.file_menu.addAction(self.open_catalogue_action)
 
-        self.file_menu.addSeparator()
+        self.new_catalogue_action = QAction("Create Empty Catalogue\u2026", self)
+        self.new_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.New))
+        self.new_catalogue_action.triggered.connect(self.new_catalogue)
+        self.file_menu.addAction(self.new_catalogue_action)
 
-        self.create_snapshot_action = QAction("Create Snapshot\u2026", self)
-        self.create_snapshot_action.setToolTip(
-            "Record the catalogue in its snapshot repository; only changed drives are written"
-        )
-        self.create_snapshot_action.triggered.connect(self.create_snapshot_from_menu)
-        self.file_menu.addAction(self.create_snapshot_action)
-
-        self.snapshot_history_action = QAction("Snapshot History\u2026", self)
-        self.snapshot_history_action.setToolTip(
-            "Browse, restore, delete and verify the catalogue's snapshots"
-        )
-        self.snapshot_history_action.triggered.connect(self.show_snapshot_history)
-        self.file_menu.addAction(self.snapshot_history_action)
-
-        self.restore_snapshot_action = QAction(
-            "Restore Catalogue from Snapshot\u2026",
-            self,
+        self.restore_snapshot_action = QAction("Create New Catalogue from Repository\u2026", self)
+        self.restore_snapshot_action.setToolTip(
+            "Choose a repository and snapshot, then create and open a new catalogue"
         )
         self.restore_snapshot_action.triggered.connect(self.restore_snapshot_from_dialog)
         self.file_menu.addAction(self.restore_snapshot_action)
+        self.home_actions = [
+            self.new_catalogue_action, self.open_catalogue_action, self.restore_snapshot_action,
+        ]
+        self.home_file_separator = self.file_menu.addSeparator()
 
-        self.file_menu.addSeparator()
+        self.new_volume_action = QAction("Add Volume\u2026", self)
+        self.new_volume_action.triggered.connect(self.add_volume)
+        self.file_menu.addAction(self.new_volume_action)
+        self.workspace_file_separator = self.file_menu.addSeparator()
 
-
-        self.open_catalogue_location_action = QAction("Open Catalogue Location", self)
+        self.open_catalogue_location_action = QAction("Open Catalogue Folder", self)
         self.open_catalogue_location_action.triggered.connect(self.open_catalogue_location)
         self.file_menu.addAction(self.open_catalogue_location_action)
 
-        self.close_catalogue_action = QAction("Close Catalogue", self)
+        self.close_catalogue_action = QAction("Close Catalogue / Return Home", self)
         self.close_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Close))
         self.close_catalogue_action.triggered.connect(lambda: self.close_catalogue())
         self.file_menu.addAction(self.close_catalogue_action)
 
-        self.file_menu.addSeparator()
+        self.workspace_exit_separator = self.file_menu.addSeparator()
 
         self.exit_action = QAction("Exit", self)
         self.exit_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Quit))
         self.exit_action.setMenuRole(QAction.MenuRole.QuitRole)
         self.exit_action.triggered.connect(QApplication.instance().quit)
         self.file_menu.addAction(self.exit_action)
-
-        self.catalogue_menu = self.app_menu_bar.addMenu("&Catalogue")
-
-        self.new_volume_action = QAction("New Volume\u2026", self)
-        self.new_volume_action.triggered.connect(self.add_volume)
-        self.catalogue_menu.addAction(self.new_volume_action)
-
-        self.catalogue_menu.addSeparator()
-
-        self.backup_evidence_action = QAction("Backup Evidence\u2026", self)
-        self.backup_evidence_action.triggered.connect(self.show_backup_evidence)
-        self.backup_evidence_action.setToolTip(
-            "Compare metadata already saved in this catalogue; no drives are rescanned"
-        )
-        self.catalogue_menu.addAction(self.backup_evidence_action)
-
-        self.catalogue_info_action = QAction("Catalogue Info\u2026", self)
-        self.catalogue_info_action.triggered.connect(self.show_catalogue_info)
-        self.catalogue_menu.addAction(self.catalogue_info_action)
-
-        self.preview_cache_action = QAction("Preview Cache\u2026", self)
-        self.preview_cache_action.setToolTip(
-            "Inspect the offline preview directory and list previews not referenced by "
-            "this catalogue"
-        )
-        self.preview_cache_action.triggered.connect(self.show_preview_cache)
-        self.catalogue_menu.addAction(self.preview_cache_action)
 
         self.view_menu = self.app_menu_bar.addMenu("&View")
         self.zoom_in_action = QAction("Zoom In", self)
@@ -5461,17 +5537,48 @@ class MainWindow(QMainWindow):
         self.zoom_out_action.triggered.connect(self.zoom_out)
         self.view_menu.addAction(self.zoom_out_action)
 
-        self.settings_menu = self.app_menu_bar.addMenu("&Settings")
-        self.preferences_action = QAction("Preferences\u2026", self)
+        self.window_menu = self.app_menu_bar.addMenu("&Window")
+        self.preferences_action = QAction("App Settings", self)
         self.preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
         self.preferences_action.triggered.connect(self.show_preferences)
-        self.settings_menu.addAction(self.preferences_action)
+        self.window_menu.addAction(self.preferences_action)
 
-        self.help_menu = self.app_menu_bar.addMenu("&Help")
+        self.catalogue_settings_action = QAction("Catalogue Settings", self)
+        self.catalogue_settings_action.triggered.connect(self.show_catalogue_settings)
+        self.window_menu.addAction(self.catalogue_settings_action)
+        self.window_settings_separator = self.window_menu.addSeparator()
+
+        self.snapshot_history_action = QAction("Snapshot Manager", self)
+        self.snapshot_history_action.setToolTip(
+            "Create and browse snapshots, delete old snapshots, and manage the repository"
+        )
+        self.snapshot_history_action.triggered.connect(self.show_snapshot_history)
+        self.window_menu.addAction(self.snapshot_history_action)
+
+        self.backup_evidence_action = QAction("Backup Evidence", self)
+        self.backup_evidence_action.triggered.connect(self.show_backup_evidence)
+        self.backup_evidence_action.setToolTip(
+            "Compare metadata already saved in this catalogue; no drives are rescanned"
+        )
+        self.window_menu.addAction(self.backup_evidence_action)
+
+        self.preview_cache_action = QAction("Preview Manager", self)
+        self.preview_cache_action.setToolTip(
+            "Inspect the preview directory and list previews not referenced by "
+            "this catalogue"
+        )
+        self.preview_cache_action.triggered.connect(self.show_preview_cache)
+        self.window_menu.addAction(self.preview_cache_action)
+        self.window_information_separator = self.window_menu.addSeparator()
+
+        self.catalogue_info_action = QAction("Catalogue Information", self)
+        self.catalogue_info_action.triggered.connect(self.show_catalogue_info)
+        self.window_menu.addAction(self.catalogue_info_action)
+
         self.help_action = QAction("Help", self)
         self.help_action.setShortcut(QKeySequence(QKeySequence.StandardKey.HelpContents))
         self.help_action.triggered.connect(self.show_help)
-        self.help_menu.addAction(self.help_action)
+        self.window_menu.addAction(self.help_action)
         # Some Qt platform plugins require the PySide menu-action wrappers to
         # stay alive alongside their C++ owners.
         self.menu_actions = self.app_menu_bar.actions()
@@ -5522,6 +5629,10 @@ class MainWindow(QMainWindow):
                 title_font.setPixelSize(title_font.pixelSize() + self.scaled_ui_value(8))
             title_font.setBold(True)
             self.welcome_title_label.setFont(title_font)
+        if hasattr(self, "catalogue_name_label"):
+            name_font = QFont(QApplication.font())
+            name_font.setBold(True)
+            self.catalogue_name_label.setFont(name_font)
 
         for table_name in ("volume_table", "file_table", "search_table"):
             table = getattr(self, table_name, None)
@@ -5532,6 +5643,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "folder_tree"):
             self.folder_tree.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
             self.folder_tree.setIndentation(self.scaled_ui_value(16))
+        if hasattr(self, "browser_backup_filter_combo"):
+            self.browser_backup_filter_combo.setMaximumWidth(self.scaled_ui_value(280))
         if hasattr(self, "up_button"):
             navigation_size = self.scaled_ui_value(26)
             self.up_button.setFixedSize(navigation_size, navigation_size)
@@ -5545,15 +5658,14 @@ class MainWindow(QMainWindow):
             configure_progress_bar(self.catalogue_loading_progress, self.ui_zoom)
         if hasattr(self, "detail_full"):
             configure_progress_bar(self.detail_full, self.ui_zoom)
-        if hasattr(self, "details_box"):
-            self.details_box.setMaximumHeight(self.scaled_ui_value(150))
         if hasattr(self, "workspace_splitter"):
             self.workspace_splitter.setHandleWidth(self.scaled_ui_value(3))
         if hasattr(self, "browser_splitter"):
             self.browser_splitter.setHandleWidth(self.scaled_ui_value(3))
         if hasattr(self, "welcome_new_button"):
-            self.welcome_new_button.setMinimumWidth(self.scaled_ui_value(240))
-            self.welcome_open_button.setMinimumWidth(self.scaled_ui_value(240))
+            for button in self.home_buttons:
+                button.setMinimumWidth(self.scaled_ui_value(320))
+            self.refresh_recent_catalogues()
         if hasattr(self, "catalogue_loading_progress"):
             self.catalogue_loading_path_label.setMaximumWidth(self.scaled_ui_value(700))
             self.catalogue_loading_progress.setMinimumWidth(self.scaled_ui_value(420))
@@ -5601,17 +5713,44 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.welcome_page)
         self.stack.addWidget(self.loading_page)
         self.stack.addWidget(self.catalogue_page)
-        self.setCentralWidget(self.stack)
+        self.catalogue_header = QWidget()
+        header_layout = QHBoxLayout(self.catalogue_header)
+        self.home_button = QPushButton("Close Catalogue / Return Home")
+        self.home_button.setToolTip("Close this catalogue and return to Home")
+        self.home_button.clicked.connect(self.close_catalogue_action.trigger)
+        self.catalogue_name_label = QLabel()
+        name_font = self.catalogue_name_label.font()
+        name_font.setBold(True)
+        self.catalogue_name_label.setFont(name_font)
+        self.catalogue_path_label = QLabel()
+        self.catalogue_path_label.setObjectName("mutedLabel")
+        self.catalogue_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.catalogue_path_label.setWordWrap(True)
+        identity = QVBoxLayout()
+        identity.addWidget(self.catalogue_name_label)
+        identity.addWidget(self.catalogue_path_label)
+        header_layout.addWidget(self.home_button)
+        header_layout.addLayout(identity, 1)
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.catalogue_header)
+        layout.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
 
     def _build_welcome_page(self) -> QWidget:
-        page = QWidget()
+        page = QScrollArea()
         page.setObjectName("welcomePage")
-        layout = QVBoxLayout(page)
+        page.setWidgetResizable(True)
+        page.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         self.welcome_layout = layout
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(14)
 
-        title = QLabel("No Catalogue Open")
+        title = QLabel("Home")
         title.setObjectName("welcomeTitle")
         title_font = title.font()
         title_font.setPointSize(title_font.pointSize() + 8)
@@ -5620,22 +5759,63 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.welcome_title_label = title
 
-        description = QLabel("Create a new catalogue folder or open an existing .jvvv catalogue folder.")
+        description = QLabel("Open a catalogue, start an empty one, or create one from a repository snapshot.")
         description.setObjectName("mutedLabel")
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
         description.setWordWrap(True)
 
-        self.welcome_new_button = QPushButton("Create New Catalogue")
-        self.welcome_new_button.setObjectName("primaryButton")
-        self.welcome_open_button = QPushButton("Open Existing Catalogue")
-        self.welcome_new_button.setMinimumWidth(240)
-        self.welcome_open_button.setMinimumWidth(240)
+        self.welcome_new_button = QPushButton("Create Empty Catalogue…")
+        self.welcome_open_button = QPushButton("Open Catalogue…")
+        self.welcome_open_button.setObjectName("primaryButton")
+        self.welcome_restore_button = QPushButton("Create New Catalogue from Repository…")
+        self.welcome_settings_button = QPushButton("App Settings…")
+        self.home_buttons = [
+            self.welcome_open_button, self.welcome_new_button, self.welcome_restore_button,
+        ]
+        for button in self.home_buttons:
+            button.setMinimumWidth(320)
+
+        recent_group = QGroupBox("Recent catalogues")
+        recent_group.setMaximumWidth(900)
+        recent_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        recent_layout = QVBoxLayout(recent_group)
+        recent_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.recent_catalogue_table = QTableWidget(0, 2)
+        self.recent_catalogue_table.setHorizontalHeaderLabels(["Catalogue", "Location"])
+        self.recent_catalogue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.recent_catalogue_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.recent_catalogue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.recent_catalogue_table.verticalHeader().setVisible(False)
+        self.recent_catalogue_table.horizontalHeader().setStretchLastSection(True)
+        self.recent_catalogue_table.setColumnWidth(0, 220)
+        self.recent_catalogue_table.doubleClicked.connect(lambda _index: self.open_recent_catalogue())
+        self.recent_catalogue_table.itemSelectionChanged.connect(self.update_recent_catalogue_buttons)
+        self.recent_empty_label = QLabel("Catalogues you open will appear here, most recent first.")
+        self.recent_empty_label.setObjectName("mutedLabel")
+        self.recent_open_button = QPushButton("Open Selected")
+        self.recent_open_button.clicked.connect(self.open_recent_catalogue)
+        self.recent_remove_button = QPushButton("Remove from List")
+        self.recent_remove_button.setToolTip("Forget this recent entry; the catalogue stays on disk")
+        self.recent_remove_button.clicked.connect(self.remove_recent_catalogue)
+        recent_buttons = QHBoxLayout()
+        recent_buttons.addWidget(self.recent_open_button)
+        recent_buttons.addWidget(self.recent_remove_button)
+        recent_buttons.addStretch(1)
+        recent_layout.addWidget(self.recent_empty_label)
+        recent_layout.addWidget(self.recent_catalogue_table)
+        recent_layout.addLayout(recent_buttons)
 
         layout.addWidget(title)
         layout.addWidget(description)
         layout.addSpacing(8)
-        layout.addWidget(self.welcome_new_button, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.welcome_open_button, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.welcome_new_button, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.welcome_restore_button, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(8)
+        layout.addWidget(recent_group)
+        layout.addWidget(self.welcome_settings_button, 0, Qt.AlignmentFlag.AlignCenter)
+        self.refresh_recent_catalogues()
+        page.setWidget(content)
         return page
 
     def _build_loading_page(self) -> QWidget:
@@ -5647,6 +5827,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(14)
 
         title = QLabel("Opening Catalogue")
+        self.catalogue_loading_title_label = title
         title_font = title.font()
         title_font.setPointSize(title_font.pointSize() + 6)
         title_font.setBold(True)
@@ -5676,6 +5857,82 @@ class MainWindow(QMainWindow):
             Qt.AlignmentFlag.AlignCenter,
         )
         return page
+
+    def refresh_recent_catalogues(self) -> None:
+        paths = load_recent_catalogue_paths(self.settings)
+        self.recent_catalogue_table.setRowCount(0)
+        for path in paths:
+            row = self.recent_catalogue_table.rowCount()
+            self.recent_catalogue_table.insertRow(row)
+            for column, text in enumerate((Path(path).name, path)):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                item.setToolTip(path)
+                self.recent_catalogue_table.setItem(row, column, item)
+        self.recent_empty_label.setVisible(not paths)
+        self.recent_catalogue_table.setVisible(bool(paths))
+        self.recent_open_button.setVisible(bool(paths))
+        self.recent_remove_button.setVisible(bool(paths))
+        if paths:
+            table = self.recent_catalogue_table
+            row_height = max(table.fontMetrics().height() + 12, self.scaled_ui_value(26))
+            table.verticalHeader().setDefaultSectionSize(row_height)
+            table.setFixedHeight(min(
+                self.scaled_ui_value(250),
+                table.horizontalHeader().sizeHint().height() + len(paths) * row_height
+                + table.frameWidth() * 2 + 4,
+            ))
+            self.recent_catalogue_table.selectRow(0)
+        self.update_recent_catalogue_buttons()
+
+    def selected_recent_catalogue(self) -> str | None:
+        items = self.recent_catalogue_table.selectedItems()
+        return str(items[0].data(Qt.ItemDataRole.UserRole)) if items else None
+
+    def _home_commands_available(self) -> bool:
+        return (
+            self.db is None
+            and not self._catalogue_ui_open
+            and not self._catalogue_ui_busy
+            and not self._catalogue_ui_loading
+            and not self._catalogue_open_in_progress()
+            and self.repository_worker is None
+        )
+
+    def update_recent_catalogue_buttons(self) -> None:
+        enabled = self._home_commands_available() and self.selected_recent_catalogue() is not None
+        self.recent_open_button.setEnabled(enabled)
+        self.recent_remove_button.setEnabled(enabled)
+
+    def remember_recent_catalogue(self, path: Path) -> None:
+        location = os.path.abspath(os.path.expanduser(str(path)))
+        key = os.path.normcase(location)
+        paths = [location] + [
+            existing for existing in load_recent_catalogue_paths(self.settings)
+            if os.path.normcase(existing) != key
+        ]
+        self.settings.setValue(RECENT_CATALOGUE_PATHS_SETTING, paths[:MAX_RECENT_CATALOGUES])
+        self.settings.setValue(LAST_CATALOGUE_PATH_SETTING, location)
+        self.settings.sync()
+        self.refresh_recent_catalogues()
+
+    def open_recent_catalogue(self) -> None:
+        if not self._home_commands_available():
+            return
+        path = self.selected_recent_catalogue()
+        if path is not None:
+            self.open_catalogue_path(Path(path))
+
+    def remove_recent_catalogue(self) -> None:
+        if not self._home_commands_available():
+            return
+        path = self.selected_recent_catalogue()
+        if path is None:
+            return
+        paths = [existing for existing in load_recent_catalogue_paths(self.settings) if existing != path]
+        self.settings.setValue(RECENT_CATALOGUE_PATHS_SETTING, paths)
+        self.settings.sync()
+        self.refresh_recent_catalogues()
 
     def _build_catalogue_workspace(self) -> QWidget:
         self.volume_table = VolumeTableView()
@@ -5798,7 +6055,7 @@ class MainWindow(QMainWindow):
     def _build_details_box(self) -> QGroupBox:
         box = QGroupBox("Selected Volume")
         box.setObjectName("detailsPanel")
-        box.setMaximumHeight(self.scaled_ui_value(180))
+        box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.detail_labels: dict[str, QLabel] = {}
         self.detail_full = QProgressBar()
         self.detail_full.setRange(0, 100)
@@ -5817,23 +6074,29 @@ class MainWindow(QMainWindow):
             (0, 0, "Drive ID", "drive_id"),
             (0, 2, "Name", "name"),
             (0, 4, "Connection", "connection"),
-            (1, 0, "Status", "register_status"),
-            (1, 2, "Condition", "condition"),
-            (1, 4, "Last Scan", "last_scan"),
+            (1, 0, "Connector", "connector"),
+            (1, 2, "Status", "register_status"),
+            (1, 4, "Condition", "condition"),
+            (2, 0, "Capacity", "capacity"),
+            (2, 2, "Used", "used"),
+            (2, 4, "Free", "free"),
+            (3, 0, "Files", "files"),
+            (3, 2, "Folders", "folders"),
+            (3, 4, "Last Scan", "last_scan"),
         ]
         for row, column, label, key in summary_rows:
             key_label = QLabel(label)
             key_label.setObjectName("detailKey")
             grid.addWidget(key_label, row, column)
-            grid.addWidget(self._detail_value_label(key), row, column + 1)
+            grid.addWidget(self._detail_value_label(key, word_wrap=key == "name"), row, column + 1)
 
-        path_row = 2
+        path_row = 4
         scan_path_label = QLabel("Scan Path")
         scan_path_label.setObjectName("detailKey")
         grid.addWidget(scan_path_label, path_row, 0)
-        grid.addWidget(self._detail_value_label("path"), path_row, 1, 1, 5)
+        grid.addWidget(self._detail_value_label("path", word_wrap=True), path_row, 1, 1, 5)
 
-        coverage_row = 3
+        coverage_row = 5
         coverage_label = QLabel("Other-copy coverage")
         coverage_label.setObjectName("detailKey")
         coverage_label.setToolTip(BACKUP_VOLUME_COVERAGE_TOOLTIP)
@@ -5842,8 +6105,8 @@ class MainWindow(QMainWindow):
         coverage_value.setToolTip(BACKUP_VOLUME_COVERAGE_TOOLTIP)
         grid.addWidget(coverage_value, coverage_row, 1, 1, 5)
 
-        full_row = 4
-        full_label = QLabel("Full")
+        full_row = 6
+        full_label = QLabel("Space used")
         full_label.setObjectName("detailKey")
         grid.addWidget(full_label, full_row, 0)
         grid.addWidget(self.detail_full, full_row, 1, 1, 5)
@@ -5891,20 +6154,25 @@ class MainWindow(QMainWindow):
         path_row.addWidget(self.up_button)
         path_row.addWidget(self.current_path_label, 1)
 
-        backup_filter_label = QLabel("Other-copy status")
+        backup_filter_label = QLabel("Filter files by copy status")
         backup_filter_label.setObjectName("detailKey")
         self.browser_backup_filter_combo = QComboBox()
         self.browser_backup_filter_combo.setObjectName("browserBackupFilter")
+        self.browser_backup_filter_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.browser_backup_filter_combo.setMinimumContentsLength(16)
+        self.browser_backup_filter_combo.setMaximumWidth(self.scaled_ui_value(280))
+        backup_filter_label.setBuddy(self.browser_backup_filter_combo)
+        self.browser_backup_filter_combo.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
         for label, key in BACKUP_FILTER_OPTIONS:
             self.browser_backup_filter_combo.addItem(label, key)
         self.browser_backup_filter_combo.setToolTip(
             "Filter by other-copy status. 'Needs attention' includes not confirmed, "
             "partial, name-and-size only, content differs, no copy found, outdated, "
             "and can't-tell items."
-        )
-        self.browser_backup_help_button = QPushButton("How matching works")
-        self.browser_backup_help_button.setToolTip(
-            "Explain what the coloured copy-evidence indicators mean"
         )
         # Always-visible answer to "why is the parent amber when its children
         # are green": the open folder's own verdict plus a tally of what is
@@ -5917,13 +6185,14 @@ class MainWindow(QMainWindow):
         )
         self.browser_status_strip.setVisible(False)
 
-        backup_filter_row = QHBoxLayout()
+        self.browser_file_toolbar = QWidget()
+        self.browser_file_toolbar.setObjectName("browserFileToolbar")
+        backup_filter_row = QHBoxLayout(self.browser_file_toolbar)
         backup_filter_row.setContentsMargins(0, 0, 0, 0)
         backup_filter_row.setSpacing(4)
         backup_filter_row.addWidget(backup_filter_label)
         backup_filter_row.addWidget(self.browser_backup_filter_combo)
         backup_filter_row.addStretch(1)
-        backup_filter_row.addWidget(self.browser_backup_help_button)
 
         self.file_table = QTableView()
         self.file_table.setObjectName("fileTable")
@@ -5940,12 +6209,21 @@ class MainWindow(QMainWindow):
             ),
         )
 
+        self.browser_file_pane = QWidget()
+        self.browser_file_pane.setObjectName("browserFilePane")
+        file_layout = QVBoxLayout(self.browser_file_pane)
+        file_layout.setContentsMargins(0, 0, 0, 0)
+        file_layout.setSpacing(self.scaled_ui_value(5))
+        file_layout.addWidget(self.browser_file_toolbar)
+        file_layout.addWidget(self.browser_status_strip)
+        file_layout.addWidget(self.file_table, 1)
+
         browser_splitter = QSplitter()
         self.browser_splitter = browser_splitter
         browser_splitter.setObjectName("browserSplitter")
         browser_splitter.setHandleWidth(3)
         browser_splitter.addWidget(self.folder_tree)
-        browser_splitter.addWidget(self.file_table)
+        browser_splitter.addWidget(self.browser_file_pane)
         browser_splitter.setStretchFactor(0, 1)
         browser_splitter.setStretchFactor(1, 2)
 
@@ -5957,8 +6235,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(5)
         layout.addWidget(self.offline_label)
         layout.addLayout(path_row)
-        layout.addLayout(backup_filter_row)
-        layout.addWidget(self.browser_status_strip)
         layout.addWidget(browser_splitter, 1)
         return widget
 
@@ -6093,7 +6369,7 @@ class MainWindow(QMainWindow):
         self.reveal_file_button.setEnabled(False)
         self.open_preview_button.setEnabled(False)
         self.open_preview_button.setToolTip(
-            "Open the offline preview in the operating system's default application"
+            "Open the preview in the operating system's default application"
         )
         self.search_backup_filter_combo = QComboBox()
         self.search_backup_filter_combo.setObjectName("searchBackupFilter")
@@ -6179,7 +6455,9 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.welcome_new_button.clicked.connect(self.new_catalogue)
         self.welcome_open_button.clicked.connect(self.open_catalogue_from_dialog)
-        self.catalogue_loading_cancel_button.clicked.connect(self.cancel_catalogue_open)
+        self.welcome_restore_button.clicked.connect(self.restore_snapshot_from_dialog)
+        self.welcome_settings_button.clicked.connect(self.show_preferences)
+        self.catalogue_loading_cancel_button.clicked.connect(self.cancel_home_operation)
         self.volume_filter_edit.textChanged.connect(lambda _text: self.refresh_volumes())
         self.volume_table.selectionModel().selectionChanged.connect(self.on_volume_selection_changed)
         self.volume_table.customContextMenuRequested.connect(self.show_volume_context_menu)
@@ -6191,7 +6469,6 @@ class MainWindow(QMainWindow):
         self.browser_backup_filter_combo.currentIndexChanged.connect(
             lambda _index: self.apply_browser_backup_filter()
         )
-        self.browser_backup_help_button.clicked.connect(self.show_backup_evidence)
         self.file_table.doubleClicked.connect(self.open_browser_index)
         self.file_table.customContextMenuRequested.connect(self.show_browser_context_menu)
         self.search_button.clicked.connect(self.perform_search)
@@ -6214,12 +6491,12 @@ class MainWindow(QMainWindow):
         self.catalogue_actions = [
             self.close_catalogue_action,
             self.open_catalogue_location_action,
-            self.create_snapshot_action,
             self.snapshot_history_action,
             self.new_volume_action,
             self.backup_evidence_action,
             self.catalogue_info_action,
             self.preview_cache_action,
+            self.catalogue_settings_action,
             self.refresh_action,
         ]
         self.catalogue_widgets = [
@@ -6231,9 +6508,7 @@ class MainWindow(QMainWindow):
         ]
         self.scan_blocked_actions = [
             self.new_volume_action,
-            self.create_snapshot_action,
             self.snapshot_history_action,
-            self.restore_snapshot_action,
         ]
         self.scan_blocked_widgets = []
 
@@ -6289,15 +6564,6 @@ class MainWindow(QMainWindow):
             original_appearance[2],
             self,
         )
-        hash_settings = getattr(dialog, "set_catalogue_hash_settings", None)
-        if callable(hash_settings):
-            catalogue = getattr(self, "db", None)
-            hash_settings(
-                catalogue.hash_algorithm if catalogue is not None else DEFAULT_HASH_ALGORITHM,
-                locked=catalogue.hash_algorithm_locked if catalogue is not None else False,
-                read_only=catalogue.read_only if catalogue is not None else False,
-                catalogue_open=catalogue is not None,
-            )
         preview_signal = getattr(dialog, "appearance_changed", None)
         if preview_signal is not None:
             preview_signal.connect(
@@ -6309,31 +6575,13 @@ class MainWindow(QMainWindow):
                 )
             )
         current_preview_settings = getattr(self, "preview_settings", None)
-        preview_widget = getattr(dialog, "preview_widget", None)
-        if preview_widget is not None and current_preview_settings is not None:
-            preview_widget.set_settings(current_preview_settings)
-            # Spec §2: a successful enable-validation is persisted immediately.
-            preview_widget.validated.connect(
-                lambda validated: MainWindow.persist_preview_settings(self, validated)
-            )
+        preview_setter = getattr(dialog, "set_preview_settings", None)
+        if callable(preview_setter) and current_preview_settings is not None:
+            preview_setter(current_preview_settings)
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             MainWindow.apply_appearance(self, *original_appearance)
             return
-
-        hash_changed = False
-        hash_getter = getattr(dialog, "selected_hash_algorithm", None)
-        catalogue = getattr(self, "db", None)
-        if catalogue is not None and callable(hash_getter):
-            chosen = hash_getter()
-            if chosen != catalogue.hash_algorithm:
-                try:
-                    catalogue.set_hash_algorithm(chosen)
-                    hash_changed = True
-                except (CatalogueError, ValueError) as exc:
-                    QMessageBox.warning(self, "Catalogue Hashing", str(exc))
-                    MainWindow.apply_appearance(self, *original_appearance)
-                    return
 
         include_paths = dialog.include_paths()
         theme_style = dialog.theme_style()
@@ -6352,10 +6600,10 @@ class MainWindow(QMainWindow):
             and new_preview_settings != current_preview_settings
         )
         if preview_changed:
-            MainWindow.persist_preview_settings(self, new_preview_settings)
+            MainWindow.persist_ffmpeg_path(self, new_preview_settings.ffmpeg_path)
         if not search_changed and not appearance_changed:
-            if preview_changed or hash_changed:
-                self.statusBar().showMessage("Preferences saved.", 3000)
+            if preview_changed:
+                self.statusBar().showMessage("App settings saved.", 3000)
             return
 
         self.search_include_paths = include_paths
@@ -6380,26 +6628,89 @@ class MainWindow(QMainWindow):
             self.search_edit.setPlaceholderText(self.search_placeholder_text())
             if self.db is not None and self.search_edit.text().strip():
                 self.perform_search()
-        self.statusBar().showMessage("Preferences saved.", 3000)
+        self.statusBar().showMessage("App settings saved.", 3000)
+
+    def show_catalogue_settings(self) -> None:
+        if self.db is None:
+            return
+        dialog = CatalogueSettingsDialog(self)
+        catalogue = self.db
+        dialog.set_catalogue_hash_settings(
+            catalogue.hash_algorithm if catalogue is not None else DEFAULT_HASH_ALGORITHM,
+            locked=catalogue.hash_algorithm_locked if catalogue is not None else False,
+            read_only=catalogue.read_only if catalogue is not None else False,
+            catalogue_open=catalogue is not None,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        hash_changed = False
+        if catalogue is not None and dialog.selected_hash_algorithm() != catalogue.hash_algorithm:
+            try:
+                catalogue.set_hash_algorithm(dialog.selected_hash_algorithm())
+                hash_changed = True
+            except (CatalogueError, ValueError) as exc:
+                QMessageBox.warning(self, "Catalogue Hashing", str(exc))
+                return
+        if hash_changed:
+            self.statusBar().showMessage("Catalogue settings saved.", 3000)
 
     def search_placeholder_text(self) -> str:
         if self.search_include_paths:
             return "Search filename, extension, folder, or relative path"
         return "Search filename, extension, or folder"
 
-    def persist_preview_settings(self, preview_settings: PreviewSettings) -> None:
-        """Store a validated offline-preview configuration and apply it now."""
-
-        self.preview_settings = preview_settings
-        save_preview_settings(self.settings, preview_settings)
+    def persist_preview_settings(self, preview_settings: PreviewSettings) -> bool:
+        """Apply catalogue preferences only after their registry write succeeds."""
+        if self.db is None or self.db.read_only:
+            QMessageBox.warning(self, "Previews", "Open this catalogue for editing to change its previews.")
+            return False
+        if self._catalogue_job_running() or self._catalogue_open_in_progress():
+            self._show_catalogue_job_running_message()
+            return False
+        try:
+            self.db.set_preview_settings(preview_settings)
+            applied = self.db.preview_settings(ffmpeg_path=self.preview_settings.ffmpeg_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Preview Settings Not Saved", str(exc))
+            return False
+        self.preview_settings = applied
         dialog = getattr(self, "preview_cache_dialog", None)
         if dialog is not None:
-            dialog.set_settings(preview_settings)
+            dialog.set_settings(applied)
         refresh_search = getattr(self, "on_search_selection_changed", None)
         if callable(refresh_search):
             refresh_search()
+        self.statusBar().showMessage("Preview settings saved in this catalogue.", 4000)
+        return True
 
-    # -- offline previews: opening -------------------------------------------
+    def persist_ffmpeg_path(self, path: str) -> bool:
+        """Keep the executable on this computer without changing catalogue preferences."""
+        current = getattr(self, "preview_settings", PreviewSettings())
+        updated = replace(current, ffmpeg_path=path.strip())
+        save_preview_settings(self.settings, updated)
+        self.preview_settings = updated
+        dialog = getattr(self, "preview_cache_dialog", None)
+        if dialog is not None:
+            dialog.set_ffmpeg_path(updated.ffmpeg_path)
+        return True
+
+    def load_catalogue_preview_settings(self, db: Database) -> PreviewSettings:
+        """Import legacy app preferences once, then use the catalogue's own configuration."""
+        ffmpeg_path = load_preview_settings(self.settings).ffmpeg_path
+        if not db.has_preview_settings():
+            legacy = PreviewSettings.from_mapping({
+                key: self.settings.value(key) for key in CATALOGUE_PREVIEW_SETTING_KEYS
+            })
+            if db.read_only:
+                return replace(legacy, ffmpeg_path=ffmpeg_path)
+            try:
+                db.set_preview_settings(legacy)
+            except Exception as exc:
+                self.statusBar().showMessage(f"Preview preferences could not be migrated: {exc}", 10000)
+                return replace(legacy, ffmpeg_path=ffmpeg_path)
+        return db.preview_settings(ffmpeg_path=ffmpeg_path)
+
+    # -- previews: opening -------------------------------------------
     def catalogue_item_media_kind(self, target: CatalogueItemRef) -> str | None:
         if target.is_folder:
             return None
@@ -6422,11 +6733,11 @@ class MainWindow(QMainWindow):
 
     def preview_unavailable_reason(self, media_kind: str, info, file_row) -> str:
         if self.preview_settings.root_path is None:
-            return "No preview storage directory is configured in Settings > Preferences."
+            return "No preview storage directory is configured in Window > Preview Manager."
         if file_row is not None and file_row["content_hash"] is None:
             return "No content hash is recorded for this file, so no preview path can be derived."
         if info is None:
-            return "The offline preview location could not be determined."
+            return "The preview location could not be determined."
         if not info.exists:
             status = self.db.get_file_preview_status(int(file_row["id"])) if self.db is not None and file_row is not None else None
             if status is not None and str(status["status"]) == DB_STATUS_FAILED:
@@ -6434,7 +6745,7 @@ class MainWindow(QMainWindow):
                 return "Preview generation failed during the last scan" + (f": {detail}" if detail else ".")
             if not self.preview_settings.enabled:
                 return (
-                    "No preview exists at the expected location and offline preview "
+                    "No preview exists at the expected location and preview "
                     "generation is disabled in Settings."
                 )
             return "No preview exists at the expected location. Rescan the volume to generate it."
@@ -6459,7 +6770,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Preview Not Available",
-                f"The offline preview is not available.\n\n{reason}",
+                f"The preview is not available.\n\n{reason}",
             )
             self.on_search_selection_changed()
             return
@@ -6749,7 +7060,7 @@ class MainWindow(QMainWindow):
     def _show_catalogue_info_dialog(self, info) -> None:
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Catalogue Info")
+        dialog.setWindowTitle("Catalogue Information")
         dialog.setMinimumWidth(self.scaled_ui_value(460))
 
         form = QFormLayout()
@@ -6818,9 +7129,9 @@ class MainWindow(QMainWindow):
             elif link.status == LINK_UNLINKED:
                 text = f"none yet — the first snapshot creates {link.recorded_path}"
             elif link.status == LINK_MISSING:
-                text = f"{link.recorded_path} (offline — relink it in Snapshot History)"
+                text = f"{link.recorded_path} (offline — choose Locate Repository in Snapshot Manager)"
             else:
-                text = f"{link.recorded_path} ({link.detail or 'wrong repository'} — relink it in Snapshot History)"
+                text = f"{link.recorded_path} ({link.detail or 'wrong repository'} — choose Locate Repository in Snapshot Manager)"
             rows.append(("Snapshot repository", text))
             report = db.last_reconcile
             if report is not None and report.orphan_files:
@@ -6848,7 +7159,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Catalogue info failed.", 4000)
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Critical)
-        dialog.setWindowTitle("Catalogue Info Failed")
+        dialog.setWindowTitle("Catalogue Information Failed")
         dialog.setText("The catalogue information could not be loaded.")
         dialog.setDetailedText(details)
         dialog.exec()
@@ -6896,6 +7207,44 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    def prompt_missing_repository(self, expected_catalogue: Database | None = None) -> None:
+        """Offer to locate an unavailable repository once per location per open catalogue."""
+        if expected_catalogue is not None and self.db is not expected_catalogue:
+            return
+        if (
+            self.db is None or self.db.read_only or self._catalogue_close_in_progress
+            or self._catalogue_open_in_progress() or self._catalogue_job_running()
+        ):
+            return
+        try:
+            link = self.repository_link()
+        except Exception as exc:
+            self.statusBar().showMessage(f"Could not check the snapshot repository: {exc}", 8000)
+            return
+        if link is None or not link.offline:
+            return
+        key = (self.db, str(link.recorded_path), link.status)
+        if self._repository_prompt_key == key:
+            return
+        self._repository_prompt_key = key
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Snapshot Repository Unavailable")
+        box.setText("The catalogue opened, but its snapshot repository is unavailable.")
+        reason = f"\n\n{link.detail}" if link.detail else ""
+        box.setInformativeText(
+            f"Last known location:\n{link.recorded_path}{reason}\n\n"
+            "If the folder moved, choose Locate Repository. If its drive is disconnected, "
+            "you can reconnect it later. You can continue browsing and editing the local catalogue."
+        )
+        locate = box.addButton("Locate Repository…", QMessageBox.ButtonRole.AcceptRole)
+        later = box.addButton("Continue Without Repository", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(later)
+        box.setEscapeButton(later)
+        box.exec()
+        if box.clickedButton() is locate:
+            self.relink_repository()
+
     def relink_repository(self) -> Path | None:
         """Point the catalogue at its repository after it moved (like relinking media)."""
 
@@ -6918,6 +7267,7 @@ class MainWindow(QMainWindow):
             return None
         if not self.record_repository_link(chosen):
             return None
+        self._repository_prompt_key = None
         self.statusBar().showMessage("Snapshot repository relinked.", 4000)
         self.refresh_snapshot_history_dialog()
         return chosen
@@ -6942,10 +7292,10 @@ class MainWindow(QMainWindow):
         )
         box.setText(
             f"The catalogue's snapshot repository is offline.\n\n{reason}\n\n"
-            "If you moved or renamed it, relink it. Creating a new repository starts the "
+            "If you moved or renamed it, choose Locate Repository. Creating a new repository starts the "
             "version history from scratch; the old one is left where it is."
         )
-        relink = box.addButton("Relink…", QMessageBox.ButtonRole.AcceptRole)
+        relink = box.addButton("Locate Repository…", QMessageBox.ButtonRole.AcceptRole)
         create = box.addButton("Create New Repository", QMessageBox.ButtonRole.DestructiveRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
         box.exec()
@@ -6958,7 +7308,7 @@ class MainWindow(QMainWindow):
                     self,
                     "Location In Use",
                     f"{link.recorded_path} is occupied by another repository. Move it away "
-                    "first, or relink to the correct one.",
+                    "first, or choose Locate Repository to find the correct one.",
                 )
                 return None
             return link.recorded_path
@@ -6999,6 +7349,7 @@ class MainWindow(QMainWindow):
         self.snapshot_history_dialog.show()
         self.snapshot_history_dialog.raise_()
         self.snapshot_history_dialog.activateWindow()
+        self.prompt_missing_repository()
 
     def refresh_snapshot_history_dialog(self) -> None:
         dialog = self.snapshot_history_dialog
@@ -7006,20 +7357,14 @@ class MainWindow(QMainWindow):
             dialog.refresh()
 
     def restore_snapshot_from_dialog(self) -> None:
-        """File menu: rebuild a catalogue from any repository, no catalogue required."""
+        """Home: choose a repository snapshot for a new catalogue."""
 
-        if self._catalogue_job_running() or self._catalogue_open_in_progress():
-            self._show_catalogue_job_running_message()
+        if not self._home_commands_available():
             return
         start_dir = Path.home()
-        current = self.catalogue_repository_path()
-        if current is not None and current.exists():
-            start_dir = current
-        elif self.catalogue_path is not None:
-            start_dir = self.catalogue_path.parent
         repository_text = QFileDialog.getExistingDirectory(
             self,
-            "Choose Snapshot Repository",
+            "Create New Catalogue — Choose Catalogue Repository",
             str(start_dir),
             QFileDialog.Option.ShowDirsOnly,
         )
@@ -7041,77 +7386,30 @@ class MainWindow(QMainWindow):
         self.restore_snapshot_to_new_location(repository_path, manifest)
 
     def restore_snapshot_to_new_location(self, repository_path: Path, manifest: SnapshotManifest) -> None:
-        selected = self._choose_restored_catalogue_path(repository_path, manifest)
-        if selected is None:
+        if not self._home_commands_available():
             return
-        target, overwrite = selected
-        if (
-            self.catalogue_path is not None
-            and target.resolve(strict=False) == self.catalogue_path.resolve(strict=False)
-        ):
-            QMessageBox.warning(
-                self,
-                "Catalogue Is Open",
-                "Choose a different destination, or use Snapshot History > Restore Catalogue "
-                "> Replace Current Catalogue to roll back the open catalogue.",
-            )
+        target = self._choose_restored_catalogue_path(repository_path, manifest)
+        if target is None:
             return
-        worker = snapshot_restore_worker(repository_path, manifest.snapshot_id, target, overwrite=overwrite)
-        self.pending_restored_status_message = "Catalogue restored and opened."
-        self._start_repository_worker(worker, "restore")
-
-    def restore_snapshot_over_open_catalogue(self, repository_path: Path, manifest: SnapshotManifest) -> None:
-        """Roll the open catalogue back to *manifest*: close, replace, reopen."""
-
-        if self.db is None or self.catalogue_path is None:
-            return
-        if self._catalogue_job_running() or self._catalogue_open_in_progress():
-            self._show_catalogue_job_running_message()
-            return
-        target = self.catalogue_path
-        answer = QMessageBox.question(
-            self,
-            "Replace Current Catalogue",
-            "Replace the open catalogue with the snapshot taken "
-            f"{display_db_time(manifest.created_at)}"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Create New Catalogue from Repository")
+        box.setText("Create and open this catalogue?")
+        box.setInformativeText(
+            f"Repository: {repository_path}\n"
+            f"Snapshot: {display_db_time(manifest.created_at)}"
             + (f" ({manifest.label})" if manifest.label else "")
-            + "?\n\nThe catalogue is closed, rebuilt from the snapshot, and reopened. "
-            "Changes made after that snapshot are lost unless a later snapshot holds them.\n\n"
-            f"{target}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            + f"\nNew catalogue: {target}"
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        create = box.addButton("Create and Open Catalogue", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(create)
+        box.exec()
+        if box.clickedButton() is not create:
             return
-        if not self.close_catalogue(show_status=False):
-            return
-        worker = snapshot_restore_worker(repository_path, manifest.snapshot_id, target, overwrite=True)
-        self.pending_restored_status_message = "Catalogue rolled back to the snapshot and reopened."
+        worker = snapshot_restore_worker(repository_path, manifest.snapshot_id, target, overwrite=False)
+        self.pending_restored_status_message = "New catalogue created from repository and opened."
         self._start_repository_worker(worker, "restore")
-
-    def restore_volume_from_snapshot(
-        self,
-        repository_path: Path,
-        manifest: SnapshotManifest,
-        volume_uuid: str,
-        volume_label: str,
-    ) -> None:
-        if self.db is None or self.catalogue_path is None:
-            return
-        if self._catalogue_job_running() or self._catalogue_open_in_progress():
-            self._show_catalogue_job_running_message()
-            return
-        answer = QMessageBox.question(
-            self,
-            "Restore Volume from Snapshot",
-            f"Restore {volume_label} to its state in the snapshot taken "
-            f"{display_db_time(manifest.created_at)}?\n\nOnly this drive's records change; "
-            "its current records are replaced and Backup Evidence is marked outdated.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        worker = volume_restore_worker(repository_path, manifest.snapshot_id, volume_uuid, self.catalogue_path)
-        self._start_repository_worker(worker, "volume restore")
 
     def delete_snapshot(self, repository_path: Path, manifest: SnapshotManifest) -> None:
         if self._catalogue_job_running():
@@ -7151,33 +7449,13 @@ class MainWindow(QMainWindow):
         self,
         repository_path: Path,
         manifest: SnapshotManifest,
-    ) -> tuple[Path, bool] | None:
-        dialog = QFileDialog(self, "Save Restored Catalogue")
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
-        dialog.setNameFilter(CATALOGUE_FILE_FILTER)
-        dialog.setDefaultSuffix(CATALOGUE_EXTENSION.lstrip("."))
-        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
-        dialog.setDirectory(str(repository_path.parent))
+    ) -> Path | None:
         suggested_stem = manifest.catalogue_name or repository_path.stem
-        dialog.selectFile(f"{suggested_stem} (restored){CATALOGUE_EXTENSION}")
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        selected = dialog.selectedFiles()
-        if not selected:
-            return None
-        path = catalogue_path_with_extension(selected[0])
-        overwrite = path.exists()
-        if overwrite:
-            answer = QMessageBox.question(
-                self,
-                "Overwrite Catalogue",
-                f"Replace the existing catalogue?\n\n{path}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return None
-        return path, overwrite
+        return self._choose_new_catalogue_destination(
+            "Create New Catalogue from Repository — Choose Location",
+            repository_path.parent,
+            f"{suggested_stem} (from snapshot){CATALOGUE_EXTENSION}",
+        )
 
     def _start_repository_worker(self, worker: _RepositoryWorker, operation: str) -> None:
         self.repository_operation = operation
@@ -7228,8 +7506,6 @@ class MainWindow(QMainWindow):
             self.on_snapshot_finished(result)
         elif operation == "restore":
             self.on_snapshot_restore_finished(result)
-        elif operation == "volume restore":
-            self.on_volume_restore_finished(result)
         elif operation == "prune":
             self.on_prune_finished(result)
         elif operation == "verify":
@@ -7268,11 +7544,11 @@ class MainWindow(QMainWindow):
         self.refresh_snapshot_history_dialog()
 
     def on_snapshot_restore_finished(self, result: RestoreResult) -> None:
-        self.scan_progress.setFormat("Catalogue restored")
+        self.scan_progress.setFormat("Catalogue created from repository")
         QMessageBox.information(
             self,
-            "Catalogue Restored",
-            "Every blob verified and the catalogue folder was rebuilt.\n\n"
+            "Catalogue Created from Repository",
+            "A new catalogue was created from the selected snapshot.\n\n"
             f"Catalogue: {result.catalogue_path}\n"
             f"Snapshot: {result.snapshot_id}\n"
             f"Volumes: {result.volumes_restored}, files: {result.files_restored:,}, "
@@ -7281,28 +7557,7 @@ class MainWindow(QMainWindow):
             "The search index was rebuilt; Backup Evidence must be analysed again.",
         )
         self.pending_restored_catalogue_path = result.catalogue_path
-        self.statusBar().showMessage("Catalogue restored.", 5000)
-
-    def on_volume_restore_finished(self, result: VolumeRestoreResult) -> None:
-        self.scan_progress.setFormat("Volume restored")
-        self.current_volume_id = None
-        self.backup_engine = None
-        if self.db is not None:
-            try:
-                self.backup_engine = BackupAnalysisEngine(self.db)
-            except Exception:
-                self.backup_engine = None
-        self.refresh_after_catalogue_write()
-        registered = "\nThe volume had been deleted and was registered again." if result.registered else ""
-        QMessageBox.information(
-            self,
-            "Volume Restored",
-            f"The volume was restored from snapshot {result.snapshot_id}.\n\n"
-            f"Volume file: {result.volume_file.name}{registered}\n\n"
-            "Backup Evidence is marked outdated; run the analysis again when convenient.",
-        )
-        self.statusBar().showMessage("Volume restored from snapshot.", 5000)
-        self.refresh_snapshot_history_dialog()
+        self.statusBar().showMessage("New catalogue created from repository.", 5000)
 
     def on_prune_finished(self, result: PruneResult) -> None:
         self.scan_progress.setFormat("Repository pruned")
@@ -7352,14 +7607,21 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def on_repository_cancelled(self) -> None:
+        operation = (
+            "Catalogue creation from repository"
+            if self.repository_operation == "restore" else self.repository_operation.title()
+        )
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(0)
-        self.scan_progress.setFormat(f"{self.repository_operation.title()} cancelled")
-        self.statusBar().showMessage(f"{self.repository_operation.title()} cancelled.", 4000)
+        self.scan_progress.setFormat(f"{operation} cancelled")
+        self.statusBar().showMessage(f"{operation} cancelled.", 4000)
 
     @Slot(object, str)
     def on_repository_failed(self, exc: Exception, details: str) -> None:
-        operation = self.repository_operation or "operation"
+        operation = (
+            "catalogue creation from repository"
+            if self.repository_operation == "restore" else self.repository_operation or "operation"
+        )
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(0)
         self.scan_progress.setFormat(f"{operation.title()} failed")
@@ -7385,17 +7647,11 @@ class MainWindow(QMainWindow):
 
     def _set_repository_running(self, running: bool) -> None:
         self._set_catalogue_busy(running)
-        enabled = not running and not self._catalogue_open_in_progress()
-        self.new_catalogue_action.setEnabled(enabled)
-        self.open_catalogue_action.setEnabled(enabled)
-        self.restore_snapshot_action.setEnabled(enabled)
-        self.welcome_new_button.setEnabled(enabled)
-        self.welcome_open_button.setEnabled(enabled)
+        self._update_context_actions()
         if running:
             labels = {
                 "snapshot": "Creating snapshot…",
-                "restore": "Restoring catalogue from snapshot…",
-                "volume restore": "Restoring volume from snapshot…",
+                "restore": "Creating new catalogue from repository…",
                 "prune": "Pruning snapshot repository…",
                 "verify": "Verifying snapshot repository…",
             }
@@ -7404,28 +7660,26 @@ class MainWindow(QMainWindow):
             self.scan_progress.setFormat(label)
             self.statusBar().showMessage(label)
             if self.db is None:
+                self.catalogue_loading_title_label.setText("Creating Catalogue from Repository")
                 self.catalogue_loading_path_label.setText(label)
                 self.catalogue_loading_progress.setRange(0, 0)
                 self.catalogue_loading_progress.setFormat(label)
-                self.catalogue_loading_cancel_button.setEnabled(False)
+                self.catalogue_loading_cancel_button.setEnabled(True)
                 self.stack.setCurrentWidget(self.loading_page)
         elif self.db is None and not self._catalogue_open_in_progress():
             self._set_catalogue_open(False)
 
     def new_catalogue(self) -> None:
-        if self._catalogue_open_in_progress() or self.repository_worker is not None:
+        if not self._home_commands_available():
             return
         path = self._choose_new_catalogue_path()
         if path is None:
             return
-        if self.db is not None and not self.close_catalogue(show_status=False):
-            return
-
         lock: QLockFile | None = None
         db: Database | None = None
         try:
             lock = self._acquire_catalogue_lock(path)
-            db = create_catalogue(path, overwrite=path.exists())
+            db = create_catalogue(path)
         except Exception as exc:
             if db is not None:
                 db.close()
@@ -7438,7 +7692,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Catalogue created.", 4000)
 
     def open_catalogue_from_dialog(self) -> None:
-        if self._catalogue_open_in_progress() or self.repository_worker is not None:
+        if not self._home_commands_available():
             return
         path_text = QFileDialog.getExistingDirectory(
             self,
@@ -7464,11 +7718,9 @@ class MainWindow(QMainWindow):
         self.open_catalogue_path(Path(path_text), status_message="Last catalogue opened.")
 
     def open_catalogue_path(self, path: str | Path, status_message: str = "Catalogue opened.") -> None:
-        if self._catalogue_open_in_progress() or self.repository_worker is not None:
+        if not self._home_commands_available():
             return
         path = locate_catalogue(path)
-        if self.db is not None and not self.close_catalogue(show_status=False):
-            return
 
         self.catalogue_open_cancel_requested = False
         self.catalogue_open_path = path
@@ -7670,6 +7922,9 @@ class MainWindow(QMainWindow):
         self.catalogue_open_thread = None
         self.catalogue_open_cancel_requested = False
         self._set_catalogue_loading(False)
+        catalogue = self.db
+        if catalogue is not None:
+            QTimer.singleShot(0, lambda: self.prompt_missing_repository(catalogue))
 
     def _catalogue_open_in_progress(self) -> bool:
         return (
@@ -7678,25 +7933,26 @@ class MainWindow(QMainWindow):
         )
 
     def _set_catalogue_loading(self, loading: bool, path: Path | None = None) -> None:
-        enabled = (
-            not loading
-            and not self._catalogue_open_in_progress()
-            and getattr(self, "repository_worker", None) is None
-        )
-        self.new_catalogue_action.setEnabled(enabled)
-        self.open_catalogue_action.setEnabled(enabled)
-        self.restore_snapshot_action.setEnabled(enabled)
-        self.welcome_new_button.setEnabled(enabled)
-        self.welcome_open_button.setEnabled(enabled)
+        self._catalogue_ui_loading = loading
+        self._update_context_actions()
         self.catalogue_loading_cancel_button.setEnabled(
             loading and not self.catalogue_open_cancel_requested
         )
         if loading:
+            self.catalogue_loading_title_label.setText("Opening Catalogue")
             self.catalogue_loading_path_label.setText(str(path) if path is not None else "")
             self.catalogue_loading_progress.setRange(0, 0)
             self.catalogue_loading_progress.setFormat("Opening and checking catalogue...")
             self.stack.setCurrentWidget(self.loading_page)
             self.statusBar().showMessage("Opening catalogue...")
+
+    def cancel_home_operation(self) -> None:
+        if self.db is None and self.repository_worker is not None:
+            self.repository_worker.cancel()
+            self.catalogue_loading_cancel_button.setEnabled(False)
+            self.catalogue_loading_progress.setFormat("Cancelling catalogue creation…")
+            return
+        self.cancel_catalogue_open()
 
     def close_catalogue(self, show_status: bool = True) -> bool:
         # Closing can enter a modal event loop while the snapshot worker runs.
@@ -7737,7 +7993,7 @@ class MainWindow(QMainWindow):
         box.setText("Create a snapshot before closing?")
         box.setInformativeText(text)
         create = box.addButton("Create Snapshot && Close", QMessageBox.ButtonRole.AcceptRole)
-        skip = box.addButton("Close Without Snapshot", QMessageBox.ButtonRole.DestructiveRole)
+        skip = box.addButton("Close Without Snapshot", QMessageBox.ButtonRole.ActionRole)
         cancel = box.addButton(QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(create)
         box.setEscapeButton(cancel)
@@ -7818,6 +8074,8 @@ class MainWindow(QMainWindow):
         self.catalogue_path = None
         self.catalogue_lock = None
         self.backup_engine = None
+        self.preview_settings = load_preview_settings(self.settings)
+        self.last_preview_statistics = None
         self.backup_volume_references = {}
         if self.backup_evidence_dialog is not None:
             self.backup_evidence_dialog.close()
@@ -7841,31 +8099,33 @@ class MainWindow(QMainWindow):
         return True
 
     def _choose_new_catalogue_path(self) -> Path | None:
-        dialog = QFileDialog(self, "New Catalogue")
+        return self._choose_new_catalogue_destination("Create Empty Catalogue", Path.home())
+
+    def _choose_new_catalogue_destination(
+        self, title: str, directory: Path, suggested_name: str = "",
+    ) -> Path | None:
+        dialog = QFileDialog(self, title)
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         dialog.setFileMode(QFileDialog.FileMode.AnyFile)
         dialog.setNameFilter(CATALOGUE_FILE_FILTER)
         dialog.setDefaultSuffix(CATALOGUE_EXTENSION.lstrip("."))
         dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
-        dialog.setDirectory(str(self.catalogue_path.parent if self.catalogue_path else Path.home()))
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-
-        selected = dialog.selectedFiles()
-        if not selected:
-            return None
-        path = catalogue_path_with_extension(selected[0])
-        if path.exists():
-            answer = QMessageBox.question(
-                self,
-                "Overwrite Catalogue",
-                f"Replace the existing catalogue?\n\n{path}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
+        dialog.setDirectory(str(directory))
+        if suggested_name:
+            dialog.selectFile(suggested_name)
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = dialog.selectedFiles()
+            if not selected:
                 return None
-        return path
+            path = catalogue_path_with_extension(selected[0])
+            if not path.exists():
+                return path
+            QMessageBox.warning(
+                self,
+                "Choose a New Location",
+                f"A folder or file already exists here. Choose a new name or location.\n\n{path}",
+            )
+        return None
 
     def _acquire_catalogue_lock(self, path: Path) -> QLockFile:
         return acquire_catalogue_lock(path)
@@ -7879,7 +8139,10 @@ class MainWindow(QMainWindow):
         initial_volume_items: list[VolumeItem] | None = None,
         connected_volume_snapshots: list[VolumeSnapshot] | None = None,
     ) -> None:
+        self.preview_settings = self.load_catalogue_preview_settings(db)
+        self.last_preview_statistics = None
         self.db = db
+        self._repository_prompt_key = None
         try:
             self.backup_engine = BackupAnalysisEngine(db)
             self.backup_engine.ensure_schema()
@@ -7887,7 +8150,7 @@ class MainWindow(QMainWindow):
             self.backup_engine = None
         self.catalogue_path = path
         self.catalogue_lock = lock
-        self.settings.setValue(LAST_CATALOGUE_PATH_SETTING, str(path.resolve(strict=False)))
+        self.remember_recent_catalogue(path)
         self._set_catalogue_open(True)
         report = getattr(db, "last_reconcile", None)
         if report is not None and report.rebuilt:
@@ -7900,6 +8163,7 @@ class MainWindow(QMainWindow):
             self.refresh_volumes()
         else:
             self._apply_volume_items(initial_volume_items)
+        QTimer.singleShot(0, lambda: self.prompt_missing_repository(db))
 
     def start_connected_volume_monitor(
         self,
@@ -8036,7 +8300,7 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(
             self,
-            "Catalogue Info Cancelling",
+            "Catalogue Information Cancelling",
             "Cancellation has been requested. Close the catalogue after loading stops.",
         )
         return False
@@ -8080,9 +8344,9 @@ class MainWindow(QMainWindow):
         if getattr(self, "preview_store_worker", None) is not None:
             QMessageBox.information(
                 self,
-                "Preview Cache Busy",
+                "Preview Manager Busy",
                 "Wait for the preview cache operation to finish or cancel it in "
-                "Catalogue > Preview Cache.",
+                "Window > Preview Manager.",
             )
             return
         if self.delete_worker is not None:
@@ -8094,7 +8358,7 @@ class MainWindow(QMainWindow):
         elif self.catalogue_info_worker is not None:
             QMessageBox.information(
                 self,
-                "Catalogue Info Loading",
+                "Catalogue Information Loading",
                 "Wait for catalogue information to finish loading.",
             )
         elif getattr(self, "repository_worker", None) is not None:
@@ -8118,6 +8382,7 @@ class MainWindow(QMainWindow):
             )
 
     def _set_catalogue_busy(self, busy: bool) -> None:
+        self._catalogue_ui_busy = busy
         enabled = self.db is not None and not busy
         for action in self.catalogue_actions:
             action.setEnabled(enabled)
@@ -8125,13 +8390,13 @@ class MainWindow(QMainWindow):
             widget.setEnabled(enabled)
         for shortcut in self.browser_shortcuts:
             shortcut.setEnabled(enabled)
-        if hasattr(self, "restore_snapshot_action"):
-            standalone_enabled = (
-                not busy
-                and not self._catalogue_open_in_progress()
-                and getattr(self, "repository_worker", None) is None
+        self._update_context_actions()
+        if self.snapshot_history_dialog is not None:
+            self.snapshot_history_dialog.update_buttons()
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.set_writable(
+                self.db is not None and not self.db.read_only and not busy
             )
-            self.restore_snapshot_action.setEnabled(standalone_enabled)
 
         if hasattr(self, "volume_table"):
             self.volume_table.setEnabled(enabled)
@@ -8146,8 +8411,13 @@ class MainWindow(QMainWindow):
             widget.setEnabled(enabled)
         if hasattr(self, "stop_scan_button"):
             self.stop_scan_button.setEnabled(running and not self.scan_cancel_requested)
+        if getattr(self, "preview_cache_dialog", None) is not None:
+            self.preview_cache_dialog.set_writable(
+                self.db is not None and not self.db.read_only and not running
+            )
 
     def _set_catalogue_open(self, is_open: bool) -> None:
+        self._catalogue_ui_open = is_open
         if hasattr(self, "stack"):
             self.stack.setCurrentWidget(self.catalogue_page if is_open else self.welcome_page)
         self.close_catalogue_action.setEnabled(is_open)
@@ -8165,7 +8435,29 @@ class MainWindow(QMainWindow):
         if not is_open:
             self.stop_connected_volume_monitor()
             self._clear_catalogue_views()
+            self.refresh_recent_catalogues()
+        self._update_context_actions()
         self._update_window_title()
+
+    def _update_context_actions(self) -> None:
+        is_open = self._catalogue_ui_open
+        home_enabled = self._home_commands_available()
+        for action in self.home_actions:
+            action.setVisible(not is_open)
+            action.setEnabled(home_enabled)
+        for button in self.home_buttons:
+            button.setEnabled(home_enabled)
+        self.recent_catalogue_table.setEnabled(home_enabled)
+        self.update_recent_catalogue_buttons()
+        for action in self.catalogue_actions:
+            action.setVisible(is_open)
+        self.home_file_separator.setVisible(not is_open)
+        self.workspace_file_separator.setVisible(is_open)
+        self.workspace_exit_separator.setVisible(is_open)
+        self.window_settings_separator.setVisible(is_open)
+        self.window_information_separator.setVisible(is_open)
+        self.catalogue_header.setVisible(is_open)
+        self.home_button.setEnabled(self.close_catalogue_action.isEnabled())
 
     def _clear_catalogue_views(self) -> None:
         self.current_volume_id = None
@@ -8192,9 +8484,13 @@ class MainWindow(QMainWindow):
 
     def _update_window_title(self) -> None:
         if self.catalogue_path is None:
-            self.setWindowTitle(APP_NAME)
+            self.setWindowTitle(f"{APP_NAME} - Home")
+            self.catalogue_name_label.clear()
+            self.catalogue_path_label.clear()
         else:
             self.setWindowTitle(f"{APP_NAME} - {self.catalogue_path.name}")
+            self.catalogue_name_label.setText(self.catalogue_path.name)
+            self.catalogue_path_label.setText(str(self.catalogue_path))
 
     def _show_catalogue_error(self, title: str, exc: Exception) -> None:
         message = str(exc) or "The catalogue could not be opened."
@@ -8296,7 +8592,7 @@ class MainWindow(QMainWindow):
         busy = self._catalogue_job_running()
 
         if not index.isValid():
-            new_action = menu.addAction("New Volume")
+            new_action = menu.addAction("Add Volume…")
             new_action.triggered.connect(self.add_volume)
             new_action.setEnabled(not busy)
             menu.exec(self.volume_table.viewport().mapToGlobal(point))
@@ -8306,7 +8602,7 @@ class MainWindow(QMainWindow):
         self.volume_table.setCurrentIndex(self.volume_model.index(index.row(), 0))
         scan_running = self.scan_worker is not None
 
-        new_action = menu.addAction("New Volume")
+        new_action = menu.addAction("Add Volume…")
         new_action.triggered.connect(self.add_volume)
         new_action.setEnabled(not busy)
         menu.addSeparator()
@@ -8362,6 +8658,7 @@ class MainWindow(QMainWindow):
         if volume is None:
             for widget in self.detail_labels.values():
                 widget.setText("-")
+                widget.setToolTip("")
             self.detail_full.setValue(0)
             return
 
@@ -8380,14 +8677,22 @@ class MainWindow(QMainWindow):
             "name": display_volume_name(volume["name"]),
             "path": current_source_path or volume["source_path"] or "-",
             "connection": "Connected" if connected else "Offline",
+            "connector": volume["connector"] or "Unknown",
             "register_status": volume["register_status"],
             "condition": volume["condition"],
+            "capacity": format_size(volume["capacity_bytes"]) if volume["capacity_bytes"] else "-",
+            "used": format_size(volume["used_bytes"]) if volume["capacity_bytes"] else "-",
+            "free": format_size(volume["free_bytes"]) if volume["capacity_bytes"] else "-",
+            "files": f"{int(volume['indexed_file_count'] or 0):,}",
+            "folders": f"{int(volume['indexed_folder_count'] or 0):,}",
             "last_scan": self._display_time(volume["last_scan_at"]),
             "backup_coverage": backup.text,
         }
         for key, value in values.items():
             self.detail_labels[key].setText(value)
         self.detail_labels["backup_coverage"].setToolTip(backup.tooltip)
+        self.detail_labels["path"].setToolTip(values["path"])
+        self.detail_labels["name"].setToolTip(values["name"])
         self.detail_full.setValue(full)
 
     def add_volume(self) -> None:
@@ -8423,7 +8728,7 @@ class MainWindow(QMainWindow):
                 edit_after_success=True,
             )
         except Exception as exc:
-            QMessageBox.critical(self, "New Volume Failed", str(exc))
+            QMessageBox.critical(self, "Add Volume Failed", str(exc))
 
     def choose_new_volume_location(self) -> str | None:
         directory = QFileDialog.getExistingDirectory(self, "Choose Volume to Scan", str(Path.home()))
@@ -8596,7 +8901,7 @@ class MainWindow(QMainWindow):
         self.scan_progress.setRange(0, 0)
         if preview_settings is not None:
             self.scan_progress.setFormat(
-                "Starting scan · content hashing enabled · offline previews enabled..."
+                "Starting scan · content hashing enabled · previews enabled..."
             )
         else:
             self.scan_progress.setFormat("Starting scan · content hashing enabled...")
@@ -8660,6 +8965,9 @@ class MainWindow(QMainWindow):
                 return settings, None
             choice = self.ask_preview_preflight_decision(report)
             if choice == "settings":
+                self.edit_preview_settings()
+                continue
+            if choice == "app_settings":
                 self.show_preferences()
                 continue
             if choice == "without":
@@ -8680,7 +8988,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def ask_preview_preflight_decision(self, report: PreviewValidationReport) -> str:
-        """Blocking decision dialog; returns 'settings', 'without', or 'cancel'."""
+        """Return 'settings', 'app_settings', 'without', or 'cancel'."""
 
         failure = report.first_failure
         problem = "The preview configuration failed validation."
@@ -8696,7 +9004,8 @@ class MainWindow(QMainWindow):
         )
         box.setInformativeText(f"Problem:\n{problem}")
         box.setDetailedText(report.report_text())
-        settings_button = box.addButton("Open Settings", QMessageBox.ButtonRole.ActionRole)
+        settings_button = box.addButton("Preview Manager", QMessageBox.ButtonRole.ActionRole)
+        app_settings_button = box.addButton("App Settings", QMessageBox.ButtonRole.ActionRole)
         without_button = box.addButton("Scan Without Previews", QMessageBox.ButtonRole.AcceptRole)
         cancel_button = box.addButton("Cancel Scan", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel_button)
@@ -8705,6 +9014,8 @@ class MainWindow(QMainWindow):
         clicked = box.clickedButton()
         if clicked == settings_button:
             return "settings"
+        if clicked == app_settings_button:
+            return "app_settings"
         if clicked == without_button:
             return "without"
         return "cancel"
@@ -8719,8 +9030,8 @@ class MainWindow(QMainWindow):
         self.scan_preview_phase = True
         self.refresh_after_catalogue_write()
         self.stop_scan_button.setText("Cancel Previews")
-        self.stop_scan_button.setToolTip("Stop offline previews; the updated catalogue will be kept.")
-        self.statusBar().showMessage("Catalogue updated and ready to browse. Generating offline previews…")
+        self.stop_scan_button.setToolTip("Stop previews; the updated catalogue will be kept.")
+        self.statusBar().showMessage("Catalogue updated and ready to browse. Generating previews…")
 
     def cancel_scan(self) -> None:
         if self.scan_worker is None or self.scan_cancel_requested:
@@ -8935,7 +9246,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         if statistics.interrupted:
             box.setIcon(QMessageBox.Icon.Information)
-            box.setWindowTitle("Offline Previews Interrupted")
+            box.setWindowTitle("Previews Interrupted")
             headline = "Catalogue indexing completed. Offline preview generation was interrupted."
         elif statistics.has_problems:
             box.setIcon(QMessageBox.Icon.Warning)
@@ -8943,10 +9254,10 @@ class MainWindow(QMainWindow):
             headline = (
                 "Scan completed with preview errors."
                 if indexed
-                else f"Scan {status} — some offline previews were not created."
+                else f"Scan {status} — some previews were not created."
             )
             headline += (
-                "\n\nCatalogue indexing succeeded, but some offline previews were not created."
+                "\n\nCatalogue indexing succeeded, but some previews were not created."
                 if indexed
                 else ""
             )
@@ -8954,7 +9265,7 @@ class MainWindow(QMainWindow):
             box.setIcon(QMessageBox.Icon.Information)
             box.setWindowTitle("Offline Preview Summary")
             headline = (
-                "Scan completed. All offline previews were generated or reused."
+                "Scan completed. All previews were generated or reused."
                 if indexed
                 else f"Scan {status}. Offline preview results so far:"
             )
@@ -10162,7 +10473,7 @@ class MainWindow(QMainWindow):
             return
         preview_available = False
         label = "Open Preview"
-        tooltip = "Open the offline preview in the operating system's default application"
+        tooltip = "Open the preview in the operating system's default application"
         if item is not None and not item.is_folder and getattr(self, "db", None) is not None:
             target = self.catalogue_ref_for_search_item(item)
             media_kind, info, file_row = self.preview_info_for_target(target)
@@ -10343,7 +10654,7 @@ class MainWindow(QMainWindow):
                 )
         self.scan_log.setPlainText("\n".join(lines))
 
-    # -- offline previews: cache manager (spec §22) --------------------------
+    # -- previews: cache manager (spec §22) --------------------------
     def show_preview_cache(self) -> None:
         if self.db is None:
             return
@@ -10355,20 +10666,30 @@ class MainWindow(QMainWindow):
             dialog.delete_temporaries_requested.connect(self.start_delete_temporaries)
             dialog.open_folder_requested.connect(self.open_preview_folder)
             dialog.cancel_requested.connect(self.cancel_preview_store_operation)
+            dialog.settings_requested.connect(self.persist_preview_settings)
             self.preview_cache_dialog = dialog
         else:
             self.preview_cache_dialog.set_settings(self.preview_settings)
+        self.preview_cache_dialog.set_writable(
+            not self.db.read_only and not self._catalogue_job_running()
+        )
         self.preview_cache_dialog.show()
         self.preview_cache_dialog.raise_()
         self.preview_cache_dialog.activateWindow()
+
+    def edit_preview_settings(self) -> None:
+        """Allow scan preflight to wait for configuration before retrying the scan."""
+        self.show_preview_cache()
+        if self.preview_cache_dialog is not None:
+            self.preview_cache_dialog.exec()
 
     def open_preview_folder(self) -> None:
         root = self.preview_settings.root_path
         if root is None:
             QMessageBox.information(
                 self,
-                "Preview Cache",
-                "Choose a preview storage directory in Settings > Preferences first.",
+                "Preview Manager",
+                "Choose a preview storage directory in Window > Preview Manager first.",
             )
             return
         try:
@@ -10381,8 +10702,8 @@ class MainWindow(QMainWindow):
         if self.preview_settings.root_path is None:
             QMessageBox.information(
                 self,
-                "Preview Cache",
-                "Choose a preview storage directory in Settings > Preferences first.",
+                "Preview Manager",
+                "Choose a preview storage directory in Window > Preview Manager first.",
             )
             return False
         if self._catalogue_job_running():
@@ -10525,7 +10846,7 @@ class MainWindow(QMainWindow):
             self.preview_cache_dialog.set_busy(False, "The preview cache operation failed.")
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Critical)
-        dialog.setWindowTitle("Preview Cache Operation Failed")
+        dialog.setWindowTitle("Preview Manager Operation Failed")
         dialog.setText("The preview cache operation could not be completed.")
         dialog.setDetailedText(details)
         dialog.exec()
@@ -10545,7 +10866,7 @@ class MainWindow(QMainWindow):
             return True
         answer = QMessageBox.question(
             self,
-            "Preview Cache Busy",
+            "Preview Manager Busy",
             "A preview cache operation is still running. Cancel it before closing?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
@@ -10557,7 +10878,7 @@ class MainWindow(QMainWindow):
             return True
         QMessageBox.information(
             self,
-            "Preview Cache Cancelling",
+            "Preview Manager Cancelling",
             "Cancellation has been requested. Close the catalogue after the operation stops.",
         )
         return False

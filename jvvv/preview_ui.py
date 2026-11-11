@@ -1,7 +1,7 @@
 """Qt widgets and background workers for the offline-preview feature.
 
 Covers the Settings section (spec §1, §2, §3, §34, §35, §37, §42), the
-end-of-scan failure list (spec §15), and the Preview Cache Manager (spec §22)
+end-of-scan failure list (spec §15), and the Preview Manager (spec §22)
 together with the workers the main window runs on ``QThread``s.
 
 Nothing here displays or plays media: previews are always opened externally,
@@ -16,6 +16,7 @@ from .content_hash import HASH_LABELS
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
@@ -38,7 +39,9 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -99,15 +102,9 @@ FAILURE_COLUMNS: tuple[str, ...] = ("#", "Path", "Type", "Profile", "Stage", "Er
 UNREFERENCED_COLUMNS: tuple[str, ...] = ("", "Type", "Profile", "Content hash", "Size", "Path")
 
 UNREFERENCED_HEADING_TEXT = "Not referenced by this catalogue"
-UNREFERENCED_EXPLANATION_TEXT = (
-    "These preview files are not referenced by any content hash recorded in the open "
-    "catalogue under the current preview profiles. Another catalogue sharing the "
-    "same preview directory may still use these files, so nothing is deleted "
-    "automatically: tick the previews you want to remove and confirm the deletion."
-)
-STATUS_ENABLED_TEXT = "Offline previews enabled — configuration verified."
-STATUS_DISABLED_TEXT = "Offline previews disabled."
-ENABLE_ERROR_TITLE = "Offline Previews"
+STATUS_ENABLED_TEXT = "Previews enabled — configuration verified."
+STATUS_DISABLED_TEXT = "Previews disabled."
+ENABLE_ERROR_TITLE = "Previews"
 
 
 def _media_kind_label(media_kind: str) -> str:
@@ -189,7 +186,7 @@ def preview_summary_text(statistics: PreviewStatistics, root: str | None) -> str
 
 
 class OfflinePreviewSettingsWidget(QGroupBox):
-    """The "Offline Previews" section of Preferences (spec §1, §2, §3, §34, §35, §37, §42).
+    """Preview configuration controls shared by the preview manager and tests.
 
     Ticking the checkbox runs the full validation immediately; on failure the
     box unticks itself and the exact failure is shown.  ``validated`` fires
@@ -207,8 +204,9 @@ class OfflinePreviewSettingsWidget(QGroupBox):
         validator: Validator = validate_preview_configuration,
         show_error: ShowError | None = None,
         parent: QWidget | None = None,
+        show_ffmpeg: bool = True,
     ) -> None:
-        super().__init__("Offline Previews", parent)
+        super().__init__("Previews", parent)
         self._validator: Validator = validator
         self._show_error: ShowError = show_error or _default_show_error
         self._last_known_good: PreviewSettings | None = settings if settings.enabled else None
@@ -216,15 +214,16 @@ class OfflinePreviewSettingsWidget(QGroupBox):
         self.file_chooser: FileChooser = _default_file_chooser
         self._populating = False
         self._build_ui()
+        self.storage_form.setRowVisible(1, show_ffmpeg)
         self._connect_signals()
         self.set_settings(settings)
 
     # -- construction ---------------------------------------------------------
     def _build_ui(self) -> None:
-        self.enable_check = QCheckBox("Generate offline previews while scanning")
+        self.enable_check = QCheckBox("Generate previews while scanning")
         self.enable_check.setToolTip(
-            "Ticking this immediately tests the preview directory, the image encoder, "
-            "and FFmpeg. Previews stay disabled if any test fails."
+            "Ticking this tests the preview directory and encoders. "
+            "Previews stay disabled if any test fails."
         )
         self.status_label = _muted_label(STATUS_DISABLED_TEXT)
 
@@ -236,6 +235,7 @@ class OfflinePreviewSettingsWidget(QGroupBox):
         )
         self.browse_button = QPushButton("Browse...")
         root_row = QHBoxLayout()
+        self.root_row = root_row
         root_row.setContentsMargins(0, 0, 0, 0)
         root_row.addWidget(self.root_edit, 1)
         root_row.addWidget(self.browse_button)
@@ -252,10 +252,11 @@ class OfflinePreviewSettingsWidget(QGroupBox):
         ffmpeg_row.addWidget(self.ffmpeg_browse_button)
 
         storage_form = QFormLayout()
+        self.storage_form = storage_form
         storage_form.addRow("Preview storage directory:", root_row)
         storage_form.addRow("FFmpeg executable (optional):", ffmpeg_row)
 
-        image_group = QGroupBox("Image preview settings")
+        image_group = QGroupBox("Images")
         self.image_max_dimension_spin = QSpinBox()
         self.image_max_dimension_spin.setRange(*IMAGE_MAX_DIMENSION_RANGE)
         self.image_max_dimension_spin.setSuffix(" px")
@@ -267,10 +268,9 @@ class OfflinePreviewSettingsWidget(QGroupBox):
         self.image_quality_spin.setRange(*IMAGE_JPEG_QUALITY_RANGE)
         self.image_quality_spin.setToolTip("JPEG quality of image previews.")
         image_form = QFormLayout(image_group)
-        image_form.addRow("Maximum dimension:", self.image_max_dimension_spin)
-        image_form.addRow("JPEG quality:", self.image_quality_spin)
+        image_form.addRow("Maximum resolution:", self.image_max_dimension_spin)
 
-        video_group = QGroupBox("Video preview settings")
+        video_group = QGroupBox("Videos")
         self.video_fps_spin = QDoubleSpinBox()
         self.video_fps_spin.setRange(*VIDEO_FPS_RANGE)
         # Three decimals match preview_config.format_fps, so a persisted value
@@ -297,9 +297,7 @@ class OfflinePreviewSettingsWidget(QGroupBox):
         self.video_preset_combo.setToolTip("libx264 encoder preset: speed versus file size.")
         video_form = QFormLayout(video_group)
         video_form.addRow("Frames per second:", self.video_fps_spin)
-        video_form.addRow("Maximum height:", self.video_max_height_spin)
-        video_form.addRow("CRF:", self.video_crf_spin)
-        video_form.addRow("Encoder preset:", self.video_preset_combo)
+        video_form.addRow("Maximum resolution (height):", self.video_max_height_spin)
 
         self.image_profile_label = QLabel()
         self.image_profile_label.setTextInteractionFlags(
@@ -327,17 +325,35 @@ class OfflinePreviewSettingsWidget(QGroupBox):
             f"{STORAGE_TRADEOFF_TEXT}\n\n{ROOT_CHANGE_WARNING_TEXT}\n\n{BACKUP_POLICY_TEXT}"
         )
 
+        self.advanced_toggle = QPushButton("Show Advanced")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_widget = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_widget)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_form = QFormLayout()
+        advanced_form.addRow("Image JPEG quality:", self.image_quality_spin)
+        advanced_form.addRow("Video quality (CRF):", self.video_crf_spin)
+        advanced_form.addRow("Video encoder preset:", self.video_preset_combo)
+        advanced_layout.addLayout(advanced_form)
+        advanced_layout.addWidget(self.image_profile_label)
+        advanced_layout.addWidget(self.video_profile_label)
+        advanced_layout.addWidget(profile_note)
+        advanced_layout.addWidget(self.storage_note)
+        self.advanced_widget.setVisible(False)
+        self.advanced_toggle.toggled.connect(self.advanced_widget.setVisible)
+        self.advanced_toggle.toggled.connect(
+            lambda checked: self.advanced_toggle.setText("Hide Advanced" if checked else "Show Advanced")
+        )
+
         layout = QVBoxLayout(self)
         layout.addWidget(self.enable_check)
         layout.addWidget(self.status_label)
         layout.addLayout(storage_form)
         layout.addWidget(image_group)
         layout.addWidget(video_group)
-        layout.addWidget(self.image_profile_label)
-        layout.addWidget(self.video_profile_label)
-        layout.addWidget(profile_note)
         layout.addLayout(test_row)
-        layout.addWidget(self.storage_note)
+        layout.addWidget(self.advanced_toggle)
+        layout.addWidget(self.advanced_widget)
 
     def _connect_signals(self) -> None:
         self.enable_check.toggled.connect(self.on_enable_toggled)
@@ -499,7 +515,7 @@ class OfflinePreviewSettingsWidget(QGroupBox):
         finally:
             self.enable_check.blockSignals(False)
         self._set_status(
-            f"Offline previews could not be enabled — {_failed_step_label(report)} failed."
+            f"Previews could not be enabled — {_failed_step_label(report)} failed."
         )
         self.settings_changed.emit()
         self._show_error(self, ENABLE_ERROR_TITLE, _failure_text(report))
@@ -532,7 +548,7 @@ class OfflinePreviewSettingsWidget(QGroupBox):
             return known, report
         fallback = current.with_enabled(False)
         self.set_settings(fallback)
-        self._set_status(f"Offline previews disabled — {failed_label} failed.")
+        self._set_status(f"Previews disabled — {failed_label} failed.")
         return fallback, report
 
     # -- browsing ------------------------------------------------------------
@@ -561,10 +577,10 @@ def _failed_step_label(report: PreviewValidationReport) -> str:
 
 
 def _failure_text(report: PreviewValidationReport) -> str:
-    summary = report.failure_summary()
+    summary = report.failure_summary(heading="Previews could not be enabled.")
     if summary:
         return summary
-    return "Offline previews could not be enabled.\n\n" + report.report_text()
+    return "Previews could not be enabled.\n\n" + report.report_text()
 
 
 def _exception_report(
@@ -776,12 +792,12 @@ class PreviewFailuresDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Preview Cache Manager (spec §22)
+# Preview Manager (spec §22)
 # ---------------------------------------------------------------------------
 
 
 class PreviewCacheDialog(QDialog):
-    """Store overview plus the "not referenced by this catalogue" list (spec §22).
+    """Catalogue preview configuration and separate storage maintenance tools.
 
     The dialog only requests work; the main window runs the workers and feeds
     results back through ``set_store_statistics`` / ``set_unreferenced``.
@@ -793,10 +809,11 @@ class PreviewCacheDialog(QDialog):
     delete_temporaries_requested = Signal()
     open_folder_requested = Signal()
     cancel_requested = Signal()
+    settings_requested = Signal(object)
 
     def __init__(self, settings: PreviewSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Preview Cache")
+        self.setWindowTitle("Preview Manager")
         self.setMinimumSize(760, 560)
         self.resize(1040, 720)
         self.confirm: Confirm = _default_confirm
@@ -804,131 +821,178 @@ class PreviewCacheDialog(QDialog):
         self._entries: list[PreviewEntry] = []
         self._total_found = 0
         self._busy = False
+        self._writable = True
         self._build_ui()
         self.set_settings(settings)
         self.set_store_statistics(None, None)
 
     # -- construction ---------------------------------------------------------
     def _build_ui(self) -> None:
-        overview = QGroupBox("Preview store")
-        self.root_label = self._value_label()
+        self.tabs = QTabWidget()
+        self.previews_page = QWidget()
+        previews_layout = QVBoxLayout(self.previews_page)
+        self.scope_label = _muted_label("Configure previews for this catalogue. Changes are saved when you choose Apply.")
+        self.preview_widget = OfflinePreviewSettingsWidget(self._settings, show_ffmpeg=False)
+        self.preview_widget.setTitle("Generation")
+        self.open_folder_button = QPushButton("Open Folder")
+        self.open_folder_button.setToolTip("Open the saved preview directory; apply a changed location first")
+        self.preview_widget.root_row.addWidget(self.open_folder_button)
+        configuration = QWidget()
+        configuration_layout = QVBoxLayout(configuration)
+        configuration_layout.setContentsMargins(0, 0, 0, 0)
+        configuration_layout.addWidget(self.scope_label)
+        configuration_layout.addWidget(self.preview_widget)
+        configuration_layout.addStretch(1)
+        self.configuration_scroll = QScrollArea()
+        self.configuration_scroll.setWidgetResizable(True)
+        self.configuration_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.configuration_scroll.setWidget(configuration)
+        previews_layout.addWidget(self.configuration_scroll, 1)
+        apply_row = QHBoxLayout()
+        self.settings_state_label = _muted_label()
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.setObjectName("primaryButton")
+        self.apply_button.clicked.connect(self.apply_settings)
+        apply_row.addWidget(self.settings_state_label, 1)
+        apply_row.addWidget(self.apply_button)
+        previews_layout.addLayout(apply_row)
+        self.preview_widget.settings_changed.connect(self._update_configuration_state)
+        self.tabs.addTab(self.previews_page, "Previews")
+
+        self.usage_group = QGroupBox("Storage usage")
+        usage_layout = QVBoxLayout(self.usage_group)
+        self.scan_button = QPushButton("Refresh Usage")
+        self.scan_button.setToolTip("Count preview files and the space they use")
+        usage_toolbar = QHBoxLayout()
+        usage_toolbar.addWidget(_muted_label("Usage of the saved preview directory."), 1)
+        usage_toolbar.addWidget(self.scan_button)
+        usage_layout.addLayout(usage_toolbar)
         self.free_space_label = self._value_label()
-        self.image_profile_label = self._value_label()
-        self.video_profile_label = self._value_label()
         self.image_count_label = self._value_label()
         self.video_count_label = self._value_label()
         self.total_storage_label = self._value_label()
-        self.temporary_label = self._value_label()
-        self.profiles_label = _muted_label("")
-        form = QFormLayout(overview)
-        form.addRow("Preview root:", self.root_label)
-        form.addRow("Free space:", self.free_space_label)
-        form.addRow("Current image profile:", self.image_profile_label)
-        form.addRow("Current video profile:", self.video_profile_label)
-        form.addRow("Total image previews:", self.image_count_label)
-        form.addRow("Total video previews:", self.video_count_label)
-        form.addRow("Total preview storage:", self.total_storage_label)
-        form.addRow("Temporary files:", self.temporary_label)
-        form.addRow("Per profile:", self.profiles_label)
+        usage_cards = QHBoxLayout()
+        for title, value in (
+            ("Space used", self.total_storage_label),
+            ("Free space", self.free_space_label),
+            ("Images", self.image_count_label),
+            ("Videos", self.video_count_label),
+        ):
+            card = QWidget()
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 0)
+            heading = _muted_label(title)
+            heading.setWordWrap(False)
+            card_layout.addWidget(heading)
+            font = value.font()
+            font.setBold(True)
+            value.setFont(font)
+            card_layout.addWidget(value)
+            usage_cards.addWidget(card, 1)
+        usage_layout.addLayout(usage_cards)
+        self.profiles_toggle = QPushButton("Show Profile Breakdown")
+        self.profiles_toggle.setCheckable(True)
+        self.profiles_toggle.setFlat(True)
+        self.profiles_label = _muted_label("Not checked yet.")
+        self.profiles_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.profiles_label.hide()
+        self.profiles_toggle.toggled.connect(self.profiles_label.setVisible)
+        self.profiles_toggle.toggled.connect(
+            lambda checked: self.profiles_toggle.setText("Hide Profile Breakdown" if checked else "Show Profile Breakdown")
+        )
+        breakdown_row = QHBoxLayout()
+        breakdown_row.addWidget(self.profiles_toggle)
+        breakdown_row.addStretch(1)
+        usage_layout.addLayout(breakdown_row)
+        usage_layout.addWidget(self.profiles_label)
 
-        self.open_folder_button = QPushButton("Open Preview Folder")
-        self.scan_button = QPushButton("Scan Preview Store")
-        self.scan_button.setToolTip(
-            "Count previews and bytes per profile by walking the preview directory"
-        )
-        self.unreferenced_button = QPushButton("Show Unreferenced Previews")
-        self.unreferenced_button.setToolTip(
-            "List previews under the current profiles whose content hash is not recorded "
-            "in the open catalogue"
-        )
-        self.temporaries_button = QPushButton("Delete Temporary Files")
-        self.temporaries_button.setToolTip(
-            "Remove leftover .tmp- files from interrupted preview generation. Files "
-            "newer than 24 hours are kept because another JVVV window may still be "
-            "writing them."
-        )
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setEnabled(False)
-        actions = QHBoxLayout()
-        actions.addWidget(self.open_folder_button)
-        actions.addWidget(self.scan_button)
-        actions.addWidget(self.unreferenced_button)
-        actions.addWidget(self.temporaries_button)
-        actions.addStretch(1)
-        actions.addWidget(self.cancel_button)
-
-        self.progress = QProgressBar()
-        self.progress.setTextVisible(False)
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        self.progress.setVisible(False)
-        self.status_label = _muted_label(
-            "Use Scan Preview Store to count previews, or Show Unreferenced Previews "
-            "to compare the store with this catalogue."
-        )
-
-        unreferenced_group = QGroupBox("Unreferenced previews")
+        self.unreferenced_group = QGroupBox("Unused previews")
+        unreferenced_layout = QVBoxLayout(self.unreferenced_group)
         self.unreferenced_heading = QLabel(UNREFERENCED_HEADING_TEXT)
-        self.unreferenced_heading.setObjectName("emptyStateTitle")
-        self.unreferenced_note = QLabel(UNREFERENCED_EXPLANATION_TEXT)
-        self.unreferenced_note.setObjectName("offlineNotice")
-        self.unreferenced_note.setWordWrap(True)
+        self.unreferenced_heading.setObjectName("mutedLabel")
+        self.unreferenced_button = QPushButton("Find Unused Previews")
+        self.unreferenced_button.setToolTip("Compare previews with the saved catalogue and its current preview profiles")
+        unused_toolbar = QHBoxLayout()
+        unused_toolbar.addWidget(self.unreferenced_heading, 1)
+        unused_toolbar.addWidget(self.unreferenced_button)
+        unreferenced_layout.addLayout(unused_toolbar)
         self.unreferenced_count_label = _muted_label("Not checked yet.")
-
+        unreferenced_layout.addWidget(self.unreferenced_count_label)
         self.unreferenced_table = QTableWidget(0, len(UNREFERENCED_COLUMNS))
         self.unreferenced_table.setHorizontalHeaderLabels(list(UNREFERENCED_COLUMNS))
         self.unreferenced_table.verticalHeader().setVisible(False)
         self.unreferenced_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.unreferenced_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
+        self.unreferenced_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.unreferenced_table.setAlternatingRowColors(True)
         self.unreferenced_table.setWordWrap(False)
         header = self.unreferenced_table.horizontalHeader()
         header.setStretchLastSection(True)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.unreferenced_table.setColumnWidth(0, 32)
-        self.unreferenced_table.setColumnWidth(1, 70)
-        self.unreferenced_table.setColumnWidth(2, 220)
-        self.unreferenced_table.setColumnWidth(3, 200)
-        self.unreferenced_table.setColumnWidth(4, 90)
+        for column, width in enumerate((32, 70, 180, 180, 90)):
+            self.unreferenced_table.setColumnWidth(column, width)
         self.unreferenced_table.itemChanged.connect(self._on_table_item_changed)
-
+        self.unreferenced_table.setMinimumHeight(150)
+        unreferenced_layout.addWidget(self.unreferenced_table, 1)
         self.select_all_button = QPushButton("Select All")
         self.select_none_button = QPushButton("Clear Selection")
-        self.delete_button = QPushButton("Delete Selected Unreferenced Previews")
+        self.delete_button = QPushButton("Delete Selected")
         self.delete_button.setEnabled(False)
-        self.delete_button.setToolTip(
-            "Delete only the ticked previews after confirmation. Another catalogue "
-            "may still use them."
-        )
+        self.delete_button.setToolTip("Delete only the ticked preview files after confirmation")
         selection_row = QHBoxLayout()
         selection_row.addWidget(self.select_all_button)
         selection_row.addWidget(self.select_none_button)
         selection_row.addStretch(1)
         selection_row.addWidget(self.delete_button)
-
-        unreferenced_layout = QVBoxLayout(unreferenced_group)
-        unreferenced_layout.addWidget(self.unreferenced_heading)
-        unreferenced_layout.addWidget(self.unreferenced_note)
-        unreferenced_layout.addWidget(self.unreferenced_count_label)
-        unreferenced_layout.addWidget(self.unreferenced_table, 1)
         unreferenced_layout.addLayout(selection_row)
+        self.unreferenced_note = _muted_label(
+            "Another catalogue sharing the same preview directory may still need these files. Nothing is deleted automatically."
+        )
+        unreferenced_layout.addWidget(self.unreferenced_note)
 
+        self.temporary_group = QGroupBox("Temporary files")
+        temporary_layout = QHBoxLayout(self.temporary_group)
+        self.temporary_label = self._value_label()
+        temporary_layout.addWidget(QLabel("Files:"))
+        temporary_layout.addWidget(self.temporary_label, 1)
+        self.temporaries_button = QPushButton("Clean Up Temporary Files")
+        self.temporaries_button.setToolTip("Remove leftover temporary files; files newer than 24 hours are kept")
+        temporary_layout.addWidget(self.temporaries_button)
+        self.cleanup_page = QWidget()
+        cleanup_layout = QVBoxLayout(self.cleanup_page)
+        cleanup_layout.setContentsMargins(0, 0, 0, 0)
+        cleanup_layout.addWidget(self.usage_group)
+        cleanup_layout.addWidget(self.unreferenced_group, 1)
+        cleanup_layout.addWidget(self.temporary_group)
+        self.cleanup_scroll = QScrollArea()
+        self.cleanup_scroll.setWidgetResizable(True)
+        self.cleanup_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.cleanup_scroll.setWidget(self.cleanup_page)
+        cleanup_tab = QWidget()
+        cleanup_tab_layout = QVBoxLayout(cleanup_tab)
+        cleanup_tab_layout.addWidget(self.cleanup_scroll, 1)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.hide()
+        self.status_label = _muted_label("Choose Refresh Usage to check storage, or Find Unused Previews to review cleanup candidates.")
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.hide()
+        operation_row = QHBoxLayout()
+        operation_row.addWidget(self.status_label, 1)
+        operation_row.addWidget(self.cancel_button)
+        cleanup_tab_layout.addWidget(self.progress)
+        cleanup_tab_layout.addLayout(operation_row)
+        self.tabs.addTab(cleanup_tab, "Storage && Cleanup")
         self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.close)
         bottom = QHBoxLayout()
         bottom.addStretch(1)
         bottom.addWidget(self.close_button)
-
         layout = QVBoxLayout(self)
-        layout.addWidget(overview)
-        layout.addLayout(actions)
-        layout.addWidget(self.progress)
-        layout.addWidget(self.status_label)
-        layout.addWidget(unreferenced_group, 1)
+        layout.addWidget(self.tabs, 1)
         layout.addLayout(bottom)
-
         self.open_folder_button.clicked.connect(self.open_folder_requested)
         self.scan_button.clicked.connect(self.scan_requested)
         self.unreferenced_button.clicked.connect(self.unreferenced_requested)
@@ -937,6 +1001,8 @@ class PreviewCacheDialog(QDialog):
         self.temporaries_button.clicked.connect(self.on_delete_temporaries_clicked)
         self.select_all_button.clicked.connect(lambda: self._set_all_checked(True))
         self.select_none_button.clicked.connect(lambda: self._set_all_checked(False))
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
 
     @staticmethod
     def _value_label() -> QLabel:
@@ -947,25 +1013,98 @@ class PreviewCacheDialog(QDialog):
 
     # -- data ----------------------------------------------------------------
     def set_settings(self, settings: PreviewSettings) -> None:
-        previous_root = self._settings.root_directory.strip()
+        previous = self._settings
+        draft = self.preview_widget.settings()
+        dirty = draft != previous
+        changed_output = (previous.root_directory, previous.image, previous.video) != (
+            settings.root_directory, settings.image, settings.video,
+        )
         self._settings = settings
+        if not dirty or draft == settings or getattr(self, "_applying", False):
+            self.preview_widget.set_settings(settings)
+        else:
+            # App Settings may change FFmpeg while the user has unapplied edits
+            # here. Preserve those edits and overlay the computer's executable.
+            known = self.preview_widget.last_known_good
+            if known is not None and known.ffmpeg_path != settings.ffmpeg_path:
+                known = None
+            self.preview_widget.set_settings(replace(draft, ffmpeg_path=settings.ffmpeg_path))
+            self.preview_widget.last_known_good = known
         root_text = settings.root_directory.strip()
-        self.root_label.setText(root_text or "Not configured")
-        self.image_profile_label.setText(_profile_id_text(settings, "image"))
-        self.video_profile_label.setText(_profile_id_text(settings, "video"))
         has_root = bool(root_text)
         if not self._busy:
             self.scan_button.setEnabled(has_root)
             self.unreferenced_button.setEnabled(has_root)
             self.open_folder_button.setEnabled(has_root)
-        if root_text != previous_root and self.image_count_label.text() != "—":
-            # Figures belong to the previous directory; do not present them as current.
+            self.temporaries_button.setEnabled(has_root)
+        if changed_output and self.image_count_label.text() != "—":
+            # Root/profile changes make the old comparison unsafe for deletion.
             self.set_store_statistics(None, None)
             self.set_unreferenced([], 0)
+            self.unreferenced_count_label.setText("Not checked for these preview settings yet.")
             self.status_label.setText(
-                "The preview directory changed. Scan the preview store to refresh the figures."
+                "Preview settings changed. Refresh Usage to update the figures."
             )
         self._refresh_free_space()
+        self._update_configuration_state()
+
+    def set_ffmpeg_path(self, path: str) -> None:
+        """Update computer-specific FFmpeg without discarding catalogue drafts."""
+
+        known = self.preview_widget.last_known_good
+        if known is not None and known.ffmpeg_path != path:
+            known = None
+        self._settings = replace(self._settings, ffmpeg_path=path)
+        self.preview_widget.set_settings(replace(self.preview_widget.settings(), ffmpeg_path=path))
+        # A new executable has not been tested with the pending configuration.
+        self.preview_widget.last_known_good = known
+        self._update_configuration_state()
+
+    def set_writable(self, writable: bool) -> None:
+        """Allow editing only when the current catalogue can accept changes."""
+
+        self._writable = bool(writable)
+        self._update_configuration_state()
+
+    def _update_configuration_state(self) -> None:
+        editable = self._writable and not self._busy
+        dirty = self.preview_widget.settings() != self._settings
+        self.preview_widget.setEnabled(editable)
+        self.apply_button.setEnabled(editable and dirty)
+        self.open_folder_button.setEnabled(
+            not self._busy and bool(self._settings.root_directory.strip())
+            and self.preview_widget.root_edit.text().strip() == self._settings.root_directory.strip()
+        )
+        if not self._writable:
+            text = "Preview settings cannot be changed right now."
+        elif self._busy:
+            text = "Wait for the storage operation to finish before changing preview settings."
+        elif dirty:
+            text = "Unsaved changes. Choose Apply to save them in this catalogue."
+        else:
+            text = "Settings are saved in this catalogue."
+        self.settings_state_label.setText(text)
+
+    def apply_settings(self) -> None:
+        if not self._writable or self._busy:
+            return
+        candidate, report = self.preview_widget.validate_for_save()
+        if report is not None and not report.passed:
+            self.preview_widget._show_error(self, "Previews", _failure_text(report))
+            self._update_configuration_state()
+            return
+        try:
+            candidate.validate(require_root=candidate.enabled)
+        except PreviewConfigError as exc:
+            self.preview_widget._show_error(self, "Previews", str(exc))
+            return
+        if candidate != self._settings:
+            self._applying = True
+            try:
+                self.settings_requested.emit(candidate)
+            finally:
+                self._applying = False
+        self._update_configuration_state()
 
     def _refresh_free_space(self) -> None:
         """Free space is one cheap ``disk_usage`` call; show it without a full store walk."""
@@ -1004,10 +1143,8 @@ class PreviewCacheDialog(QDialog):
             return
         self.image_count_label.setText(f"{int(statistics.image_count):,}")
         self.video_count_label.setText(f"{int(statistics.video_count):,}")
-        self.total_storage_label.setText(
-            f"{format_size(int(statistics.total_bytes))} "
-            f"({int(statistics.total_bytes):,} bytes)"
-        )
+        self.total_storage_label.setText(format_size(int(statistics.total_bytes)))
+        self.total_storage_label.setToolTip(f"{int(statistics.total_bytes):,} bytes")
         self.temporary_label.setText(f"{int(statistics.temporary_files):,}")
         profile_lines = []
         for (media_kind, profile_id), profile_stats in sorted(statistics.profiles.items()):
@@ -1025,11 +1162,7 @@ class PreviewCacheDialog(QDialog):
         if statistics.cancelled:
             self.status_label.setText("Preview store scan cancelled — the figures are partial.")
         else:
-            self.status_label.setText(
-                f"Preview store scanned: {int(statistics.image_count):,} image and "
-                f"{int(statistics.video_count):,} video previews, "
-                f"{format_size(int(statistics.total_bytes))} in total."
-            )
+            self.status_label.setText("Usage updated.")
 
     def set_unreferenced(
         self,
@@ -1089,7 +1222,7 @@ class PreviewCacheDialog(QDialog):
             return
         self.set_unreferenced([], 0)
         self.status_label.setText(
-            "The catalogue changed — run Show Unreferenced Previews again before deleting anything."
+            "The catalogue changed — run Find Unused Previews again before deleting anything."
         )
 
     def _refresh_unreferenced_count(self) -> None:
@@ -1099,7 +1232,7 @@ class PreviewCacheDialog(QDialog):
             # A cancelled comparison must never read as "nothing is unreferenced".
             self.unreferenced_count_label.setText(
                 f"The comparison was cancelled before it finished: {shown:,} preview(s) not "
-                "referenced by this catalogue were found so far. Run Show Unreferenced "
+                "referenced by this catalogue were found so far. Run Find Unused "
                 "Previews again for a complete list."
             )
             return
@@ -1161,6 +1294,7 @@ class PreviewCacheDialog(QDialog):
         self.select_all_button.setEnabled(not busy)
         self.select_none_button.setEnabled(not busy)
         self.cancel_button.setEnabled(bool(busy))
+        self.cancel_button.setVisible(bool(busy))
         if busy:
             self.progress.setRange(0, 0)
             self.progress.setVisible(True)
@@ -1170,6 +1304,7 @@ class PreviewCacheDialog(QDialog):
             self.progress.setVisible(False)
         if message:
             self.status_label.setText(message)
+        self._update_configuration_state()
         self._update_delete_button()
 
     def set_progress(self, count: int, message: str) -> None:
@@ -1261,7 +1396,7 @@ def _cache_for(settings: PreviewSettings) -> PreviewCache:
     if root is None:
         raise PreviewError(
             STAGE_CONFIGURATION,
-            "No preview storage directory is configured in Settings > Preferences.",
+            "No preview storage directory is configured in Window > Preview Manager.",
         )
     try:
         settings.image.validate()
@@ -1286,7 +1421,7 @@ def _require_store(cache: PreviewCache) -> None:
         raise PreviewError(
             STAGE_PREVIEW_ROOT,
             f"The preview directory does not exist or is not reachable: {cache.root}",
-            detail="Reconnect the drive or choose the preview directory again in Settings > Preferences.",
+            detail="Reconnect the drive or choose the preview directory again in Window > Preview Manager.",
         )
 
 

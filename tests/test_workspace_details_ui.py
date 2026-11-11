@@ -1,0 +1,128 @@
+"""Selected-volume information and filters scoped to the file browser."""
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+
+from jvvv.app import BackupDisplay, BrowserItem, MainWindow
+from jvvv.database import create_catalogue
+from jvvv.utils import format_size
+from test_catalogue_directory import populate
+
+
+@pytest.fixture
+def window(monkeypatch, tmp_path):
+    application = QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr("jvvv.app.QSettings", lambda *args: settings)
+    monkeypatch.setattr("jvvv.app.list_connected_volume_snapshots", lambda: [])
+    monkeypatch.setattr(MainWindow, "_confirm_snapshot_before_close", lambda self: True)
+    instance = MainWindow()
+    path = tmp_path / "Archive.jvvv"
+    db = create_catalogue(path)
+    instance._open_catalogue_in_window(db, path, None, connected_volume_snapshots=[])
+    yield instance
+    instance.close()
+    application.processEvents()
+
+
+def populated_volume(window, tmp_path):
+    volume_id = window.db.create_volume(
+        "Photo Archive", str(tmp_path / "Original Drive"),
+        {"drive_id": "AID-001", "connector": "USB-C", "condition": "Good"},
+    )
+    populate(window.db, volume_id, "photo", 8, errors=0)
+    window.db.update_volume_storage(volume_id, 3 * 1024**4, 2 * 1024**4, 1024**4)
+    return window.db.get_volume(volume_id)
+
+
+def test_selected_volume_shows_saved_connector_storage_and_counts_while_offline(window, tmp_path, monkeypatch):
+    volume = populated_volume(window, tmp_path)
+    monkeypatch.setattr(window, "current_source_path_for_volume", lambda _volume: None)
+    window.show_volume_details(volume)
+    labels = window.detail_labels
+    assert labels["drive_id"].text() == "AID-001"
+    assert labels["name"].text() == "Photo Archive"
+    assert labels["connector"].text() == "USB-C"
+    assert labels["connection"].text() == "Offline"
+    assert labels["register_status"].text() == "Archive"
+    assert labels["condition"].text() == "Good"
+    assert labels["capacity"].text() == format_size(3 * 1024**4)
+    assert labels["used"].text() == format_size(2 * 1024**4)
+    assert labels["free"].text() == format_size(1024**4)
+    assert labels["files"].text() == "8"
+    assert labels["folders"].text() == "3"
+    assert labels["last_scan"].text() != "-"
+    assert labels["path"].text() == volume["source_path"]
+    assert labels["path"].toolTip() == volume["source_path"]
+    assert window.detail_full.value() == 67
+
+
+def test_selected_volume_uses_connected_location_and_clears_stale_information(window, tmp_path, monkeypatch):
+    volume = populated_volume(window, tmp_path)
+    connected_path = str(tmp_path / "Connected Drive")
+    monkeypatch.setattr(window, "current_source_path_for_volume", lambda _volume: connected_path)
+    window.show_volume_details(volume)
+    assert window.detail_labels["connection"].text() == "Connected"
+    assert window.detail_labels["path"].text() == connected_path
+    assert window.detail_labels["path"].toolTip() == connected_path
+    window.show_volume_details(None)
+    assert all(label.text() == "-" for label in window.detail_labels.values())
+    assert all(not label.toolTip() for label in window.detail_labels.values())
+    assert window.detail_full.value() == 0
+
+
+def test_unscanned_volume_does_not_report_unknown_capacity_as_measured_zero(window, tmp_path, monkeypatch):
+    volume_id = window.db.create_volume("New Drive", str(tmp_path))
+    monkeypatch.setattr(window, "current_source_path_for_volume", lambda _volume: None)
+    window.show_volume_details(window.db.get_volume(volume_id))
+    assert window.detail_labels["connector"].text() == "Unknown"
+    assert [window.detail_labels[key].text() for key in ("capacity", "used", "free")] == ["-", "-", "-"]
+
+
+def test_copy_filter_is_attached_to_file_list_and_still_filters_without_hiding_parent_navigation(window):
+    assert window.browser_splitter.widget(1) is window.browser_file_pane
+    assert window.browser_file_pane.isAncestorOf(window.file_table)
+    assert window.browser_file_pane.isAncestorOf(window.browser_status_strip)
+    assert window.browser_file_toolbar.isAncestorOf(window.browser_backup_filter_combo)
+    assert not window.browser_file_pane.isAncestorOf(window.folder_tree)
+    assert "Filter files by copy status" in {
+        label.text() for label in window.browser_file_toolbar.findChildren(QLabel)
+    }
+    assert "How matching works" not in {button.text() for button in window.findChildren(QPushButton)}
+    assert window.browser_backup_filter_combo.currentData() == "all"
+    parent = BrowserItem("folder", 0, "..", "", "Folder", is_parent_entry=True)
+    verified = BrowserItem(
+        "file", 1, "Copy.jpg", "Copy.jpg", "Image",
+        backup=BackupDisplay("verified", "Hash verified", "Matching content hash", 4),
+    )
+    unconfirmed = BrowserItem(
+        "file", 2, "Only.jpg", "Only.jpg", "Image",
+        backup=BackupDisplay("none", "No copy found", "No other copy", 0),
+    )
+    window.current_directory_items = [parent, verified, unconfirmed]
+    window.apply_browser_backup_filter()
+    assert set(item.name for item in window.browser_model.items) == {"..", "Copy.jpg", "Only.jpg"}
+    window.browser_backup_filter_combo.setCurrentIndex(window.browser_backup_filter_combo.findData("verified"))
+    assert set(item.name for item in window.browser_model.items) == {"..", "Copy.jpg"}
+    window.browser_backup_filter_combo.setCurrentIndex(0)
+    assert len(window.browser_model.items) == 3
+
+
+def test_selected_volume_panel_fits_its_contents_at_larger_zoom(window, tmp_path, monkeypatch):
+    volume = populated_volume(window, tmp_path)
+    monkeypatch.setattr(window, "current_source_path_for_volume", lambda _volume: None)
+    window.show_volume_details(volume)
+    window.set_ui_zoom(1.5)
+    window.resize(1280, 960)
+    window.show()
+    for _ in range(5):
+        QApplication.instance().processEvents()
+    assert window.detail_full.geometry().bottom() < window.details_box.height()
+    assert all(label.geometry().bottom() < window.details_box.height()
+               for label in window.detail_labels.values())
+    assert window.file_table.height() > 150

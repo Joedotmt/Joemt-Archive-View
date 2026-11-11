@@ -131,19 +131,19 @@ QPushButton:disabled, QToolButton:disabled {
     border-color: __BORDER__;
 }
 
-QPushButton#primaryButton, QPushButton#searchButton, QPushButton:default {
+QPushButton#primaryButton:enabled, QPushButton#searchButton:enabled, QPushButton:default:enabled {
     color: __ACCENT_TEXT__;
     background-color: __ACCENT__;
     border-color: __ACCENT_BORDER__;
 }
 
-QPushButton#primaryButton:hover, QPushButton#searchButton:hover,
-QPushButton:default:hover {
+QPushButton#primaryButton:enabled:hover, QPushButton#searchButton:enabled:hover,
+QPushButton:default:enabled:hover {
     background-color: __ACCENT_HOVER__;
 }
 
-QPushButton#primaryButton:pressed, QPushButton#searchButton:pressed,
-QPushButton:default:pressed {
+QPushButton#primaryButton:enabled:pressed, QPushButton#searchButton:enabled:pressed,
+QPushButton:default:enabled:pressed {
     background-color: __ACCENT_PRESSED__;
 }
 

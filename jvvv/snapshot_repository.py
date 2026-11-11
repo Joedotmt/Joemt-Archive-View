@@ -17,8 +17,7 @@ costs one new blob.
 
 Restoring rebuilds a complete catalogue folder (registry, volume files, and a
 freshly imported index) in a temporary location and swaps it into place only
-after every blob verified.  A single volume can also be restored into a live
-catalogue; the next open re-imports it.
+after every blob is verified.
 """
 
 from __future__ import annotations
@@ -53,7 +52,6 @@ from .catalogue_format import (
     set_registry_meta,
     validate_registry,
 )
-from . import volume_store
 from .volume_store import (
     HashingTee,
     RowCounts,
@@ -69,6 +67,7 @@ from .volume_store import (
     write_blob,
 )
 from .content_hash import DEFAULT_HASH_ALGORITHM, normalize_hash_algorithm
+from .preview_config import catalogue_preview_mapping
 
 
 REPOSITORY_EXTENSION = ".jvvvrepo"
@@ -79,7 +78,7 @@ BLOBS_DIR_NAME = "blobs"
 SNAPSHOTS_DIR_NAME = "snapshots"
 BLOB_EXTENSION = ".blob"
 SNAPSHOT_FORMAT = "jvvv-snapshot"
-SNAPSHOT_FORMAT_VERSION = 2
+SNAPSHOT_FORMAT_VERSION = 3
 SNAPSHOT_FILE_EXTENSION = ".json"
 CATALOGUE_META_REPOSITORY_KEY = "snapshot_repository"
 CATALOGUE_META_REPOSITORY_UUID_KEY = "snapshot_repository_uuid"
@@ -179,6 +178,7 @@ class SnapshotManifest:
     volumes: tuple[VolumeSnapshotRecord, ...]
     hash_algorithm: str = DEFAULT_HASH_ALGORITHM
     hash_algorithm_locked: bool = False
+    preview_settings: dict[str, str] = field(default_factory=catalogue_preview_mapping)
 
     @property
     def volume_count(self) -> int:
@@ -213,6 +213,7 @@ class SnapshotManifest:
                 "next_volume_id": self.next_volume_id,
                 "hash_algorithm": self.hash_algorithm,
                 "hash_algorithm_locked": self.hash_algorithm_locked,
+                "preview_settings": self.preview_settings,
             },
             "totals": {
                 "volumes": self.volume_count,
@@ -227,7 +228,7 @@ class SnapshotManifest:
         if data.get("format") != SNAPSHOT_FORMAT:
             raise InvalidRepositoryError("The file is not a JVVV snapshot manifest.")
         version = int(data.get("format_version", 0))
-        if version not in (1, SNAPSHOT_FORMAT_VERSION):
+        if version not in (1, 2, SNAPSHOT_FORMAT_VERSION):
             raise InvalidRepositoryError(
                 f"The snapshot uses manifest version {version}; this build reads "
                 f"version {SNAPSHOT_FORMAT_VERSION}."
@@ -243,6 +244,7 @@ class SnapshotManifest:
                 next_volume_id=int(catalogue.get("next_volume_id") or 1),
                 hash_algorithm=normalize_hash_algorithm(catalogue.get("hash_algorithm", DEFAULT_HASH_ALGORITHM)),
                 hash_algorithm_locked=bool(catalogue.get("hash_algorithm_locked", False)),
+                preview_settings=catalogue_preview_mapping(catalogue.get("preview_settings")),
                 volumes=tuple(
                     VolumeSnapshotRecord.from_json(item) for item in data.get("volumes", [])
                 ),
@@ -273,17 +275,6 @@ class RestoreResult:
     files_restored: int
     folders_restored: int
     seconds: float
-
-
-@dataclass(frozen=True)
-class VolumeRestoreResult:
-    repository_path: Path
-    snapshot_id: str
-    catalogue_path: Path
-    volume_id: int
-    uuid: str
-    volume_file: Path
-    registered: bool
 
 
 @dataclass(frozen=True)
@@ -325,6 +316,7 @@ class SnapshotDelta:
     content_changed: list[VolumeSnapshotRecord] = field(default_factory=list)
     history_changed: list[VolumeSnapshotRecord] = field(default_factory=list)
     metadata_changed: list[VolumeSnapshotRecord] = field(default_factory=list)
+    preview_settings_changed: bool = False
 
     @property
     def changed_count(self) -> int:
@@ -334,6 +326,7 @@ class SnapshotDelta:
             + len(self.content_changed)
             + len(self.history_changed)
             + len(self.metadata_changed)
+            + int(self.preview_settings_changed)
         )
 
 
@@ -539,6 +532,9 @@ class SnapshotRepository:
     @staticmethod
     def delta(current: SnapshotManifest, previous: SnapshotManifest | None) -> SnapshotDelta:
         delta = SnapshotDelta()
+        delta.preview_settings_changed = (
+            previous is not None and current.preview_settings != previous.preview_settings
+        )
         before = {record.uuid: record for record in previous.volumes} if previous else {}
         for record in current.volumes:
             old = before.pop(record.uuid, None)
@@ -577,6 +573,7 @@ class SnapshotRepository:
             != manifest.hash_algorithm
             or bool(values.get("hash_algorithm_locked") == "1" or next_volume_id > 1 or entries)
             != manifest.hash_algorithm_locked
+            or catalogue_preview_mapping(values) != manifest.preview_settings
         ):
             return True
         previous = {record.uuid: record for record in manifest.volumes}
@@ -731,6 +728,7 @@ class SnapshotRepository:
             volumes=tuple(records),
             hash_algorithm=normalize_hash_algorithm(registry_values.get("hash_algorithm", DEFAULT_HASH_ALGORITHM)),
             hash_algorithm_locked=bool(registry_values.get("hash_algorithm_locked") == "1" or next_volume_id > 1 or entries),
+            preview_settings=catalogue_preview_mapping(registry_values),
         )
         _write_json_atomic(self.snapshot_path(manifest.snapshot_id), manifest.to_json())
         if not stored_uuid or meta.get("catalogue_name") != catalogue_name:
@@ -956,6 +954,8 @@ class SnapshotRepository:
                 with registry:
                     set_registry_meta(registry, "hash_algorithm", manifest.hash_algorithm)
                     set_registry_meta(registry, "hash_algorithm_locked", "1" if manifest.hash_algorithm_locked else "0")
+                    for key, value in manifest.preview_settings.items():
+                        set_registry_meta(registry, key, value)
                 total = len(manifest.volumes)
                 for position, record in enumerate(manifest.volumes, start=1):
                     _check_cancel(cancel_callback)
@@ -1021,7 +1021,7 @@ class SnapshotRepository:
             seconds=time.monotonic() - started,
         )
 
-    def _materialize(self, record: VolumeSnapshotRecord, target: Path, exported_at: str, *, revision: int | None = None) -> None:
+    def _materialize(self, record: VolumeSnapshotRecord, target: Path, exported_at: str) -> None:
         try:
             materialize_volume_file(
                 target,
@@ -1029,7 +1029,7 @@ class SnapshotRepository:
                 volume_row=record.volume,
                 content_chunks=iter_blob_bytes(self.blob_path(record.content_blob)),
                 history_chunks=iter_blob_bytes(self.blob_path(record.history_blob)),
-                revision=record.revision if revision is None else revision,
+                revision=record.revision,
                 exported_at=exported_at,
                 expected_content_blob=record.content_blob,
                 expected_history_blob=record.history_blob,
@@ -1038,80 +1038,6 @@ class SnapshotRepository:
             raise SnapshotError(
                 f"Volume {record.drive_id or record.name or record.uuid} could not be restored: {exc}"
             ) from exc
-
-    def restore_volume(
-        self,
-        snapshot_id: str,
-        volume_uuid: str,
-        catalogue_path: str | Path,
-        *,
-        progress_callback: ProgressCallback | None = None,
-    ) -> VolumeRestoreResult:
-        """Put one volume back to its state in *snapshot_id* inside a live catalogue.
-
-        The volume file is replaced (or re-created and re-registered when the
-        volume had been deleted) with a revision the index has never seen, so
-        the next :meth:`jvvv.database.Database.reconcile` re-imports it.  The
-        caller must make sure no scan is writing to that catalogue meanwhile.
-        """
-
-        manifest = self.read_snapshot(snapshot_id)
-        record = next((item for item in manifest.volumes if item.uuid == volume_uuid), None)
-        if record is None:
-            raise InvalidRepositoryError(
-                f"Snapshot {snapshot_id} does not contain volume {volume_uuid}."
-            )
-        for digest in (record.content_blob, record.history_blob):
-            if not self.has_blob(digest):
-                raise InvalidRepositoryError(
-                    f"Snapshot {snapshot_id} references a blob that is missing from the repository."
-                )
-        layout = CatalogueLayout(Path(catalogue_path).expanduser())
-        if not layout.exists():
-            raise SnapshotError(f"The catalogue folder does not exist: {layout.root}")
-        registry_check = open_registry_db(layout.catalogue_db, read_only=True)
-        try:
-            target_algorithm = normalize_hash_algorithm(
-                validate_registry(registry_check).get("hash_algorithm", DEFAULT_HASH_ALGORITHM)
-            )
-        finally:
-            registry_check.close()
-        if manifest.hash_algorithm != target_algorithm:
-            raise SnapshotError(
-                "The snapshot uses a different hash algorithm from this catalogue. "
-                "Restore the complete snapshot as a separate catalogue instead."
-            )
-        _emit(progress_callback, "volume", 0, 1, f"Restoring {record.drive_id or record.name or record.uuid}")
-        target = layout.volume_file(record.uuid)
-        current = volume_store.current_revision(target)
-        self._materialize(record, target, manifest.created_at, revision=max(current, record.revision) + 1)
-        registered = False
-        registry = open_registry_db(layout.catalogue_db)
-        try:
-            validate_registry(registry)
-            entries = {entry.uuid: entry for entry in read_registry(registry)}
-            if record.uuid not in entries:
-                taken = {entry.volume_id for entry in entries.values()}
-                volume_id = record.volume_id
-                if volume_id in taken:
-                    volume_id = registry_next_volume_id(registry)
-                with registry:
-                    register_volume(registry, volume_id, record.uuid, utc_now())
-                registered = True
-            else:
-                volume_id = entries[record.uuid].volume_id
-        finally:
-            registry.close()
-        _emit(progress_callback, "volume", 1, 1, "Volume file restored")
-        return VolumeRestoreResult(
-            repository_path=self.path,
-            snapshot_id=snapshot_id,
-            catalogue_path=layout.root,
-            volume_id=volume_id,
-            uuid=record.uuid,
-            volume_file=target,
-            registered=registered,
-        )
 
 
 # ----------------------------------------------------------------------

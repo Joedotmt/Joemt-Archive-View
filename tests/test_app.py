@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QApplication, QDialog
 
 from jvvv.app import (
@@ -43,31 +44,58 @@ from jvvv.theme import (
 from jvvv.utils import VolumeSnapshot
 
 
-def test_file_menu_exposes_snapshots_and_restore_with_correct_availability(monkeypatch):
+def test_menus_group_actions_and_windows_for_the_current_context(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
     application = QApplication.instance() or QApplication([])
     window = MainWindow()
     try:
-        file_menu = window.menuBar().actions()[0].menu()
-        action_texts = [action.text() for action in file_menu.actions()]
-        assert "Create Snapshot…" in action_texts
-        assert "Snapshot History…" in action_texts
-        assert "Restore Catalogue from Snapshot…" in action_texts
-        assert "Create Catalogue Backup…" not in action_texts
-        # Without an open catalogue only the standalone actions are available.
-        assert not window.create_snapshot_action.isEnabled()
+        def visible_entries(menu):
+            actions = [action for action in menu.actions() if action.isVisible()]
+            assert not actions[0].isSeparator() and not actions[-1].isSeparator()
+            assert not any(left.isSeparator() and right.isSeparator()
+                           for left, right in zip(actions, actions[1:]))
+            return [action.text() for action in actions if not action.isSeparator()]
+
+        assert [action.text() for action in window.menuBar().actions()] == [
+            "&File", "&View", "&Window",
+        ]
+        assert visible_entries(window.file_menu) == [
+            "Open Catalogue…", "Create Empty Catalogue…",
+            "Create New Catalogue from Repository…", "Exit",
+        ]
+        assert visible_entries(window.window_menu) == ["App Settings", "Help"]
+        assert visible_entries(window.view_menu) == ["Zoom In", "Zoom Out"]
+        assert not window.catalogue_settings_action.isVisible()
         assert not window.snapshot_history_action.isEnabled()
         assert window.restore_snapshot_action.isEnabled()
-        assert window.create_snapshot_action in window.catalogue_actions
         assert window.snapshot_history_action in window.catalogue_actions
         assert window.restore_snapshot_action not in window.catalogue_actions
-        assert window.create_snapshot_action in window.scan_blocked_actions
-        assert window.restore_snapshot_action in window.scan_blocked_actions
+        assert window.snapshot_history_action in window.scan_blocked_actions
+        assert window.restore_snapshot_action not in window.scan_blocked_actions
         window._set_catalogue_loading(True)
         assert not window.restore_snapshot_action.isEnabled()
         window._set_catalogue_loading(False)
         assert window.restore_snapshot_action.isEnabled()
+
+        window._set_catalogue_open(True)
+        assert visible_entries(window.file_menu) == [
+            "Add Volume…", "Open Catalogue Folder", "Close Catalogue / Return Home", "Exit",
+        ]
+        assert visible_entries(window.window_menu) == [
+            "App Settings", "Catalogue Settings", "Snapshot Manager", "Backup Evidence",
+            "Preview Manager", "Catalogue Information", "Help",
+        ]
+        for action in window.home_actions:
+            assert not action.isVisible()
+            assert not action.isEnabled()
+        assert window.catalogue_settings_action.isVisible()
+        assert window.preferences_action.isVisible()
+        assert window.open_catalogue_action.shortcut() == QKeySequence(QKeySequence.StandardKey.Open)
+        assert window.close_catalogue_action.shortcut() == QKeySequence(QKeySequence.StandardKey.Close)
+        window._set_catalogue_open(False)
+        assert visible_entries(window.window_menu) == ["App Settings", "Help"]
+        assert all(action.isVisible() and action.isEnabled() for action in window.home_actions)
     finally:
         window.close()
     assert application is not None
@@ -1187,7 +1215,7 @@ def test_snapshot_history_offers_relink_when_the_repository_moved(monkeypatch, t
         assert window.repository_link().status == "missing"
         assert "offline" in dialog.location_label.text()
         assert dialog.relink_button.isEnabled()
-        assert not dialog.prune_button.isEnabled()
+        assert not dialog.prune_action.isEnabled()
         assert dialog.snapshot_table.rowCount() == 0
 
         # Relinking through the dialog path (user picks the found candidate).

@@ -38,6 +38,13 @@ from .catalogue_format import (
 )
 from .content_hash import DEFAULT_HASH_ALGORITHM, HASH_LENGTHS, content_hash_hex, normalize_hash_algorithm
 from .folder_statistics import calculate_folder_statistics
+from .preview_config import (
+    CATALOGUE_PREVIEW_SETTING_KEYS,
+    PREVIEWS_FFMPEG_PATH_SETTING,
+    PREVIEWS_ROOT_SETTING,
+    PreviewSettings,
+    catalogue_preview_mapping,
+)
 from . import volume_store
 from .volume_store import ImportResult, VolumeStoreError
 
@@ -726,6 +733,13 @@ class Database:
             catalogue_uuid=new_uuid(),
             created_at=utc_now(),
         )
+        registry = open_registry_db(self.layout.catalogue_db)
+        try:
+            with registry:
+                for key, value in catalogue_preview_mapping().items():
+                    set_registry_meta(registry, key, value)
+        finally:
+            registry.close()
 
     def _create_index_db(self) -> None:
         temp = self.layout.index_db.with_name(f"{INDEX_DB_NAME}.creating-{os.urandom(4).hex()}")
@@ -791,6 +805,51 @@ class Database:
         registry = self._registry()
         with registry:
             set_registry_meta(registry, key, value)
+
+    def has_preview_settings(self) -> bool:
+        """Whether this catalogue owns a complete preview configuration.
+
+        Older catalogues omit these keys, allowing the app to import the old
+        computer-wide preferences once without overwriting configured ones.
+        """
+
+        meta = self.catalogue_meta()
+        return all(key in meta for key in CATALOGUE_PREVIEW_SETTING_KEYS)
+
+    def preview_settings(self, *, ffmpeg_path: str = "") -> PreviewSettings:
+        """Read this catalogue's preferences with the local FFmpeg executable."""
+
+        values = catalogue_preview_mapping(self.catalogue_meta())
+        root_text = values[PREVIEWS_ROOT_SETTING]
+        if root_text:
+            root = Path(root_text).expanduser()
+            if not root.is_absolute():
+                root = self.path / root
+            values[PREVIEWS_ROOT_SETTING] = os.path.abspath(root)
+        values[PREVIEWS_FFMPEG_PATH_SETTING] = ffmpeg_path
+        return PreviewSettings.from_mapping(values)
+
+    def set_preview_settings(self, settings: PreviewSettings) -> None:
+        """Save a complete configuration atomically in the catalogue registry."""
+
+        if self.read_only:
+            raise CatalogueError("The catalogue is open read-only.")
+        settings.validate(require_root=settings.enabled)
+        values = catalogue_preview_mapping(settings.as_mapping())
+        root_text = values[PREVIEWS_ROOT_SETTING]
+        if root_text:
+            root = Path(root_text).expanduser()
+            if not root.is_absolute():
+                root = self.path / root
+            try:
+                values[PREVIEWS_ROOT_SETTING] = Path(os.path.relpath(root, self.path)).as_posix()
+            except ValueError:
+                # Windows cannot express a relative path across drive letters.
+                values[PREVIEWS_ROOT_SETTING] = os.path.abspath(root)
+        registry = self._registry()
+        with registry:
+            for key, value in values.items():
+                set_registry_meta(registry, key, value)
 
     @property
     def hash_algorithm(self) -> str:

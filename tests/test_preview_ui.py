@@ -5,6 +5,7 @@ import hashlib
 import os
 import pathlib
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
 from jvvv import preview_ui  # noqa: E402
 from jvvv.database import Database, utc_now  # noqa: E402
@@ -223,7 +224,7 @@ def test_checkbox_defaults_off_for_default_settings(app):
     widget = make_widget(PreviewSettings(), validator)
 
     assert not widget.enable_check.isChecked()
-    assert widget.enable_check.text() == "Generate offline previews while scanning"
+    assert widget.enable_check.text() == "Generate previews while scanning"
     assert widget.last_known_good is None
     assert validator.calls == []
     assert "disabled" in widget.status_label.text().lower()
@@ -272,8 +273,8 @@ def test_failed_validation_unchecks_box_and_names_failed_step(app, tmp_path):
     assert len(errors.shown) == 1
     parent, title, text = errors.shown[0]
     assert parent is widget
-    assert title == "Offline Previews"
-    assert text.startswith("Offline previews could not be enabled.")
+    assert title == "Previews"
+    assert text.startswith("Previews could not be enabled.")
     assert FAILED_STEP_LABEL in text
     assert FAILED_STEP_DETAIL in text
     assert "fail" in widget.status_label.text().lower()
@@ -288,7 +289,7 @@ def test_unchecking_reports_disabled_without_validation(app, tmp_path):
     widget.enable_check.setChecked(False)
 
     assert validator.calls == []
-    assert widget.status_label.text() == "Offline previews disabled."
+    assert widget.status_label.text() == "Previews disabled."
     assert widget.settings().enabled is False
     # The last configuration proven to work is remembered for spec §35.
     assert widget.last_known_good == enabled_settings(tmp_path)
@@ -735,13 +736,13 @@ def test_cache_dialog_labels_from_settings_and_64_bit_statistics(app, tmp_path):
         video=VideoPreviewProfile(fps=1.0, max_height=720, crf=30, preset="fast"),
     )
     dialog = PreviewCacheDialog(PreviewSettings())
-    assert dialog.root_label.text() == "Not configured"
+    assert dialog.preview_widget.root_edit.text() == ""
     assert dialog.image_count_label.text() == "Not scanned"
     assert dialog.free_space_label.text() == "Unknown"
     assert not dialog.scan_button.isEnabled()
 
     dialog.set_settings(settings)
-    assert dialog.root_label.text() == str(tmp_path / "JVVV Previews")
+    assert dialog.preview_widget.root_edit.text() == str(tmp_path / "JVVV Previews")
     # The directory does not exist yet, so free space cannot be read.
     assert dialog.free_space_label.text() == "Unknown"
     existing_root = tmp_path / "existing-root"
@@ -750,8 +751,8 @@ def test_cache_dialog_labels_from_settings_and_64_bit_statistics(app, tmp_path):
     # An existing directory reports its free space immediately, before any scan.
     assert dialog.free_space_label.text() not in {"Unknown", "—"}
     dialog.set_settings(settings)
-    assert dialog.image_profile_label.text() == "jpeg-max4096-q90"
-    assert dialog.video_profile_label.text() == "h264-1fps-720p-crf30-fast"
+    assert dialog.preview_widget.settings().image.profile_id == "jpeg-max4096-q90"
+    assert dialog.preview_widget.settings().video.profile_id == "h264-1fps-720p-crf30-fast"
     assert dialog.scan_button.isEnabled()
     assert dialog.unreferenced_button.isEnabled()
 
@@ -774,12 +775,12 @@ def test_cache_dialog_labels_from_settings_and_64_bit_statistics(app, tmp_path):
     assert dialog.image_count_label.text() == "128,401"
     assert dialog.video_count_label.text() == "18,420"
     assert dialog.total_storage_label.text().startswith("7.0 TB")
-    assert "7,000,000,000,000 bytes" in dialog.total_storage_label.text()
+    assert "7,000,000,000,000 bytes" in dialog.total_storage_label.toolTip()
     assert dialog.temporary_label.text() == "3"
     assert dialog.free_space_label.text() == "5.4 TB"
     assert "h264-1fps-240p-crf35-veryfast" in dialog.profiles_label.text()
     assert "(current)" in dialog.profiles_label.text()
-    assert "128,401" in dialog.status_label.text()
+    assert dialog.status_label.text() == "Usage updated."
 
     dialog.set_store_statistics(None, None)
     assert dialog.image_count_label.text() == "Not scanned"
@@ -806,15 +807,17 @@ def test_cache_dialog_buttons_emit_requests(app, tmp_path):
     dialog.open_folder_button.click()
     assert received == ["scan", "unreferenced", "open"]
 
-    assert dialog.scan_button.text() == "Scan Preview Store"
-    assert dialog.unreferenced_button.text() == "Show Unreferenced Previews"
-    assert dialog.open_folder_button.text() == "Open Preview Folder"
-    assert dialog.delete_button.text() == "Delete Selected Unreferenced Previews"
+    assert dialog.scan_button.text() == "Refresh Usage"
+    assert dialog.unreferenced_button.text() == "Find Unused Previews"
+    assert dialog.open_folder_button.text() == "Open Folder"
+    assert dialog.delete_button.text() == "Delete Selected"
+    assert dialog.cancel_button.isHidden()
 
     dialog.set_busy(True, "Scanning the preview store…")
     assert not dialog.scan_button.isEnabled()
     assert not dialog.unreferenced_button.isEnabled()
     assert dialog.cancel_button.isEnabled()
+    assert not dialog.cancel_button.isHidden()
     assert dialog.progress.minimum() == 0 and dialog.progress.maximum() == 0
     assert dialog.status_label.text() == "Scanning the preview store…"
     dialog.cancel_button.click()
@@ -827,6 +830,7 @@ def test_cache_dialog_buttons_emit_requests(app, tmp_path):
     dialog.set_busy(False, "Done.")
     assert dialog.scan_button.isEnabled()
     assert not dialog.cancel_button.isEnabled()
+    assert dialog.cancel_button.isHidden()
     assert dialog.progress.maximum() == 1
     assert dialog.status_label.text() == "Done."
 
@@ -925,8 +929,195 @@ def test_cache_dialog_forgets_figures_when_root_changes(app, tmp_path):
 
     dialog.set_settings(PreviewSettings(enabled=True, root_directory=str(tmp_path / "elsewhere")))
     assert dialog.image_count_label.text() == "Not scanned"
-    assert dialog.root_label.text() == str(tmp_path / "elsewhere")
+    assert dialog.preview_widget.root_edit.text() == str(tmp_path / "elsewhere")
     assert "changed" in dialog.status_label.text().lower()
+
+
+def test_manager_stages_validated_edits_until_apply(app, tmp_path):
+    settings = PreviewSettings(root_directory=str(tmp_path / "previews"))
+    dialog = PreviewCacheDialog(settings)
+    dialog.preview_widget._validator = RecordingValidator(True)
+    requested = []
+    dialog.settings_requested.connect(requested.append)
+    dialog.settings_requested.connect(dialog.set_settings)
+
+    assert dialog.windowTitle() == "Preview Manager"
+    assert [dialog.tabs.tabText(index).replace("&&", "&") for index in range(dialog.tabs.count())] == [
+        "Previews", "Storage & Cleanup",
+    ]
+    assert dialog.tabs.currentIndex() == 0
+    assert not dialog.apply_button.isEnabled()
+    dialog.preview_widget.video_fps_spin.setValue(0.333)
+    dialog.preview_widget.enable_check.setChecked(True)
+    assert requested == []
+    assert dialog.apply_button.isEnabled()
+    dialog.apply_button.click()
+    assert len(requested) == 1
+    assert requested[0].enabled and requested[0].video.fps == 0.333
+    assert not dialog.apply_button.isEnabled()
+    dialog.close()
+
+
+def test_manager_scopes_configuration_and_cleanup_without_ffmpeg_or_duplicate_location(app, tmp_path):
+    dialog = PreviewCacheDialog(enabled_settings(tmp_path))
+    dialog.show()
+    try:
+        assert dialog.previews_page.isAncestorOf(dialog.open_folder_button)
+        assert dialog.usage_group.isAncestorOf(dialog.scan_button)
+        assert dialog.unreferenced_group.isAncestorOf(dialog.unreferenced_button)
+        assert dialog.unreferenced_group.isAncestorOf(dialog.delete_button)
+        assert dialog.temporary_group.isAncestorOf(dialog.temporaries_button)
+        assert not hasattr(dialog, "root_label")
+        assert not hasattr(dialog, "image_profile_label")
+        assert not hasattr(dialog, "video_profile_label")
+        assert not hasattr(dialog, "configure_ffmpeg_button")
+        assert not hasattr(dialog, "ffmpeg_status_label")
+        for index in range(dialog.tabs.count()):
+            dialog.tabs.setCurrentIndex(index)
+            text = " ".join(widget.text() for widget in dialog.findChildren(QLabel)
+                            if widget.isVisibleTo(dialog))
+            text += " ".join(widget.text() for widget in dialog.findChildren(QPushButton)
+                             if widget.isVisibleTo(dialog))
+            assert "FFmpeg" not in text
+        assert dialog.profiles_label.isHidden()
+        dialog.profiles_toggle.click()
+        assert not dialog.profiles_label.isHidden()
+    finally:
+        dialog.close()
+
+
+def test_open_folder_waits_for_a_changed_directory_to_be_applied(app, tmp_path):
+    initial = PreviewSettings(root_directory=str(tmp_path / "previews"))
+    dialog = PreviewCacheDialog(initial)
+    opened = []
+    dialog.open_folder_requested.connect(lambda: opened.append(True))
+    dialog.settings_requested.connect(dialog.set_settings)
+    assert dialog.open_folder_button.isEnabled()
+    dialog.preview_widget.root_edit.setText(str(tmp_path / "another-directory"))
+    assert not dialog.open_folder_button.isEnabled()
+    dialog.open_folder_button.click()
+    assert opened == []
+    dialog.apply_button.click()
+    assert dialog.open_folder_button.isEnabled()
+    dialog.open_folder_button.click()
+    assert opened == [True]
+    dialog.close()
+
+
+def test_manager_apply_failure_does_not_request_persistence(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    dialog = PreviewCacheDialog(settings)
+    errors = RecordingErrors()
+    dialog.preview_widget._show_error = errors
+    dialog.preview_widget._validator = RecordingValidator(False)
+    requested = []
+    dialog.settings_requested.connect(requested.append)
+    dialog.preview_widget.root_edit.setText(str(tmp_path / "unavailable"))
+    dialog.apply_button.click()
+    assert requested == []
+    assert errors.shown
+    assert dialog.preview_widget.settings() == settings
+    assert not dialog.apply_button.isEnabled()
+    dialog.close()
+
+
+def test_manager_configuration_is_disabled_for_read_only_or_busy_catalogue(app, tmp_path):
+    dialog = PreviewCacheDialog(PreviewSettings(root_directory=str(tmp_path)))
+    requested = []
+    dialog.settings_requested.connect(requested.append)
+    dialog.preview_widget.video_fps_spin.setValue(2)
+    dialog.set_writable(False)
+    assert not dialog.preview_widget.isEnabled()
+    assert not dialog.apply_button.isEnabled()
+    dialog.apply_settings()
+    assert requested == []
+    dialog.set_writable(True)
+    assert dialog.apply_button.isEnabled()
+    dialog.set_busy(True)
+    assert not dialog.preview_widget.isEnabled()
+    assert not dialog.apply_button.isEnabled()
+    dialog.set_busy(False)
+    assert dialog.preview_widget.isEnabled()
+    assert dialog.apply_button.isEnabled()
+    dialog.close()
+
+
+def test_manager_external_ffmpeg_change_preserves_unapplied_catalogue_edits(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    dialog = PreviewCacheDialog(settings)
+    dialog.preview_widget.video_max_height_spin.setValue(720)
+    executable = str(tmp_path / "ffmpeg.exe")
+    dialog.set_ffmpeg_path(executable)
+    assert dialog.preview_widget.settings().ffmpeg_path == executable
+    assert dialog.preview_widget.settings().video.max_height == 720
+    assert dialog.preview_widget.last_known_good is None
+    dialog.set_settings(replace(settings, ffmpeg_path=executable))
+    assert dialog.preview_widget.settings().video.max_height == 720
+    assert dialog.apply_button.isEnabled()
+    dialog.close()
+
+
+def test_manager_discards_cleanup_results_after_profile_changes(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    dialog = PreviewCacheDialog(settings)
+    entry = PreviewEntry(tmp_path / "old.jpg", "image", settings.image.profile_id, sha_hex("a"), 50)
+    dialog.set_store_statistics(PreviewStoreStatistics(1, 0, 50, 0, 50, 0, {}), None)
+    dialog.set_unreferenced([entry], 1)
+    dialog.unreferenced_table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    assert dialog.delete_button.isEnabled()
+    dialog.set_settings(replace(settings, image=ImagePreviewProfile(max_dimension=2048)))
+    assert dialog.unreferenced_table.rowCount() == 0
+    assert not dialog.delete_button.isEnabled()
+    assert dialog.image_count_label.text() == "Not scanned"
+    dialog.close()
+
+
+def test_manager_reopening_preserves_validation_requirement_for_pending_quality_edits(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    dialog = PreviewCacheDialog(settings)
+    requested = []
+    errors = RecordingErrors()
+    dialog.settings_requested.connect(requested.append)
+    dialog.preview_widget._show_error = errors
+    dialog.preview_widget._validator = RecordingValidator(False)
+    dialog.preview_widget.video_max_height_spin.setValue(720)
+    dialog.set_settings(settings)
+    dialog.apply_button.click()
+    assert requested == []
+    assert errors.shown
+    assert dialog.preview_widget.settings() == settings
+    dialog.close()
+
+
+def test_manager_ffmpeg_change_requires_validation_of_pending_enabled_configuration(app, tmp_path):
+    settings = enabled_settings(tmp_path)
+    dialog = PreviewCacheDialog(settings)
+    requested = []
+    errors = RecordingErrors()
+    dialog.settings_requested.connect(requested.append)
+    dialog.preview_widget._show_error = errors
+    dialog.preview_widget._validator = RecordingValidator(False)
+    dialog.preview_widget.video_max_height_spin.setValue(720)
+    dialog.set_ffmpeg_path(str(tmp_path / "untested-ffmpeg.exe"))
+    dialog.apply_button.click()
+    assert requested == []
+    assert errors.shown
+    assert dialog.preview_widget.settings().ffmpeg_path == str(tmp_path / "untested-ffmpeg.exe")
+    dialog.close()
+
+
+def test_preview_advanced_controls_are_collapsed_by_default(app):
+    widget = make_widget(PreviewSettings())
+    assert widget.title() == "Previews"
+    assert widget.advanced_widget.isHidden()
+    assert not widget.advanced_widget.isAncestorOf(widget.video_fps_spin)
+    assert not widget.advanced_widget.isAncestorOf(widget.video_max_height_spin)
+    assert widget.advanced_widget.isAncestorOf(widget.video_crf_spin)
+    assert widget.advanced_widget.isAncestorOf(widget.image_quality_spin)
+    widget.advanced_toggle.click()
+    assert not widget.advanced_widget.isHidden()
+    assert widget.advanced_toggle.text() == "Hide Advanced"
+    widget.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1198,7 +1389,7 @@ def test_cache_dialog_invalidate_unreferenced_clears_the_list_and_explains(app, 
     dialog.invalidate_unreferenced()
 
     assert dialog.unreferenced_table.rowCount() == 0
-    assert "run Show Unreferenced Previews again" in dialog.status_label.text()
+    assert "run Find Unused Previews again" in dialog.status_label.text()
 
     dialog.status_label.setText("untouched")
     dialog.invalidate_unreferenced()  # nothing displayed: nothing to say

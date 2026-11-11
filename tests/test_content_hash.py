@@ -10,7 +10,7 @@ from jvvv.database import CatalogueError, Database, open_catalogue
 from jvvv.preview_cache import PreviewCache
 from jvvv.preview_config import ImagePreviewProfile, VideoPreviewProfile
 from jvvv.preview_service import inspect_preview_file
-from jvvv.snapshot_repository import SnapshotError, SnapshotManifest, SnapshotRepository
+from jvvv.snapshot_repository import SnapshotManifest, SnapshotRepository
 from test_preview_scanner import make_scanner, make_service, write_test_image
 
 ALGORITHMS = tuple(HASH_LENGTHS)
@@ -158,12 +158,6 @@ def test_scan_preview_backup_and_snapshot_use_catalogue_algorithm(tmp_path, algo
         assert db.connection.execute("SELECT content_hash FROM files LIMIT 1").fetchone()[0] == expected
     finally:
         db.close()
-    target = Database(tmp_path / "other.jvvv")
-    target.set_hash_algorithm(next(a for a in ALGORITHMS if a != algorithm))
-    target.close()
-    with pytest.raises(SnapshotError, match="different hash algorithm"):
-        repository.restore_volume(snapshot.snapshot_id, snapshot.volumes[0].uuid, tmp_path / "other.jvvv")
-    assert not list((tmp_path / "other.jvvv" / "volumes").glob("*.jvvvol"))
 
 
 def test_preview_names_separate_algorithms_and_preserve_legacy_sha(tmp_path):

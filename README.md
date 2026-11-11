@@ -20,13 +20,12 @@ JVVV. There is no server or cloud component.
   (`index.sqlite`).
 - Keep a version history in a content-addressed snapshot repository
   (`.jvvvrepo`): a snapshot after rescanning one drive writes only that drive's
-  data, and any snapshot can be restored as a whole catalogue or one drive at a
-  time.
+  data, and any snapshot can be used to create a new catalogue.
 - Browse indexed folders and files offline.
 - Search by filename, partial filename, extension, and folder name across all
-  volumes, with optional relative-path matching in **Settings > Preferences**.
+  volumes, with optional relative-path matching in **Window > App Settings**.
 - Choose a custom accent color, light or dark mode, and the default Adobe or
-  optional Qt Fusion styling in **Settings > Preferences**. Appearance changes
+  optional Qt Fusion styling in **Window > App Settings**. Appearance changes
   preview live and can be reset to the default Adobe theme.
 - Show connected/offline status, capacity, used/free space, indexed item counts,
   last scan time, and scan logs.
@@ -83,9 +82,30 @@ On Windows, activate the environment with:
 python -m jvvv
 ```
 
-JVVV starts without opening a catalogue. Use **File > New Catalogue** to create
-a `.jvvv` folder, or **File > Open Catalogue** to open an existing one (pick the
-folder; picking the `catalogue.sqlite` inside it works too).
+JVVV starts on **Home**. Choose **Open Catalogue…**, **Create Empty Catalogue…**,
+or **Create New Catalogue from Repository…**. These actions are available only
+on Home. The recent list remembers the last eight successfully opened catalogues
+on this computer, most recent first, and shows their names and full locations.
+Double-click an entry or use **Open Selected**; **Remove from List** only forgets
+the entry and leaves the catalogue on disk. Offline locations stay in the list.
+
+An open catalogue has its own workspace, with its name and location at the top.
+Use **Close Catalogue / Return Home** to return Home before opening or creating another
+catalogue. Catalogue actions and Catalogue Settings appear only in the workspace;
+App Settings, Help, and UI zoom remain available on both screens.
+
+The Selected Volume panel shows connector type, connection, catalogue status,
+condition, capacity, used/free space, indexed file/folder counts, last scan,
+scan path, and other-copy coverage. The file list has its own **Filter files by
+copy status** control; **All items** shows everything in the current folder.
+
+The top bar has three menus: **File** for catalogue and volume actions, **View**
+for zoom, and **Window** for settings, managers, information, and Help. On Home,
+Window contains only **App Settings** and **Help**. With a catalogue open, it also
+offers **Catalogue Settings**, **Snapshot Manager**, **Backup Evidence**,
+**Preview Manager**, and **Catalogue Information**. File keeps catalogue
+opening and creation actions on Home; the workspace instead offers **Add Volume…**,
+**Open Catalogue Folder**, and **Close Catalogue / Return Home**.
 
 ### Catalogue folder layout
 
@@ -107,11 +127,11 @@ the other two (Backup Evidence has to be analysed again afterwards, because it
 is derived data). A volume file that is missing from `volumes/` is reported
 and the catalogue refuses to open until it is put back or restored from a
 snapshot; a volume file that is not registered is left alone and listed under
-**Catalogue > Catalogue Info**.
+**Window > Catalogue Information**.
 
 ### Snapshots: version history and backup
 
-When closing a catalogue, exiting the app, or switching catalogues, JVVV offers
+When returning Home or exiting the app, JVVV offers
 **Create Snapshot & Close**, **Close Without Snapshot**, and **Cancel** if the
 catalogue differs from its latest snapshot (or has no snapshots yet). Changes
 remain saved in the local catalogue even when you close without a snapshot.
@@ -119,12 +139,17 @@ Creating a snapshot keeps the catalogue open until it succeeds; cancelling or
 a failure leaves the catalogue open. If the repository is offline or cannot
 be checked, the prompt explains that its snapshot status is unknown.
 
-Use **File > Create Snapshot…** to record the catalogue in its snapshot
-repository, a `.jvvvrepo` folder that by default sits next to the catalogue
+Open **Window > Snapshot Manager** and choose **Create Snapshot…** to record the catalogue in its snapshot
+repository, a `.jvvvrepo` folder that by default sits next to the catalogue.
 If you later move or rename that folder, the catalogue shows the repository as
-offline and **Snapshot History > Relink…** points it at the new location — the
+offline and **Snapshot Manager > Locate Repository…** points it at the new location — the
 app lists matching repositories it finds nearby and refuses folders that belong
-to another catalogue. A catalogue restored from a snapshot comes out linked to
+to another catalogue. Opening a catalogue checks its repository and offers
+**Locate Repository…** or **Continue Without Repository** when it is unavailable.
+Snapshot Manager also checks when opened; dismissing the prompt avoids repeated
+warnings during the same catalogue session. If the repository's drive was just
+disconnected, reconnect it and choose **Check Again**. Locate Repository is hidden
+when the repository is available. A catalogue restored from a snapshot comes out linked to
 the repository it was restored from. A snapshot is a small JSON
 manifest listing every volume with its metadata row and the digests of two
 blobs: its *content* (folders, files, media details, preview status) and its
@@ -134,26 +159,26 @@ recorded without being read. Rescanning one drive and taking a snapshot writes
 one new blob of a few megabytes in a couple of seconds; taking twenty snapshots
 of an unchanged archive costs twenty manifests.
 
-**File > Snapshot History…** lists every snapshot with what changed since the
+**Window > Snapshot Manager** lists every snapshot with what changed since the
 previous one (drives added, removed, rescanned, or whose details were edited),
-shows the drives inside a snapshot, and offers:
+shows the drives inside a snapshot, and has three sections:
 
-- **Restore Catalogue…** — either replace the open catalogue with the snapshot
-  (it is closed, rebuilt from the snapshot in a temporary folder, swapped into
-  place and reopened) or restore to a new location.
-- **Restore Selected Volume…** — roll one drive back to its state in that
-  snapshot inside the open catalogue; a drive deleted since is registered
-  again.
-- **Delete Snapshot**, **Prune Unreferenced Blobs** (reclaim space held only
-  by deleted snapshots) and **Verify Repository** (re-hash every blob and check
-  that every snapshot is complete).
+- **Repository** shows its location and availability. **Repository Tools** contains
+  **Reclaim Unused Space…** (space held only by deleted snapshots) and
+  **Verify Repository…** (re-hash every blob and check that every snapshot is complete).
+- **Snapshots** contains **Create Snapshot…** and **Delete Selected Snapshot…**.
+  A catalogue without snapshots offers **Create First Snapshot…**.
+- **Volumes in the selected snapshot** shows the saved volume names, counts,
+  and changes for inspection.
 
-**File > Restore Catalogue from Snapshot…** works without an open catalogue:
-choose any repository folder, pick a snapshot, and choose where to build the
-restored `.jvvv` folder. Every blob is verified against its digest while the
-volume files are rebuilt; the search index is regenerated; the destination is
-replaced only after the whole restore succeeded. A restored catalogue
-re-snapshots to exactly the same blobs as the original.
+On **Home**, choose **Create New Catalogue from Repository…**: choose a repository
+folder, pick a snapshot (the latest is selected by default), and choose a new
+catalogue name and location. Review the repository, snapshot, and destination,
+then choose **Create and Open Catalogue**. Existing folders and files cannot be
+overwritten by this workflow. Every blob is verified against its digest while
+the volume files are rebuilt, and the search index is regenerated. The new
+catalogue opens automatically and appears in Recent catalogues. It re-snapshots
+to exactly the same blobs as the original.
 
 Snapshots do not include offline preview files. The per-file preview status
 recorded in the catalogue is included, but the preview directory itself may be
@@ -162,15 +187,15 @@ separately with your normal file-copy or backup software.
 
 ## Usage
 
-1. Choose **File > New Catalogue** and save a `.jvvv` file.
-2. Click **New Volume**.
+1. On **Home**, choose **Create Empty Catalogue…** and name the `.jvvv` folder.
+2. Choose **File > Add Volume…**.
 3. Enter a volume name and choose a connected drive or folder. JVVV starts
    scanning when the volume is added.
 4. Browse the saved folder tree and file list after the scan completes.
 5. Use the search bar to search across all indexed volumes.
 6. Use **Scan** again to refresh an existing catalogue.
 
-Choose **Settings > Preferences > Catalogue hashing** before adding the first
+Choose **Window > Catalogue Settings > Catalogue hashing** before adding the first
 volume. The dropdown offers **SHA-256** (the default), **BLAKE3**, and
 **XXH3-128**. One algorithm applies to every drive in the catalogue and locks
 permanently as soon as its first volume is added, even before scanning. Deleting
@@ -205,7 +230,7 @@ is unchanged. Missing, partial, failed, or unavailable details are probed again.
 If a retry fails, earlier useful details are retained only when the hash matches,
 and Properties labels them as partial with the latest failure reason.
 
-Use **Catalogue > Backup Evidence** to compare records already stored in the
+Use **Window > Backup Evidence** to compare records already stored in the
 catalogue. This analysis reads the `.jvvv` database only: it does not access or
 rescan source drives and does not reread file contents. **Hash verified** means
 the full-file content hashes previously recorded by scans are identical, even if
@@ -268,14 +293,34 @@ the update. Cancelling the confirmation leaves the existing catalogue intact.
 If a result belongs to a connected volume, use the result buttons to open the
 real file or reveal it in the operating system file manager.
 
-## Offline previews
+## Previews
 
-Offline previews are disabled by default. To enable them, open **Settings >
-Preferences > Offline Previews**, choose a preview storage directory (a local
+Previews are disabled by default. To enable them, open **Window >
+Preview Manager > Previews**, choose a preview storage directory (a local
 disk, removable disk, mapped network drive, or UNC path; it does not need to sit
-beside the `.jvvv` file), optionally point JVVV at a specific `ffmpeg`
-executable if it is not on `PATH`, pick the image and video quality you want to
-spend storage on, and tick **Generate offline previews while scanning**.
+beside the `.jvvv` file), pick the image and video quality you want to spend
+storage on, and tick **Generate previews while scanning**, then choose **Apply**. If FFmpeg is
+not on `PATH`, set its executable under **Window > App Settings > FFmpeg** first.
+
+Preview preferences (including FPS, resolution, quality, enabled state, and
+storage directory) are saved in the catalogue's `catalogue.sqlite`, independently
+for each catalogue, and preserved in snapshots. FFmpeg's executable path remains
+in App Settings on this computer. The catalogue also stores each file's preview
+profile ID and status. Preview files themselves are stored separately and are
+not included in snapshots. Directory associations use relative paths where
+possible, so moving a catalogue and its preview directory together keeps the
+association. If the directory moves separately, choose its new location in
+Preview Manager and Apply.
+
+Existing catalogues import their previous computer-wide preview preferences on
+their first writable open, then keep their own settings. New catalogues start
+with previews disabled. Snapshots from older versions that did not save preview
+preferences restore disabled defaults.
+
+Preview Manager separates **Previews** configuration from **Storage & Cleanup**.
+Resolution and video FPS are shown first; **Show Advanced** reveals image quality,
+video quality, encoding speed, and profile IDs. Catalogue Settings contains only
+catalogue hashing. FFmpeg configuration is available only in App Settings.
 
 Ticking the box immediately proves the configuration works: JVVV writes and
 removes a test file in the preview directory, checks that every image library is
@@ -361,15 +406,17 @@ video application — JVVV never contains an embedded viewer or player.
 Properties show whether a preview is available, its profile, dimensions,
 duration, size, and location, or why the last scan could not create it.
 
-**Catalogue > Preview Cache…** shows the preview directory, its free space, the
-current profiles, and (after **Scan Preview Store**) how many image and video
-previews it holds and how much space they use. **Show Unreferenced Previews**
+The **Previews** tab contains the directory setting and **Open Folder** alongside
+generation preferences. **Window > Preview Manager > Storage & Cleanup** shows
+free space, image/video counts and total usage after **Refresh Usage**.
+**Show Profile Breakdown** expands the detailed storage figures.
+**Find Unused Previews**
 lists files under the current profiles whose content hash and algorithm are not referenced by the
 open catalogue. Because other catalogues may share the same directory, nothing
 is deleted automatically: select the entries you want to remove and confirm
-**Delete Selected Unreferenced Previews**. The list is cleared whenever the
+**Delete Selected**. The list is cleared whenever the
 catalogue changes, so it always has to be produced again before deleting.
-**Delete Temporary Files** removes `.tmp-` files left behind by an interrupted
+**Clean Up Temporary Files** removes `.tmp-` files left behind by an interrupted
 preview generation (a crash or power loss); files newer than 24 hours are kept
 because another JVVV window sharing the directory may still be writing them.
 Directory junctions or symbolic links inside the preview directory are never
@@ -386,7 +433,7 @@ The automated tests cover database initialization and current-schema validation,
 the catalogue folder format (truth-first writes, revision tracking, index
 rebuild, crash recovery of interrupted deletions, external volume-file changes,
 canonical serialisation), the snapshot repository (deduplication, deltas,
-full and single-volume restore, prune, verify, cancellation), volume operations, streaming hashes,
+full catalogue restore, prune, verify, cancellation), volume operations, streaming hashes,
 media inspection, scan cancellation/change review and rollback, hash-first backup
 evidence, offline browsing,
 search, and the offline preview system (profile IDs, preview-root validation,

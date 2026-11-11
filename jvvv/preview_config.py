@@ -42,6 +42,12 @@ PREVIEW_SETTING_KEYS: tuple[str, ...] = (
     PREVIEWS_VIDEO_PRESET_SETTING,
 )
 
+# Generation preferences belong to the catalogue. Only the executable location
+# depends on the computer on which that catalogue is open.
+CATALOGUE_PREVIEW_SETTING_KEYS: tuple[str, ...] = tuple(
+    key for key in PREVIEW_SETTING_KEYS if key != PREVIEWS_FFMPEG_PATH_SETTING
+)
+
 # Allowed configuration ranges (inclusive).
 IMAGE_MAX_DIMENSION_RANGE = (320, 8192)
 IMAGE_JPEG_QUALITY_RANGE = (40, 100)
@@ -436,6 +442,24 @@ class PreviewSettings:
 
 def default_preview_settings() -> PreviewSettings:
     return PreviewSettings()
+
+
+def catalogue_preview_mapping(values: Mapping[str, Any] | None = None) -> dict[str, str]:
+    """Canonical catalogue metadata, without any computer-specific FFmpeg path.
+
+    Paths remain relative when supplied that way; the database resolves them
+    against its catalogue folder when it builds the runtime configuration.
+    Missing or invalid values use the same safe defaults as the settings UI.
+    """
+
+    if values is not None and not isinstance(values, Mapping):
+        raise ValueError("Catalogue preview settings must be a key/value mapping.")
+    settings = PreviewSettings.from_mapping(values).as_mapping()
+    return {
+        key: ("1" if value else "0") if isinstance(value, bool) else str(value)
+        for key, value in settings.items()
+        if key in CATALOGUE_PREVIEW_SETTING_KEYS
+    }
 
 
 def preview_extension_for(media_kind: str) -> str:

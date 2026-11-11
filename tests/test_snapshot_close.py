@@ -168,7 +168,7 @@ def test_cancelling_repository_selection_keeps_catalogue_open(window, monkeypatc
     assert window.db is not None
 
 
-def test_switching_catalogues_continues_after_snapshot(window, monkeypatch, tmp_path):
+def test_returning_home_before_creating_another_catalogue_keeps_snapshot_flow(window, monkeypatch, tmp_path):
     original = window.catalogue_path
     target = tmp_path / "New.jvvv"
     answer_next_prompt(monkeypatch, "Create Snapshot && Close")
@@ -179,6 +179,10 @@ def test_switching_catalogues_continues_after_snapshot(window, monkeypatch, tmp_
         "_open_catalogue_in_window",
         lambda db, path, lock: open_in_window(db, path, lock, connected_volume_snapshots=[]),
     )
+    window.new_catalogue()  # Creating another catalogue is unavailable in the workspace.
+    assert window.catalogue_path == original
+    assert window.close_catalogue()
+    assert window.stack.currentWidget() is window.welcome_page
     window.new_catalogue()
     assert window.catalogue_path == target
     assert window.db is not None
