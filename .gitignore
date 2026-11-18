@@ -23,6 +23,11 @@ dist/
 *.egg-info/
 *.egg
 
+# Local test runs, report drafts, and generated deliverables
+/tmp/
+/work/
+/output/
+
 # IDE and editor settings
 .idea/
 .vscode/

@@ -1606,7 +1606,7 @@ def test_scan_log_messages_are_appended_only_when_a_log_widget_exists():
 # ---------------------------------------------------------------------------
 # End-of-scan reporting (spec §15, §16, §17) - real offscreen MainWindow
 # ---------------------------------------------------------------------------
-def test_scan_finished_with_preview_failures_reports_every_failure(main_window, monkeypatch, tmp_path):
+def test_scan_finished_reports_preview_failures_without_a_popup(main_window, monkeypatch, tmp_path):
     window = main_window
     window.preview_settings = enabled_settings(tmp_path)
     monkeypatch.setattr(MainWindow, "refresh_after_catalogue_write", lambda self: None)
@@ -1632,17 +1632,12 @@ def test_scan_finished_with_preview_failures_reports_every_failure(main_window, 
     assert status_message.startswith("Scan completed with warnings:")
     assert "Offline previews: 5 generated, 2 reused, 3 failed." in status_message
 
-    assert len(boxes.boxes) == 1
-    box = boxes.boxes[0]
-    assert box.windowTitle() == "Scan Completed with Preview Errors"
-    assert "Scan completed with preview errors." in box.text()
-    assert "Catalogue indexing succeeded, but some previews were not created." in box.text()
-    summary = box.informativeText()
-    assert summary.startswith("Offline Preview Summary")
-    assert str(tmp_path / "previews") in summary
-    assert format_size(18_700_000) in summary
-    assert button_texts(box) == {"View Preview Failures", "Close"}
+    assert boxes.boxes == []
+    assert dialogs == []
+    assert window.scan_queue_result[0] == "warning"
+    assert "failed 3" in window.scan_queue_result[1]
 
+    window.show_preview_failures()
     assert len(dialogs) == 1
     dialog = dialogs[0]
     assert dialog.parent() is window
@@ -1671,10 +1666,11 @@ def test_scan_finished_with_storage_unavailable_offers_the_failure_list(main_win
 
     assert window.scan_progress.format() == "Completed with preview errors"
     assert "4 skipped (storage unavailable)" in window.statusBar().currentMessage()
-    box = boxes.boxes[0]
-    assert box.windowTitle() == "Scan Completed with Preview Errors"
-    assert "Preview generation stopped because preview storage became unavailable." in box.informativeText()
-    assert "No space left on device" in box.informativeText()
+    assert boxes.boxes == []
+    assert dialogs == []
+    assert window.scan_queue_result[0] == "warning"
+    assert "No space left on device" in window.scan_queue_result[1]
+    window.show_preview_failures()
     assert len(dialogs) == 1
     assert dialogs[0].table.rowCount() == 0
     assert "No space left on device" in dialogs[0].storage_label.text()
@@ -1702,7 +1698,7 @@ def test_scan_finished_with_previews_disabled_shows_no_preview_dialog(main_windo
     assert window.scan_progress.format() == "Cancelled"
 
 
-def test_scan_finished_with_all_previews_ok_shows_the_summary(main_window, monkeypatch, tmp_path):
+def test_scan_finished_with_all_previews_ok_reports_to_queue(main_window, monkeypatch, tmp_path):
     window = main_window
     window.preview_settings = enabled_settings(tmp_path)
     monkeypatch.setattr(MainWindow, "refresh_after_catalogue_write", lambda self: None)
@@ -1714,12 +1710,9 @@ def test_scan_finished_with_all_previews_ok_shows_the_summary(main_window, monke
 
     assert window.scan_progress.format() == "Completed"
     assert "Offline previews: 2 generated, 1 reused, 0 failed." in window.statusBar().currentMessage()
-    assert len(boxes.boxes) == 1
-    box = boxes.boxes[0]
-    assert box.windowTitle() == "Offline Preview Summary"
-    assert box.text() == "Scan completed. All previews were generated or reused."
-    assert box.informativeText() == statistics.summary_text(str(tmp_path / "previews"))
-    assert button_texts(box) == {"Close"}
+    assert boxes.boxes == []
+    assert window.scan_queue_result[0] == "completed"
+    assert "Previews generated 2, reused 1, failed 0" in window.scan_queue_result[1]
 
 
 def test_scan_finished_after_a_skipped_preflight_says_so_without_a_dialog(main_window, monkeypatch):
@@ -2564,8 +2557,8 @@ def test_scan_summary_names_the_root_the_scan_wrote_to_not_the_current_setting(
 
     window.on_scan_finished(scan_result(statistics))
 
-    assert len(boxes.boxes) == 1
-    summary = boxes.boxes[0].informativeText()
+    assert boxes.boxes == []
+    summary = window.scan_queue_result[1]
     assert scan_root in summary
     assert str(tmp_path / "previews") not in summary
 
@@ -2669,7 +2662,9 @@ def test_interrupted_preview_summary_preserves_successful_indexing(main_window, 
     assert scan_outcome("completed", restored.as_dict()) == "completed_with_warnings"
     window.on_scan_finished(scan_result(statistics))
     assert window.scan_progress.format() == "Completed; previews interrupted"
-    assert boxes.boxes[-1].windowTitle() == "Previews Interrupted"
+    assert boxes.boxes == []
+    assert window.scan_queue_result[0] == "warning"
+    assert "The updated catalogue and completed previews were kept." in window.scan_queue_result[1]
 
 
 @pytest.mark.parametrize("algorithm", ["sha256", "blake3", "xxh3_128"])

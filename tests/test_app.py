@@ -80,7 +80,8 @@ def test_menus_group_actions_and_windows_for_the_current_context(monkeypatch):
 
         window._set_catalogue_open(True)
         assert visible_entries(window.file_menu) == [
-            "Add Volume…", "Open Catalogue Folder", "Close Catalogue / Return Home", "Exit",
+            "Add Volume…", "Archive Project…", "Operations Queue…", "Open Catalogue Folder",
+            "Close Catalogue / Return Home", "Exit",
         ]
         assert visible_entries(window.window_menu) == [
             "App Settings", "Catalogue Settings", "Snapshot Manager", "Backup Evidence",

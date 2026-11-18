@@ -8,7 +8,6 @@ import re
 import sqlite3
 import sys
 import traceback
-from threading import Event
 from time import monotonic
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
@@ -83,6 +82,9 @@ from PySide6.QtWidgets import (
 )
 
 from .config import APP_NAME
+from .archive_io import hold_folder
+from .archive_job import check_archive_write_locations, is_archive_volume_root, is_scanned_archive_volume, pending_archive
+from .archive_ui import ArchiveDialog, ArchiveThread
 from .backup_analysis import (
     ITEM_EVIDENCE_MISSING,
     BackupAnalysisEngine,
@@ -94,6 +96,9 @@ from .backup_analysis import (
 )
 from .catalogue_format import CATALOGUE_DB_NAME
 from .content_hash import DEFAULT_HASH_ALGORITHM, HASH_LABELS
+from .drive_marker import MARKER_IDENTITY, read_drive_marker, write_drive_marker
+from .operations_queue import ACTIONABLE, OperationsQueue, prepare_operation_previews
+from .operations_ui import OperationsDialog
 from .database import (
     ARCHIVE_STATUSES,
     CATALOGUE_EXTENSION,
@@ -196,6 +201,8 @@ from .utils import (
     rename_volume_label,
     relative_path_for_display,
     resolve_volume_source_path,
+    snapshot_matches_volume,
+    volume_identity_known,
 )
 
 
@@ -2328,10 +2335,6 @@ def display_duration_ms(value: int | None) -> str:
 
 def size_sort_key(value: int | None) -> int:
     return -1 if value is None else int(value)
-
-
-def source_path_exists(source_path: str | None) -> bool:
-    return bool(source_path and Path(source_path).exists())
 
 
 def display_db_date(value: str | None) -> str:
@@ -4703,7 +4706,6 @@ class ScanWorker(QObject):
     catalogue_ready = Signal()
     progress = Signal(int, int, str)
     stats_progress = Signal(int, int, str, int, int)
-    review_requested = Signal(dict)
     log_message = Signal(str)
     finished = Signal(dict)
     failed = Signal(str)
@@ -4715,6 +4717,7 @@ class ScanWorker(QObject):
         *,
         preview_settings: PreviewSettings | None = None,
         preview_skip_reason: str | None = None,
+        volume_uuid: str | None = None,
     ) -> None:
         super().__init__()
         self.db_path = db_path
@@ -4724,9 +4727,8 @@ class ScanWorker(QObject):
         # user's choice to scan without previews after a failed preflight.
         self.preview_settings = preview_settings
         self.preview_skip_reason = preview_skip_reason
+        self.volume_uuid = volume_uuid
         self.cancel_requested = False
-        self._review_event = Event()
-        self._apply_reviewed_changes = False
         self._io_canceller = _SynchronousIoCanceller()
 
     def _build_preview_service(self) -> PreviewService | None:
@@ -4742,10 +4744,19 @@ class ScanWorker(QObject):
         db: Database | None = None
         try:
             self._io_canceller.start()
+            if self.volume_uuid is not None:
+                check_archive_write_locations(None, self.db_path)
+                self.preview_settings, self.preview_skip_reason = prepare_operation_previews(self.preview_settings)
             db = Database(self.db_path)
+            if self.volume_uuid is not None:
+                volume = db.get_volume(self.volume_id)
+                if volume is None or volume["uuid"] != self.volume_uuid:
+                    raise OSError("The queued volume was removed from the catalogue.")
             preview_statistics: PreviewStatistics | None = None
             if self.preview_skip_reason is not None:
                 preview_statistics = skipped_preflight_statistics(self.preview_skip_reason)
+                if self.volume_uuid is not None:
+                    preview_statistics.message = f"Offline previews skipped. {self.preview_skip_reason}"
             scanner = VolumeScanner(
                 db,
                 progress_callback=lambda files, folders, path: self.progress.emit(files, folders, path),
@@ -4757,7 +4768,7 @@ class ScanWorker(QObject):
                     total,
                 ),
                 cancel_callback=lambda: self.cancel_requested,
-                preview_callback=self.request_review,
+                require_complete=self.volume_uuid is not None,
                 preview_service=self._build_preview_service(),
                 preview_statistics=preview_statistics,
                 catalogue_ready_callback=self.catalogue_ready.emit,
@@ -4788,21 +4799,9 @@ class ScanWorker(QObject):
                 db.close()
             self._io_canceller.stop()
 
-    def request_review(self, changes) -> bool:
-        self._apply_reviewed_changes = False
-        self._review_event.clear()
-        self.review_requested.emit(changes.as_dict())
-        self._review_event.wait()
-        return self._apply_reviewed_changes and not self.cancel_requested
-
-    def resolve_review(self, apply_changes: bool) -> None:
-        self._apply_reviewed_changes = bool(apply_changes)
-        self._review_event.set()
-
     @Slot()
     def cancel(self) -> None:
         self.cancel_requested = True
-        self._review_event.set()
         self._io_canceller.cancel()
 
 
@@ -5366,8 +5365,13 @@ class MainWindow(QMainWindow):
         self.current_folder_id: int | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: ScanWorker | None = None
+        self.archive_dialog: ArchiveDialog | None = None
+        self.archive_thread: ArchiveThread | None = None
+        self.operations_dialog: OperationsDialog | None = None
+        self.operations_queue: OperationsQueue | None = None
+        self.operation_id: str | None = None
+        self.scan_queue_result: tuple[str, str] | None = None
         self.scan_cancel_requested = False
-        self.post_scan_edit_volume_id: int | None = None
         self.delete_thread: QThread | None = None
         self.delete_worker: DeleteVolumeWorker | None = None
         self.catalogue_info_thread: QThread | None = None
@@ -5437,6 +5441,9 @@ class MainWindow(QMainWindow):
         self.volume_connection_refresh_timer.setSingleShot(True)
         self.volume_connection_refresh_timer.setInterval(VOLUME_CONNECTION_REFRESH_DELAY_MS)
         self.volume_connection_refresh_timer.timeout.connect(self.refresh_after_connected_volumes_changed)
+        self.operations_timer = QTimer(self)
+        self.operations_timer.setInterval(VOLUME_CONNECTION_POLL_INTERVAL_MS)
+        self.operations_timer.timeout.connect(self._pump_operations)
         self.catalogue_probe_timer = QTimer(self)
         self.catalogue_probe_timer.setSingleShot(True)
         self.catalogue_probe_timer.setInterval(CATALOGUE_PROBE_TIMEOUT_MS)
@@ -5507,6 +5514,12 @@ class MainWindow(QMainWindow):
         self.new_volume_action = QAction("Add Volume\u2026", self)
         self.new_volume_action.triggered.connect(self.add_volume)
         self.file_menu.addAction(self.new_volume_action)
+        self.archive_project_action = QAction("Archive Project\u2026", self)
+        self.archive_project_action.triggered.connect(lambda: self.archive_project())
+        self.file_menu.addAction(self.archive_project_action)
+        self.operations_queue_action = QAction("Operations Queue…", self)
+        self.operations_queue_action.triggered.connect(self.show_operations_queue)
+        self.file_menu.addAction(self.operations_queue_action)
         self.workspace_file_separator = self.file_menu.addSeparator()
 
         self.open_catalogue_location_action = QAction("Open Catalogue Folder", self)
@@ -6472,7 +6485,7 @@ class MainWindow(QMainWindow):
         self.file_table.doubleClicked.connect(self.open_browser_index)
         self.file_table.customContextMenuRequested.connect(self.show_browser_context_menu)
         self.search_button.clicked.connect(self.perform_search)
-        self.stop_scan_button.clicked.connect(self.cancel_scan)
+        self.stop_scan_button.clicked.connect(self.cancel_current_operation)
         self.search_edit.returnPressed.connect(self.perform_search)
         self.search_backup_filter_combo.currentIndexChanged.connect(
             lambda _index: self.perform_search()
@@ -6493,6 +6506,8 @@ class MainWindow(QMainWindow):
             self.open_catalogue_location_action,
             self.snapshot_history_action,
             self.new_volume_action,
+            self.archive_project_action,
+            self.operations_queue_action,
             self.backup_evidence_action,
             self.catalogue_info_action,
             self.preview_cache_action,
@@ -6508,6 +6523,7 @@ class MainWindow(QMainWindow):
         ]
         self.scan_blocked_actions = [
             self.new_volume_action,
+            self.archive_project_action,
             self.snapshot_history_action,
         ]
         self.scan_blocked_widgets = []
@@ -8040,6 +8056,12 @@ class MainWindow(QMainWindow):
             loop.deleteLater()
 
     def _close_catalogue(self, show_status: bool) -> bool:
+        if self.archive_dialog is not None:
+            self.archive_dialog.reject()
+            return False
+        if self.archive_thread is not None:
+            self.pause_operations()
+            return False
         if not self._stop_repository_for_close():
             return False
         if self.db is None:
@@ -8060,6 +8082,8 @@ class MainWindow(QMainWindow):
             return False
         if not self._stop_scan_for_catalogue_close():
             return False
+        if self.operation_id is not None:
+            return False  # Let the queued worker record its final state first.
         if not self._stop_search_for_catalogue_close():
             return False
         if not self._stop_preview_store_for_close():
@@ -8070,6 +8094,12 @@ class MainWindow(QMainWindow):
 
         db = self.db
         lock = self.catalogue_lock
+        self.operations_timer.stop()
+        if self.operations_dialog is not None:
+            self.operations_dialog.close()
+            self.operations_dialog.deleteLater()
+            self.operations_dialog = None
+        self.operations_queue = None
         self.db = None
         self.catalogue_path = None
         self.catalogue_lock = None
@@ -8150,6 +8180,11 @@ class MainWindow(QMainWindow):
             self.backup_engine = None
         self.catalogue_path = path
         self.catalogue_lock = lock
+        if not db.read_only:
+            try:
+                self._get_operations_queue()
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                self.statusBar().showMessage(f"Could not open the saved queue. {exc}", 10000)
         self.remember_recent_catalogue(path)
         self._set_catalogue_open(True)
         report = getattr(db, "last_reconcile", None)
@@ -8333,6 +8368,8 @@ class MainWindow(QMainWindow):
     def _catalogue_job_running(self) -> bool:
         return (
             self.scan_worker is not None
+            or self.archive_dialog is not None
+            or self.archive_thread is not None
             or self.delete_worker is not None
             or self.catalogue_info_worker is not None
             or getattr(self, "repository_worker", None) is not None
@@ -8451,6 +8488,7 @@ class MainWindow(QMainWindow):
         self.update_recent_catalogue_buttons()
         for action in self.catalogue_actions:
             action.setVisible(is_open)
+        self._update_archive_action()
         self.home_file_separator.setVisible(not is_open)
         self.workspace_file_separator.setVisible(is_open)
         self.workspace_exit_separator.setVisible(is_open)
@@ -8459,10 +8497,19 @@ class MainWindow(QMainWindow):
         self.catalogue_header.setVisible(is_open)
         self.home_button.setEnabled(self.close_catalogue_action.isEnabled())
 
+    def _update_archive_action(self, volumes=None) -> None:
+        self.archive_project_action.setEnabled(
+            self._catalogue_ui_open and self.db is not None and not self.db.read_only
+            and not self._catalogue_ui_busy and not self._catalogue_job_running()
+            and bool(self.archive_targets(volumes))
+        )
+        self.operations_queue_action.setEnabled(
+            self._catalogue_ui_open and self.db is not None and not self.db.read_only
+        )
+
     def _clear_catalogue_views(self) -> None:
         self.current_volume_id = None
         self.current_folder_id = None
-        self.post_scan_edit_volume_id = None
         self.current_directory_items = []
         self.backup_volume_summaries = {}
         self.backup_scan_records = {}
@@ -8513,6 +8560,7 @@ class MainWindow(QMainWindow):
             self._clear_catalogue_views()
             return
         volumes = self.db.list_volumes()
+        self._update_archive_action(volumes)
         self.backup_volume_references = {
             int(volume["id"]): volume_reference(volume["drive_id"], volume["name"])
             for volume in volumes
@@ -8616,9 +8664,25 @@ class MainWindow(QMainWindow):
         delete_action.setEnabled(not busy)
 
         menu.addSeparator()
-        scan_action = menu.addAction("Scan")
-        scan_action.triggered.connect(lambda: self.start_scan())
-        scan_action.setEnabled(not busy)
+        volume_id = self.selected_volume_id()
+        volume = self.db.get_volume(volume_id) if volume_id is not None else None
+        scan_action = menu.addAction("Queue Scan")
+        scan_action.triggered.connect(lambda: self.start_scan(volume_id=volume_id))
+        scan_action.setEnabled(not busy and not self.db.read_only)
+        archive_action = menu.addAction("Archive Project…")
+        archive_action.triggered.connect(lambda: self.archive_project(volume_id))
+        archive_action.setEnabled(
+            not busy and not self.db.read_only and bool(self.archive_targets([volume]))
+        )
+        register_action = menu.addAction("Register Archive Drive…")
+        register_action.triggered.connect(lambda: self.register_archive_drive(volume_id))
+        register_action.setEnabled(
+            not busy and not self.db.read_only and is_archive_volume_root(volume)
+            and volume["identity_kind"] != MARKER_IDENTITY
+        )
+        link_action = menu.addAction("Relink Drive…")
+        link_action.triggered.connect(lambda: self.relink_drive(volume_id))
+        link_action.setEnabled(not busy and not self.db.read_only and volume is not None)
 
         cancel_action = menu.addAction("Cancel Scan")
         cancel_action.triggered.connect(self.cancel_scan)
@@ -8696,7 +8760,7 @@ class MainWindow(QMainWindow):
         self.detail_full.setValue(full)
 
     def add_volume(self) -> None:
-        if self.db is None:
+        if self.db is None or self.db.read_only:
             return
         if self._catalogue_job_running():
             self._show_catalogue_job_running_message()
@@ -8722,11 +8786,7 @@ class MainWindow(QMainWindow):
             )
             self.current_volume_id = volume_id
             self.refresh_volumes()
-            self.start_scan(
-                volume_id=volume_id,
-                source_path=source_path,
-                edit_after_success=True,
-            )
+            self.start_scan(volume_id=volume_id)
         except Exception as exc:
             QMessageBox.critical(self, "Add Volume Failed", str(exc))
 
@@ -8734,18 +8794,98 @@ class MainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "Choose Volume to Scan", str(Path.home()))
         return directory or None
 
+    def register_archive_drive(self, volume_id: int) -> None:
+        if self.db is None or self.db.read_only or self._catalogue_job_running():
+            return
+        volume = self.db.get_volume(volume_id)
+        if not is_archive_volume_root(volume):
+            return
+        try:
+            source = resolve_volume_source_path(volume)
+            if source is None:
+                raise OSError("Connect or relink this drive before registering it.")
+            root = Path(source).resolve(strict=True)
+            check_archive_write_locations(None, root, self.db.path)
+            answer = QMessageBox.question(
+                self, "Register Archive Drive",
+                f"Write a JVVV drive ID file to the root of {root}?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            with hold_folder(root):
+                snapshot = capture_volume_snapshot(root)
+                if (not snapshot_matches_volume(snapshot, volume)
+                        or Path(snapshot.mount_root) != root):
+                    raise OSError("The selected archive drive changed. Reconnect and try again.")
+                check_archive_write_locations(None, root)
+                existing = read_drive_marker(root)
+                if existing and existing != volume["uuid"]:
+                    raise OSError("This drive already has an ID for a different JVVV volume.")
+                write_drive_marker(root, volume["uuid"])
+                location = snapshot.as_db_fields()
+                location.update(identity_kind=MARKER_IDENTITY, identity_token=volume["uuid"])
+                self.db.update_volume_location(volume_id, str(root), location)
+            self.refresh_volumes()
+            self.statusBar().showMessage("Archive drive registered.", 5000)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Could Not Register Archive Drive", str(exc))
+
+    def relink_drive(self, volume_id: int) -> None:
+        if self.db is None or self.db.read_only or self._catalogue_job_running():
+            return
+        volume = self.db.get_volume(volume_id)
+        if volume is None:
+            return
+        label = self.db.volume_reference(volume)
+        selected = QFileDialog.getExistingDirectory(self, f"Choose the Correct Drive or Folder for {label}")
+        if not selected:
+            return
+        try:
+            snapshot = capture_volume_snapshot(Path(selected).resolve(strict=True))
+            if snapshot is None or not snapshot.identity_token:
+                raise OSError("JVVV could not identify the selected drive.")
+            if volume_identity_known(volume) and (
+                snapshot.source_relative_path.casefold() != volume["source_relative_path"].casefold()
+            ):
+                raise OSError("Choose the same location on the drive that this volume was indexed from.")
+            if volume["identity_kind"] == MARKER_IDENTITY and not snapshot_matches_volume(snapshot, volume):
+                raise OSError("Choose the drive with the matching JVVV drive ID file.")
+            location = snapshot.location_for(volume)
+            resolver = ConnectedVolumeResolver()
+            candidate = {**dict(volume), **location, "source_path": snapshot.source_path}
+            path, problem = resolver.resolve_details(candidate)
+            if problem == "Relink Required":
+                raise OSError("More than one connected drive has this identity. Disconnect the duplicate and try again.")
+            if path is None or Path(path) != Path(snapshot.source_path):
+                raise OSError("JVVV could not confirm the selected drive.")
+            answer = QMessageBox.question(
+                self, "Relink Drive", f"Use {snapshot.source_path} as the location of {label}?",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.db.update_volume_location(volume_id, snapshot.source_path, location)
+                self.refresh_volumes()
+                self.statusBar().showMessage("Volume location updated.", 5000)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Could Not Relink Drive", str(exc))
+
     def choose_new_volume_drive_id(self, source_path: str, snapshot: VolumeSnapshot | None) -> str | None:
         if self.db is None:
             return None
         volume_label = snapshot.identity_label if snapshot is not None else ""
         suggested_drive_id = suggested_new_volume_drive_id(volume_label, self.db.next_drive_id())
+        can_rename = snapshot is not None and sys.platform == "win32"
+        if can_rename:
+            try:
+                check_archive_write_locations(None, Path(source_path))
+            except OSError:
+                can_rename = False
         dialog = DriveIdDialog(
             self,
             suggested_drive_id=suggested_drive_id,
             source_path=source_path,
             volume_label=volume_label,
             existing_volumes=self.db.list_volumes(),
-            allow_volume_label_rename=snapshot is not None and sys.platform == "win32",
+            allow_volume_label_rename=can_rename,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
@@ -8755,7 +8895,8 @@ class MainWindow(QMainWindow):
             if dialog.should_rename_volume_label()
             else dialog.volume_label_value()
         )
-        if snapshot is not None and target_volume_label != volume_label:
+        if can_rename and target_volume_label != volume_label:
+            check_archive_write_locations(None, Path(source_path))
             rename_volume_label(source_path, target_volume_label)
         return drive_id
 
@@ -8861,13 +9002,40 @@ class MainWindow(QMainWindow):
         )
         self.delete_thread.start()
 
-    def start_scan(
-        self,
-        volume_id: int | None = None,
-        source_path: str | None = None,
-        edit_after_success: bool = False,
-    ) -> None:
-        if self.db is None:
+    def archive_project(self, volume_id: int | None = None) -> None:
+        if self.db is None or self.db.read_only:
+            return
+        if self._catalogue_job_running():
+            self._show_catalogue_job_running_message()
+            return
+        try:
+            queue = self._get_operations_queue()
+            dialog = ArchiveDialog(self.db, self.archive_targets(), self, volume_id=volume_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot Open Archive Project", str(exc))
+            return
+        self.archive_dialog = dialog
+        self._update_context_actions()
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                target_id, target_uuid, dependency = dialog.destination.currentData()
+                volume = self.db.get_volume(target_id)
+                if volume is None or volume["uuid"] != target_uuid:
+                    raise OSError("The destination volume changed. Choose the drive again.")
+                queue.add(
+                    "archive", volume, self.db.volume_reference(volume),
+                    source=dialog.source.text(), requires=dependency,
+                )
+                self.show_operations_queue()
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(str(exc), 10000)
+        finally:
+            self.archive_dialog = None
+            dialog.deleteLater()
+            self._update_context_actions()
+
+    def start_scan(self, volume_id: int | None = None) -> None:
+        if self.db is None or self.db.read_only:
             return
         if self._catalogue_job_running():
             self._show_catalogue_job_running_message()
@@ -8876,28 +9044,210 @@ class MainWindow(QMainWindow):
         if volume is None:
             return
 
-        if source_path is None:
-            source_path = self.choose_scan_location(volume)
-            if source_path is None:
-                return
         try:
-            snapshot = capture_volume_snapshot(source_path)
-            if snapshot is not None:
-                source_path = snapshot.source_path
-            self.db.update_volume_location(
-                volume["id"],
-                source_path,
-                snapshot.as_db_fields() if snapshot is not None else None,
+            queue = self._get_operations_queue()
+            existing = queue.pending_scan(volume["uuid"])
+            if existing is None:
+                queue.add("scan", volume, self.db.volume_reference(volume))
+            elif existing.state == "failed":
+                queue.set_state(existing.id, "queued")
+            self._update_archive_action()
+            self.show_operations_queue()
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(str(exc), 10000)
+
+    def archive_targets(self, volumes=None):
+        if self.db is None:
+            return []
+        targets = []
+        for volume in self.db.list_volumes() if volumes is None else volumes:
+            if not is_archive_volume_root(volume):
+                continue
+            scan = self.operations_queue.pending_scan(volume["uuid"]) if self.operations_queue is not None else None
+            if scan is not None or is_scanned_archive_volume(self.db, volume):
+                targets.append((volume, scan.id if scan is not None else ""))
+        return targets
+
+    def _get_operations_queue(self) -> OperationsQueue:
+        if self.operations_queue is None:
+            queue = OperationsQueue(self.db.path, self.db.catalogue_uuid())
+            if not queue.path.exists():
+                try:
+                    saved = pending_archive(self.db.path)
+                    if saved and saved.get("catalogue") == self.db.catalogue_uuid():
+                        volume = next((row for row in self.db.list_volumes()
+                                       if row["uuid"] == saved.get("volume_uuid")), None)
+                        if volume is not None:
+                            queue.add("archive", volume, self.db.volume_reference(volume),
+                                      source=saved["source"], legacy=True)
+                except (OSError, ValueError, sqlite3.Error) as exc:
+                    self.statusBar().showMessage(f"Could not import the old paused archive. {exc}", 10000)
+            self.operations_queue = queue
+        return self.operations_queue
+
+    def show_operations_queue(self) -> None:
+        if self.db is None or self.db.read_only:
+            return
+        try:
+            self._get_operations_queue()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.statusBar().showMessage(f"Could not open the saved queue. {exc}", 10000)
+            return
+        if self.operations_dialog is None:
+            self.operations_dialog = OperationsDialog(self)
+            self.operations_dialog.apply_requested.connect(self.apply_operations)
+            self.operations_dialog.pause_requested.connect(self.pause_operations)
+            self.operations_dialog.move_requested.connect(self.move_operation)
+            self.operations_dialog.remove_requested.connect(self.remove_operation)
+            self.operations_dialog.retry_requested.connect(self.retry_operation)
+            self.operations_dialog.preview_failures.clicked.connect(lambda: self.show_preview_failures())
+        self._refresh_operations()
+        self.operations_dialog.show()
+        self.operations_dialog.raise_()
+
+    def _refresh_operations(self) -> None:
+        if self.operations_dialog is not None:
+            self.operations_dialog.refresh(self.operations_queue.jobs, self.operations_timer.isActive())
+            previews = self.last_preview_statistics
+            self.operations_dialog.preview_failures.setEnabled(
+                previews is not None and bool(previews.failures or previews.storage_skipped)
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "Scan Location Failed", str(exc))
-            return
 
-        preview_plan = self.plan_scan_previews()
-        if preview_plan is None:
-            return
-        preview_settings, preview_skip_reason = preview_plan
+    def _change_operations(self, change, *args) -> bool:
+        try:
+            change(*args)
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(str(exc), 10000)
+            if self.operations_dialog is not None:
+                self.operations_dialog.detail.setText(str(exc))
+            return False
+        self._refresh_operations()
+        self._update_archive_action()
+        return True
 
+    def move_operation(self, job_id: str, offset: int) -> None:
+        self._change_operations(self.operations_queue.move, job_id, offset)
+
+    def remove_operation(self, job_id: str) -> None:
+        self._change_operations(self.operations_queue.remove, job_id)
+
+    def retry_operation(self, job_id: str) -> None:
+        self._change_operations(self.operations_queue.set_state, job_id, "queued")
+
+    def apply_operations(self) -> None:
+        if self._change_operations(self.operations_queue.apply):
+            self.operations_timer.start()
+            self._refresh_operations()
+            QTimer.singleShot(0, self._pump_operations)
+
+    def pause_operations(self) -> None:
+        self.operations_timer.stop()
+        if self.archive_thread is not None:
+            self.archive_thread.cancel()
+        elif self.scan_worker is not None:
+            self.cancel_scan()
+        self._refresh_operations()
+
+    def _pump_operations(self) -> None:
+        if (self.db is None or not self.operations_timer.isActive() or self.operation_id is not None
+                or self._catalogue_close_in_progress or self._catalogue_job_running()
+                or QApplication.activeModalWidget() is not None):
+            return
+        queue = self.operations_queue
+        volumes = {volume["uuid"]: volume for volume in self.db.list_volumes()}
+        resolver = ConnectedVolumeResolver()
+
+        def availability(job):
+            volume = volumes.get(job.volume_uuid)
+            if volume is None:
+                return "failed", "This volume was removed from the catalogue."
+            path, problem = resolver.resolve_details(volume)
+            if problem == "Relink Required":
+                return "relink", "Resolve the drive identity from the volume’s Relink Drive action."
+            if path is None:
+                return "waiting", "Connect the drive linked to this volume."
+            if job.kind == "archive" and not is_scanned_archive_volume(self.db, volume):
+                return "failed", "The destination needs a completed initial drive scan."
+            return "ready", ""
+
+        try:
+            job = queue.next_ready(availability)
+            if job is None:
+                if not any(item.state in ACTIONABLE for item in queue.jobs):
+                    self.operations_timer.stop()
+                self._refresh_operations()
+                return
+            queue.set_state(job.id, "running")
+        except (OSError, ValueError) as exc:
+            self.pause_operations()
+            self.statusBar().showMessage(f"The queue could not be saved. {exc}", 10000)
+            return
+        self.operation_id = job.id
+        self._refresh_operations()
+        if job.kind == "scan":
+            self._run_queued_scan(volumes[job.volume_uuid])
+        else:
+            self.archive_thread = ArchiveThread(
+                self.db.path, job, volumes[job.volume_uuid]["id"], self.preview_settings, self,
+            )
+            self.archive_thread.progress.connect(self.on_archive_progress)
+            self.archive_thread.finished.connect(self.on_archive_finished)
+            self._set_scan_running_ui(True)
+            self.stop_scan_button.setText("Pause Archive")
+            self._update_context_actions()
+            self.archive_thread.start()
+
+    def _finish_operation(self, state: str, detail: str) -> None:
+        job_id = self.operation_id
+        self.operation_id = None
+        if job_id is None:
+            return
+        job = self.operations_queue.get(job_id)
+        if state == "failed" and job is not None:
+            volume = next((row for row in self.db.list_volumes() if row["uuid"] == job.volume_uuid), None)
+            if volume is not None and volume_identity_known(volume):
+                _, problem = ConnectedVolumeResolver().resolve_details(volume)
+                if problem == "Waiting for Drive":
+                    state = "waiting"
+                elif problem == "Relink Required":
+                    state = "relink"
+        if not self._change_operations(self.operations_queue.set_state, job_id, state, detail):
+            self.operations_timer.stop()
+            self._refresh_operations()
+            return
+        if self.operations_dialog is not None:
+            self.operations_dialog.progress.clear()
+        QTimer.singleShot(0, self._pump_operations)
+
+    @Slot(str, object, object)
+    def on_archive_progress(self, label, done, total) -> None:
+        message = f"{label} {format_size(done)} / {format_size(total)}" if total else label
+        self.statusBar().showMessage(message)
+        if self.operations_dialog is not None:
+            self.operations_dialog.progress.setText(message)
+
+    @Slot()
+    def on_archive_finished(self) -> None:
+        thread = self.archive_thread
+        self.archive_thread = None
+        self.stop_scan_button.setText("Cancel Scan")
+        self._set_scan_running_ui(False)
+        self._update_context_actions()
+        result = thread.result
+        if result is not None:
+            message = f"Verified {result.files:,} files ({format_size(result.bytes_copied)}). {result.path}"
+            if thread.preview_problem:
+                message += f" Offline previews skipped. {thread.preview_problem}"
+            elif result.preview_failures:
+                message += f" {result.preview_failures:,} previews failed."
+            self.refresh_after_catalogue_write()
+            self._finish_operation("warning" if result.preview_failures or thread.preview_problem else "completed", message)
+        else:
+            self._finish_operation("paused" if thread.paused else "failed", thread.error)
+        thread.deleteLater()
+
+    def _run_queued_scan(self, volume) -> None:
+        preview_settings = self.preview_settings if self.preview_settings.enabled else None
         self.scan_progress.setRange(0, 0)
         if preview_settings is not None:
             self.scan_progress.setFormat(
@@ -8918,19 +9268,18 @@ class MainWindow(QMainWindow):
         self.scan_cancel_requested = False
         self.scan_preview_phase = False
         self.stop_scan_button.setText("Cancel Scan")
-        self.post_scan_edit_volume_id = volume["id"] if edit_after_success else None
+        self.scan_queue_result = None
         self._set_scan_running_ui(True)
 
         self.scan_worker = ScanWorker(
             self.db.path,
             volume["id"],
             preview_settings=preview_settings,
-            preview_skip_reason=preview_skip_reason,
+            volume_uuid=volume["uuid"],
         )
         self.scan_worker.catalogue_ready.connect(self.on_scan_catalogue_ready)
         self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.stats_progress.connect(self.on_scan_stats_progress)
-        self.scan_worker.review_requested.connect(self.on_scan_review_requested)
         self.scan_worker.log_message.connect(self.on_scan_log_message)
         self.scan_worker.finished.connect(self.on_scan_finished)
         self.scan_worker.failed.connect(self.on_scan_failed)
@@ -8941,12 +9290,6 @@ class MainWindow(QMainWindow):
             self.clear_scan_worker,
         )
         self.scan_thread.start()
-
-    def choose_scan_location(self, volume) -> str | None:
-        current_path = self.current_source_path_for_volume(volume) or volume["source_path"] or ""
-        initial_dir = current_path if source_path_exists(current_path) else str(Path.home())
-        directory = QFileDialog.getExistingDirectory(self, "Choose Scan Location", initial_dir)
-        return directory or None
 
     def plan_scan_previews(self) -> tuple[PreviewSettings | None, str | None] | None:
         """Scan-start preview preflight (spec §26, §27).
@@ -9033,6 +9376,13 @@ class MainWindow(QMainWindow):
         self.stop_scan_button.setToolTip("Stop previews; the updated catalogue will be kept.")
         self.statusBar().showMessage("Catalogue updated and ready to browse. Generating previews…")
 
+    def cancel_current_operation(self) -> None:
+        if self.archive_thread is not None:
+            self.pause_operations()
+            self.stop_scan_button.setEnabled(False)
+        else:
+            self.cancel_scan()
+
     def cancel_scan(self) -> None:
         if self.scan_worker is None or self.scan_cancel_requested:
             return
@@ -9061,86 +9411,6 @@ class MainWindow(QMainWindow):
         # the phase ("Creating video preview · file · 42% of preview encode")
         # must also be shown somewhere visible (spec §30, §31).
         self.statusBar().showMessage(text)
-
-    @Slot(dict)
-    def on_scan_review_requested(self, changes: dict) -> None:
-        worker = self.scan_worker
-        if worker is None:
-            return
-        if self.scan_cancel_requested:
-            worker.resolve_review(False)
-            return
-
-        self.scan_progress.setRange(0, 1)
-        self.scan_progress.setValue(1)
-        self.scan_progress.setFormat("Waiting for confirmation")
-        self.statusBar().showMessage("Review the detected catalogue changes.")
-
-        bytes_before = int(changes.get("bytes_before", 0))
-        bytes_after = int(changes.get("bytes_after", 0))
-        size_delta = bytes_after - bytes_before
-        delta_text = format_size(abs(size_delta))
-        if size_delta > 0:
-            delta_text = f"+{delta_text}"
-        elif size_delta < 0:
-            delta_text = f"-{delta_text}"
-
-        details = [
-            f"Files added: {int(changes.get('files_added', 0)):,} "
-            f"(+{format_size(int(changes.get('bytes_added', 0)))})",
-            f"Files no longer present: {int(changes.get('files_removed', 0)):,} "
-            f"(-{format_size(int(changes.get('bytes_removed', 0)))})",
-            f"Files changed: {int(changes.get('files_changed', 0)):,}",
-            f"Folders added: {int(changes.get('folders_added', 0)):,}",
-            f"Folders no longer present: {int(changes.get('folders_removed', 0)):,}",
-            "",
-            f"Indexed size: {format_size(bytes_before)} → {format_size(bytes_after)} "
-            f"({delta_text})",
-        ]
-        errors_count = int(changes.get("errors_count", 0))
-        hash_errors = int(changes.get("hash_errors", 0))
-        access_errors = max(0, errors_count - hash_errors)
-        if access_errors:
-            details.extend(
-                [
-                    "",
-                    f"Warning: the scan reported {access_errors:,} access or file-stability "
-                    "issues. Some items listed as no longer present may have been "
-                    "inaccessible or changing during the scan.",
-                ]
-            )
-        if hash_errors:
-            details.extend(
-                [
-                    "",
-                    f"Content hash unavailable for {hash_errors:,} files. Applying this update "
-                    "will clear any older hash for those records; they will use clearly "
-                    "labelled metadata-only evidence until a later successful rescan.",
-                ]
-            )
-
-        box = QMessageBox(self)
-        box.setWindowTitle("Review Scan Changes")
-        box.setIcon(
-            QMessageBox.Icon.Warning
-            if access_errors or hash_errors
-            else QMessageBox.Icon.Question
-        )
-        box.setText("Apply these changes to the catalogue?")
-        box.setInformativeText("\n".join(details))
-        apply_button = box.addButton("Apply Update", QMessageBox.ButtonRole.AcceptRole)
-        cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(
-            cancel_button if access_errors or hash_errors else apply_button
-        )
-        box.setEscapeButton(cancel_button)
-
-        apply_changes = False
-        try:
-            box.exec()
-            apply_changes = box.clickedButton() == apply_button
-        finally:
-            worker.resolve_review(apply_changes)
 
     @Slot(int, int, str, int, int)
     def on_scan_stats_progress(
@@ -9182,8 +9452,6 @@ class MainWindow(QMainWindow):
         self.scan_progress.setValue(1)
         status = result.get("status", "completed")
         indexed = status in COMPLETED_SCAN_STATUSES
-        if not indexed:
-            self.post_scan_edit_volume_id = None
         statistics = PreviewStatistics.from_dict(result.get("preview") or {})
         self.last_preview_statistics = statistics
         preview_warning = status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
@@ -9230,59 +9498,28 @@ class MainWindow(QMainWindow):
                     timings.get("total", 0), result.get("media_metadata_reused", 0),
                 )
             )
-        self.report_preview_results(status, statistics)
-
-    def report_preview_results(self, status: str, statistics: PreviewStatistics) -> None:
-        """End-of-scan preview report (spec §15, §16, §17): never only in a log."""
-
-        if statistics.mode != MODE_ENABLED:
-            return
-        indexed = status in COMPLETED_SCAN_STATUSES
-        if not indexed and statistics.total_attempted == 0:
-            return
-        # The root the scan actually wrote to, not whatever Settings holds now.
-        root = statistics.root or self.preview_settings.root_directory or None
-        summary = statistics.summary_text(root)
-        box = QMessageBox(self)
-        if statistics.interrupted:
-            box.setIcon(QMessageBox.Icon.Information)
-            box.setWindowTitle("Previews Interrupted")
-            headline = "Catalogue indexing completed. Offline preview generation was interrupted."
-        elif statistics.has_problems:
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setWindowTitle("Scan Completed with Preview Errors")
-            headline = (
-                "Scan completed with preview errors."
-                if indexed
-                else f"Scan {status} — some previews were not created."
-            )
-            headline += (
-                "\n\nCatalogue indexing succeeded, but some previews were not created."
-                if indexed
-                else ""
-            )
-        else:
-            box.setIcon(QMessageBox.Icon.Information)
-            box.setWindowTitle("Offline Preview Summary")
-            headline = (
-                "Scan completed. All previews were generated or reused."
-                if indexed
-                else f"Scan {status}. Offline preview results so far:"
-            )
-        box.setText(headline)
-        box.setInformativeText(summary)
-        failures_button = None
-        if statistics.failures or statistics.storage_skipped:
-            failures_button = box.addButton(
-                "View Preview Failures",
-                QMessageBox.ButtonRole.ActionRole,
-            )
-        close_button = box.addButton(QMessageBox.StandardButton.Close)
-        box.setDefaultButton(close_button)
-        box.setEscapeButton(close_button)
-        box.exec()
-        if failures_button is not None and box.clickedButton() == failures_button:
-            self.show_preview_failures(statistics)
+        detail = f"{result.get('files_seen', 0):,} files. {result.get('message') or ''}".strip()
+        changes = result.get("changes") or {}
+        if indexed and changes:
+            detail += (f" Added {changes.get('files_added', 0):,}, changed {changes.get('files_changed', 0):,},"
+                       f" missing {changes.get('files_removed', 0):,}.")
+        if indexed and statistics.mode == MODE_ENABLED:
+            detail += (f" Previews generated {statistics.total_generated:,}, reused {statistics.total_reused:,},"
+                       f" failed {statistics.total_failed:,}, skipped {statistics.storage_skipped:,}.")
+            if statistics.root:
+                detail += f" Preview storage {statistics.root} ({format_size(statistics.bytes_written)} written)."
+            if statistics.storage_unavailable_reason:
+                detail += f" {statistics.storage_unavailable_reason}"
+            if statistics.interrupted:
+                detail += " Previews were interrupted. The updated catalogue and completed previews were kept."
+        state = (
+            "warning" if indexed and (preview_warning or statistics.interrupted
+                                      or statistics.mode == MODE_SKIPPED_PREFLIGHT)
+            else "completed" if indexed
+            else "paused" if status == "cancelled"
+            else "failed"
+        )
+        self.scan_queue_result = (state, detail)
 
     def show_preview_failures(self, statistics: PreviewStatistics | None = None) -> None:
         statistics = statistics or self.last_preview_statistics
@@ -9297,11 +9534,13 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def on_scan_failed(self, details: str) -> None:
-        self.post_scan_edit_volume_id = None
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(0)
         self.scan_progress.setFormat("Scan failed")
-        QMessageBox.critical(self, "Scan Failed", details)
+        self.on_scan_log_message(details)
+        message = details.strip().splitlines()[-1] if details.strip() else "Scan failed."
+        self.scan_queue_result = ("failed", message)
+        self.statusBar().showMessage(message, 10000)
         self.refresh_after_catalogue_write()
 
     @Slot()
@@ -9313,12 +9552,13 @@ class MainWindow(QMainWindow):
         self.scan_thread = None
         self.scan_cancel_requested = False
         self._set_scan_running_ui(False)
+        self._update_archive_action()
         if self.backup_evidence_dialog is not None:
             self.refresh_backup_evidence_dialog()
-        if self.post_scan_edit_volume_id is not None:
-            volume_id = self.post_scan_edit_volume_id
-            self.post_scan_edit_volume_id = None
-            QTimer.singleShot(0, lambda volume_id=volume_id: self.edit_volume_by_id(volume_id))
+        if self.scan_queue_result is not None:
+            result = self.scan_queue_result
+            self.scan_queue_result = None
+            self._finish_operation(*result)
 
     @Slot(str)
     def on_delete_progress(self, message: str) -> None:

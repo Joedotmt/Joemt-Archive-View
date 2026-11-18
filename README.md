@@ -189,11 +189,59 @@ separately with your normal file-copy or backup software.
 
 1. On **Home**, choose **Create Empty Catalogue…** and name the `.jvvv` folder.
 2. Choose **File > Add Volume…**.
-3. Enter a volume name and choose a connected drive or folder. JVVV starts
-   scanning when the volume is added.
+3. Choose a connected drive or folder and assign its drive ID. JVVV queues an
+   initial scan. Add more drives if needed, then click **Apply** in
+   **File > Operations Queue…**.
 4. Browse the saved folder tree and file list after the scan completes.
+   Double-click the volume to edit its details.
 5. Use the search bar to search across all indexed volumes.
-6. Use **Scan** again to refresh an existing catalogue.
+6. Right-click a volume and use **Queue Scan** to refresh it. JVVV uses the
+   saved volume identity and resolves its current path automatically.
+
+### Run unattended operations
+
+Review, reorder, and remove pending jobs in **Operations Queue**, then click
+**Apply**. The queue runs one job at a time. A disconnected drive waits while
+independent jobs continue. Scan results and warnings appear in the queue.
+The catalogue keeps its previous scan if indexing is incomplete.
+
+The queue is saved locally with the catalogue. After reopening it, click
+**Apply** to continue. **Pause Queue** stops the current operation and holds
+the remaining jobs. A paused scan restarts, and an archive resumes from its
+saved copy progress. Select a failed job and click **Retry**, then **Apply**.
+
+Use **Register Archive Drive…** on a designated destination to write
+`.jvvv-drive.json` at the drive root. JVVV can then identify the drive even if
+Windows reports a different identity. If several connected drives carry the
+same ID, disconnect the duplicate. Use **Relink Drive…** when an existing
+volume needs to be matched again. Scans leave the source drive read-only.
+
+### Archive a project to an HDD
+
+Add the archive drive from its root, even if the drive is empty. Right-click
+its volume and choose **Archive Project…**, then pick the source project
+folder. You can also choose a destination from **File > Archive Project…**.
+If the initial scan is still queued, JVVV runs it before starting the archive.
+
+JVVV copies the project folder to the root of that drive and hashes the source
+bytes as it copies them. It reads the destination back to verify the copy and
+adds a project marker such as `Project Name.jvvv-project.json` inside the
+copied folder. The project appears under the selected volume in the catalogue
+as soon as verification finishes, without a full drive scan.
+
+**Pause Queue** leaves progress saved in the catalogue and a temporary archive
+folder on the destination drive. Reconnect the same drive and click **Apply**
+in the queue to resume. Previously copied files are checked before publication. If the
+job was paused, JVVV also rechecks the corresponding source files before reusing
+those transfers. Start a new job if the source changed. Keep other apps that
+edit the project closed until the archive completes. On Windows, the copy opens
+existing source files with write and delete sharing disabled and stops if the
+source tree changes. Adding a new file through another app can trigger that stop.
+
+With offline previews enabled, JVVV reuses matching previews and makes missing
+ones in the background from temporary input captured during copying. The current
+decoders open a seekable temporary file. The archive destination, catalogue,
+preview store and temporary workspace must be outside the protected Q: drive.
 
 Choose **Window > Catalogue Settings > Catalogue hashing** before adding the first
 volume. The dropdown offers **SHA-256** (the default), **BLAKE3**, and
@@ -211,7 +259,7 @@ This catches same-size changes and makes content identity independent of the
 filename, folder, or date, but it also means scans can take roughly as long as
 reading all data on the drive. The scan bar and Scan Log report hashing progress,
 bytes read, and files whose hash could not be recorded. Cancelling during indexing
-or declining a rescan restores the previously applied hashes and catalogue records
+or encountering an incomplete read preserves the previously applied hashes and catalogue records
 atomically. Once indexing is committed, the catalogue is ready to browse while
 offline previews run in a separate background phase. **Cancel Previews** stops that
 phase and keeps the updated catalogue and completed previews. The Scan Log reports
@@ -382,17 +430,11 @@ any running FFmpeg process and removes temporary files. Video proxies are
 silent, use `yuv420p`, keep the original duration and aspect ratio, respect
 rotation metadata, are never upscaled, and are written with `+faststart`.
 
-Before every scan with previews enabled, JVVV re-checks the preview directory,
-FFmpeg, and the image backend. If that preflight fails you can open Settings,
-scan without previews just once (the scan report records why), or cancel. At
-the end of a scan with previews enabled, an **Offline Preview Summary** shows
-generated, reused, and failed counts for images and videos, the preview
-directory, and the space written by the scan. If anything failed, the scan is
-reported as **completed with preview errors** (stored in the scan history as
-status `completed_with_warnings`, which every other feature — Backup Evidence,
-volume summaries, scan reports — treats as a completed, fully indexed scan) and
-**View Preview Failures** lists every failed item with its stage and technical
-detail. If the preview
+Before every queued scan with previews enabled, JVVV re-checks the preview
+directory, FFmpeg, and the image backend. If the check fails, the scan runs
+without previews and the queue reports the reason. The completed job shows
+generated, reused, and failed counts. **Preview Failures** lists the failed
+items from the most recent scan with their stage and technical detail. If the preview
 disk fills up or the directory becomes unavailable, generation stops for the
 rest of that scan, catalogue indexing continues, and the report distinguishes
 direct failures from previews that were not attempted. Preview failures never

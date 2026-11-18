@@ -10,8 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .archive_io import ARCHIVE_STAGE_NAME
 from .content_hash import HASH_LABELS, new_hasher
 from .database import COMPLETED_SCAN_STATUSES, Database, format_timestamp, utc_now
+from .drive_marker import MARKER_NAME
 from .media_metadata import (
     MediaInspectionCancelled,
     MediaMetadataExtractor,
@@ -30,7 +32,7 @@ from .preview_service import (
     scan_outcome,
     status_record_for,
 )
-from .utils import capture_volume_snapshot, resolve_volume_source_path, volume_identity_known
+from .utils import capture_volume_snapshot, resolve_volume_source_path, snapshot_matches_volume, volume_identity_known
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -171,11 +173,13 @@ class VolumeScanner:
         preview_statistics: PreviewStatistics | None = None,
         catalogue_ready_callback: Callable[[], None] | None = None,
         progress_interval: float = 0.1,
+        require_complete: bool = False,
     ) -> None:
         self.db = db
         self.hash_algorithm = db.hash_algorithm
         self.catalogue_ready_callback = catalogue_ready_callback
         self.progress_interval = max(0.0, progress_interval)
+        self.require_complete = require_complete
         self._last_progress_time = float("-inf")
         self.media_metadata_reused = 0
         self.phase_seconds: dict[str, float] = {}
@@ -277,8 +281,12 @@ class VolumeScanner:
             return ScanResult("failed", 0, 0, 0, message)
 
         snapshot = capture_volume_snapshot(root)
+        if self.require_complete and not snapshot_matches_volume(snapshot, volume):
+            message = "The saved drive identity could not be confirmed. Reconnect or relink the volume."
+            self.db.finish_scan(scan_id, "failed", 0, 0, 0, message)
+            return self._result("failed", 0, 0, 0, message, None)
         if snapshot is not None:
-            self.db.update_volume_location(volume_id, snapshot.source_path, snapshot.as_db_fields())
+            self.db.update_volume_location(volume_id, snapshot.source_path, snapshot.location_for(volume))
 
         try:
             capacity, used, free = get_storage_stats(root)
@@ -339,6 +347,12 @@ class VolumeScanner:
                             status = "cancelled"
                             message = "Scan cancelled."
                             break
+                        if current_path == root and ARCHIVE_STAGE_NAME.fullmatch(directory):
+                            continue
+                        if (self.require_complete and os.name == "nt" and snapshot
+                                and not snapshot.source_relative_path and current_path == root
+                                and directory.casefold() in {"system volume information", "$recycle.bin"}):
+                            continue
                         full_path = current_path / directory
                         rel_path = normalize_relative_path(full_path.relative_to(root))
                         try:
@@ -386,6 +400,8 @@ class VolumeScanner:
                             status = "cancelled"
                             message = "Scan cancelled."
                             break
+                        if current_path == root and file_name.casefold() == MARKER_NAME:
+                            continue
                         full_path = current_path / file_name
                         rel_path = normalize_relative_path(full_path.relative_to(root))
                         if self._is_catalogue_storage_path(full_path):
@@ -520,6 +536,15 @@ class VolumeScanner:
                         errors_count=errors_count,
                         hash_errors=self.hash_errors,
                     )
+                    if self.require_complete and errors_count:
+                        latest = self.db.list_scan_errors(volume_id, limit=1)
+                        issue = ""
+                        if latest and latest[0]["scan_id"] == scan_id:
+                            issue = f" {latest[0]['path']}: {latest[0]['message']}"
+                        raise ScanDiscarded(
+                            f"Scan reported {errors_count:,} file access or hashing issues. "
+                            f"The previous catalogue was kept.{issue}"
+                        )
                     had_previous_scan = bool(volume["last_scan_at"]) or changes.has_previous_catalogue
                     if (
                         had_previous_scan
@@ -551,6 +576,8 @@ class VolumeScanner:
                     )
                     self.db.refresh_volume_counts(volume_id, scanned_at)
                     self.db.update_volume_content_dates_from_index(volume_id)
+                    if self.require_complete and not snapshot_matches_volume(capture_volume_snapshot(root), volume):
+                        raise ScanDiscarded("The drive changed or disconnected. The previous catalogue was kept.")
                 else:
                     self.db.refresh_volume_counts(volume_id)
 

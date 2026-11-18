@@ -10,6 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .drive_marker import MARKER_IDENTITY, read_drive_marker
+
 
 @dataclass(frozen=True)
 class VolumeSnapshot:
@@ -32,6 +34,12 @@ class VolumeSnapshot:
             "source_relative_path": self.source_relative_path,
         }
 
+    def location_for(self, volume: Any) -> dict[str, str]:
+        fields = self.as_db_fields()
+        if _record_value(volume, "identity_kind") == MARKER_IDENTITY:
+            fields.update(identity_kind=MARKER_IDENTITY, identity_token=_record_value(volume, "identity_token"))
+        return fields
+
 
 class ConnectedVolumeResolver:
     def __init__(
@@ -42,28 +50,46 @@ class ConnectedVolumeResolver:
     ) -> None:
         self.snapshots = snapshots if snapshots is not None else list_connected_volume_snapshots()
         self.check_source_path = check_source_path
+        self._marker_roots: dict[str, list[str]] | None = None
 
     def resolve(self, volume: Any) -> str | None:
+        return self.resolve_details(volume)[0]
+
+    def resolve_details(self, volume: Any) -> tuple[str | None, str]:
         kind = _record_value(volume, "identity_kind")
         token = _record_value(volume, "identity_token")
         if not kind or not token:
-            return None
+            return None, "Relink Required"
 
         relative = _record_value(volume, "source_relative_path") or ""
-        for snapshot in self.snapshots:
-            if snapshot.identity_kind == kind and snapshot.identity_token.casefold() == token.casefold():
-                source_path = path_with_relative(snapshot.mount_root, relative)
-                return str(source_path) if source_path.exists() else None
+        if kind == MARKER_IDENTITY:
+            if self._marker_roots is None:
+                self._marker_roots = {}
+                for snapshot in self.snapshots:
+                    marker = read_drive_marker(Path(snapshot.mount_root))
+                    if marker:
+                        self._marker_roots.setdefault(marker, []).append(snapshot.mount_root)
+            roots = self._marker_roots.get(token, [])
+        else:
+            roots = [
+                snapshot.mount_root for snapshot in self.snapshots
+                if snapshot.identity_kind == kind and snapshot.identity_token.casefold() == token.casefold()
+            ]
+        paths = {path_with_relative(root, relative) for root in roots}
+        if len(paths) > 1:
+            return None, "Relink Required"
+        if paths:
+            path = paths.pop()
+            return (str(path), "") if path.is_dir() else (None, "Waiting for Drive")
 
-        if not self.check_source_path:
-            return None
-
-        source_path = _record_value(volume, "source_path")
-        if source_path and Path(source_path).exists():
+        if self.check_source_path:
+            source_path = _record_value(volume, "source_path")
             snapshot = capture_volume_snapshot(source_path)
-            if snapshot and snapshot.identity_kind == kind and snapshot.identity_token.casefold() == token.casefold():
-                return snapshot.source_path
-        return None
+            if snapshot_matches_volume(snapshot, volume):
+                return snapshot.source_path, ""
+            if kind == MARKER_IDENTITY and snapshot and read_drive_marker(Path(snapshot.mount_root)):
+                return None, "Relink Required"
+        return None, "Waiting for Drive"
 
 
 def format_size(num_bytes: int | None) -> str:
@@ -138,6 +164,19 @@ def resolve_volume_source_path(volume: Any) -> str | None:
 
 def volume_identity_known(volume: Any) -> bool:
     return bool(_record_value(volume, "identity_kind") and _record_value(volume, "identity_token"))
+
+
+def snapshot_matches_volume(snapshot: VolumeSnapshot | None, volume: Any) -> bool:
+    if snapshot is None:
+        return False
+    kind = _record_value(volume, "identity_kind")
+    token = _record_value(volume, "identity_token")
+    relative = _record_value(volume, "source_relative_path")
+    if not token or snapshot.source_relative_path.casefold() != relative.casefold():
+        return False
+    if kind == MARKER_IDENTITY:
+        return read_drive_marker(Path(snapshot.mount_root)) == token
+    return snapshot.identity_kind == kind and snapshot.identity_token.casefold() == token.casefold()
 
 
 def path_with_relative(mount_root: str | Path, relative_path: str) -> Path:
