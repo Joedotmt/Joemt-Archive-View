@@ -175,12 +175,14 @@ class VolumeScanner:
         progress_interval: float = 0.1,
         require_complete: bool = False,
         catalogue_path: Path | None = None,
+        resolved_source_path: str | None = None,
     ) -> None:
         self.db = db
         self.hash_algorithm = db.hash_algorithm
         self.catalogue_ready_callback = catalogue_ready_callback
         self.progress_interval = max(0.0, progress_interval)
         self.require_complete = require_complete
+        self.resolved_source_path = resolved_source_path
         self._last_progress_time = float("-inf")
         self.media_metadata_reused = 0
         self.phase_seconds: dict[str, float] = {}
@@ -250,7 +252,7 @@ class VolumeScanner:
             return ScanResult("failed", 0, 0, 0, message)
 
         identity_known = volume_identity_known(volume)
-        resolved_source_path = resolve_volume_source_path(volume)
+        resolved_source_path = self.resolved_source_path or resolve_volume_source_path(volume)
         if resolved_source_path is None and identity_known:
             message = f"Identified volume is not connected: {volume['source_path']}"
             scan_id = self.db.start_scan(volume_id)
@@ -278,7 +280,7 @@ class VolumeScanner:
             return ScanResult("failed", 0, 0, 0, message)
 
         snapshot = capture_volume_snapshot(root)
-        if self.require_complete and not snapshot_matches_volume(snapshot, volume):
+        if (self.require_complete or self.resolved_source_path is not None) and not snapshot_matches_volume(snapshot, volume):
             message = "The saved drive identity could not be confirmed. Reconnect or relink the volume."
             self.db.finish_scan(scan_id, "failed", 0, 0, 0, message)
             return self._result("failed", 0, 0, 0, message, None)

@@ -204,14 +204,18 @@ separately with your normal file-copy or backup software.
 **Pending** tab also shows running, waiting, and paused jobs, with each job's
 current status in its row. Right-click a job to move or remove it, or to retry
 a failed job. Click **Apply** in Queue Manager or beside the catalogue
-name. When several jobs can be applied, both buttons say **Apply All**. The
-main progress bar shows the active scan or archive. A disconnected drive waits
+name. When several jobs can be applied, both buttons say **Apply All**. Up to
+two independent jobs can run together. Work on the same destination disk,
+including different partitions on that disk, runs in sequence. Archives can
+share read-only access to the QNAP source drive when using separate destinations.
+Queue Manager shows progress for each active job. A disconnected drive waits
 while independent jobs continue. Results and warnings are saved in the queue.
 The catalogue keeps its previous scan if indexing is incomplete.
 
 The queue is saved locally with the catalogue. After reopening it, click
-**Apply** to continue. **Pause Queue** stops the current operation and holds
-the remaining jobs. A paused scan restarts, and an archive resumes from its
+**Apply** to continue. **Pause Queue** stops active jobs and holds the queue.
+Right-click a running job and choose **Pause Job** to pause it individually.
+A paused scan restarts, and an archive resumes from its
 saved copy progress. Right-click a job in **Failed** and choose **Retry**,
 then apply the queue.
 

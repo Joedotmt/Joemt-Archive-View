@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from jvvv.operations_queue import Operation, OperationsQueue
+from jvvv.operations_queue import Operation, OperationDisks, OperationsQueue
 
 
 def test_queue_persists_order_and_requires_apply_after_interruption(tmp_path):
@@ -49,6 +49,15 @@ def test_pending_jobs_can_move_past_completed_history(tmp_path):
     queue.move(last.id, 1)
     assert [job.id for job in queue.jobs] == [last.id, completed.id, first.id]
 
+
+def test_queue_allows_shared_qnap_reads_and_keeps_destination_disks_exclusive():
+    first = OperationDisks((7, 1), (7, 7), True, True)
+    second = OperationDisks((7, 2), (7, 7), True, True)
+    assert not first.conflicts_with(second)
+    assert first.conflicts_with(OperationDisks((7, 1)))
+    assert first.conflicts_with(OperationDisks((7, 7)))
+    assert first.conflicts_with(OperationDisks(None))
+    assert first.conflicts_with(OperationDisks((7, 2), (7, 7), True, False))
 
 def test_queue_manager_sorts_by_status_and_edits_the_right_clicked_row(monkeypatch):
     from PySide6.QtWidgets import QApplication, QMenu, QPushButton

@@ -19,13 +19,15 @@ from .utils import ConnectedVolumeResolver
 class ArchiveThread(QThread):
     progress = Signal(str, object, object)
 
-    def __init__(self, catalogue, operation, volume_id, preview_settings, parent, *, writer_lock=None):
+    def __init__(self, catalogue, operation, volume_id, preview_settings, parent, *, writer_lock=None,
+                 resolved_destination=None):
         super().__init__(parent)
         self.catalogue = catalogue
         self.operation = operation
         self.volume_id = volume_id
         self.preview_settings = preview_settings
         self.writer_lock = writer_lock
+        self.resolved_destination = resolved_destination
         self.pause_requested = Event()
         self.result = None
         self.error = ""
@@ -48,6 +50,7 @@ class ArchiveThread(QThread):
                 self.result = job.run(
                     source, self.volume_id, volume_uuid=self.operation.volume_uuid,
                     job_id=None if self.operation.legacy_journal else self.operation.id,
+                    resolved_destination=self.resolved_destination,
                 )
             finally:
                 db.close()

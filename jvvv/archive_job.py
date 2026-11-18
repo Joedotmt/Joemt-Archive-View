@@ -254,7 +254,7 @@ class ArchiveJob:
 
     def run(
         self, source_path: str | Path, volume_id: int, *,
-        volume_uuid=None, start_new=False, job_id: str | None = None,
+        volume_uuid=None, start_new=False, job_id: str | None = None, resolved_destination: str | None = None,
     ) -> ArchiveResult:
         if self.db.read_only:
             raise OSError("Open the catalogue for editing to archive a project.")
@@ -263,7 +263,7 @@ class ArchiveJob:
             raise OSError("Choose a drive that has completed its initial volume scan.")
         if volume_uuid is not None and volume["uuid"] != volume_uuid:
             raise OSError("The selected volume was replaced in the catalogue. Choose the drive again.")
-        destination_path = resolve_volume_source_path(volume)
+        destination_path = resolved_destination or resolve_volume_source_path(volume)
         if destination_path is None:
             raise OSError("Connect the selected destination drive and try again.")
         destination = Path(destination_path).resolve(strict=True)

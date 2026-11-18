@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 from uuid import uuid4
 
 from PIL import Image
@@ -557,6 +557,94 @@ def wait_for_queue(predicate):
     while not predicate() and monotonic() < end:
         QTest.qWait(25)
     assert predicate(), "Timed out waiting for the operations queue."
+
+
+@pytest.mark.parametrize("kind", ["scan", "archive", "pause one archive"])
+def test_queue_runs_two_independent_jobs_and_publishes_both(tmp_path, project, index_volume, monkeypatch, kind):
+    from jvvv.app import MainWindow
+    from jvvv.operations_queue import OperationDisks
+
+    source, destination = project
+    second = tmp_path / "Second volume"
+    second.mkdir()
+    for root in (destination, second):
+        (root / "before.dat").write_bytes(b"indexed earlier")
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_confirm_snapshot_before_close", lambda self: True)
+    window = MainWindow()
+    window.catalogue_path = tmp_path / "Archive.jvvv"
+    window.db = create_catalogue(window.catalogue_path)
+    window._set_catalogue_open(True)
+    parallel_io = Barrier(2, timeout=10)
+    resume_retry = Event()
+
+    def resolve_disks(cls, job, path):
+        disk = (7, 1 if Path(path) == destination else 2)
+        return OperationDisks(disk) if job.kind == "scan" else OperationDisks(disk, (7, 7), True, True)
+
+    monkeypatch.setattr(OperationDisks, "resolve", classmethod(resolve_disks))
+    try:
+        ids = [index_volume(window.db, path) for path in (destination, second)]
+        previous_ids = [
+            window.db.list_files(volume_id, window.db.get_root_folder(volume_id)["id"])[0]["id"]
+            for volume_id in ids
+        ]
+        if kind == "scan":
+            original = VolumeScanner._hash_file
+
+            def hash_file(self, path, *args, **kwargs):
+                if path.name == "before.dat":
+                    parallel_io.wait()
+                return original(self, path, *args, **kwargs)
+
+            monkeypatch.setattr(VolumeScanner, "_hash_file", hash_file)
+            for volume_id, path in zip(ids, (destination, second)):
+                (path / "new.dat").write_bytes(b"new file")
+                window.start_scan(volume_id)
+        else:
+            original = ArchiveJob._copy_file
+
+            def copy_file(self, path, part, *args, **kwargs):
+                if path.name == "empty.dat" and not resume_retry.is_set():
+                    parallel_io.wait()
+                    if kind == "pause one archive" and part.parent.parent == destination:
+                        assert resume_retry.wait(10)
+                return original(self, path, part, *args, **kwargs)
+
+            monkeypatch.setattr(ArchiveJob, "_copy_file", copy_file)
+            queue = window._get_operations_queue()
+            for volume_id in ids:
+                volume = window.db.get_volume(volume_id)
+                queue.add("archive", volume, volume["name"], source=str(source))
+
+        window.queue_manager_button.click()
+        window.apply_queue_button.click()
+        wait_for_queue(lambda: len(window.running_operations) == 2)
+        assert window.operation_progress_label.text().startswith("2 jobs running")
+        assert window.operations_dialog.tables["Pending"].cellWidget(1, 4) is not None
+        if kind == "pause one archive":
+            first, other = window.operations_queue.jobs
+            window.pause_queue_job(first.id)
+            resume_retry.set()
+            wait_for_queue(lambda: window.operations_queue.get(first.id).state == "paused"
+                           and window.operations_queue.get(other.id).state == "completed")
+            assert pending_archive(window.db.path) is None
+            window.apply_queue_button.click()
+        wait_for_queue(lambda: all(job.state in {"completed", "warning", "failed"} for job in window.operations_queue.jobs))
+        assert all(job.state == "completed" for job in window.operations_queue.jobs), window.operations_queue.jobs
+        for volume_id, file_id in zip(ids, previous_ids):
+            assert window.db.get_file(file_id)["name"] == "before.dat"
+            if kind == "scan":
+                assert window.db.get_volume(volume_id)["indexed_file_count"] == 2
+                assert window.db.list_scan_history(volume_id)[0]["status"] == "completed"
+            else:
+                assert window.db.get_folder_by_path(volume_id, source.name) is not None
+    finally:
+        resume_retry.set()
+        window.close()
+        app.processEvents()
 
 
 def test_queued_scans_and_dependent_archive_continue_past_disconnected_drive(

@@ -4,7 +4,6 @@ from concurrent.futures import Future
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
-from functools import partial
 import math
 import os
 import re
@@ -4762,6 +4761,7 @@ class ScanWorker(QObject):
         preview_skip_reason: str | None = None,
         volume_uuid: str | None = None,
         writer_lock=None,
+        resolved_source_path: str | None = None,
     ) -> None:
         super().__init__()
         self.db_path = db_path
@@ -4773,6 +4773,7 @@ class ScanWorker(QObject):
         self.preview_skip_reason = preview_skip_reason
         self.volume_uuid = volume_uuid
         self.writer_lock = writer_lock
+        self.resolved_source_path = resolved_source_path
         self.cancel_requested = False
         self._io_canceller = _SynchronousIoCanceller()
 
@@ -4824,6 +4825,7 @@ class ScanWorker(QObject):
                     preview_statistics=preview_statistics,
                     catalogue_ready_callback=catalogue_ready,
                     catalogue_path=self.db_path,
+                    resolved_source_path=self.resolved_source_path,
                 )
                 try:
                     result = scanner.scan(self.volume_id)
@@ -4876,10 +4878,52 @@ class RunningOperation:
     disks: OperationDisks
     worker: QObject
     thread: QThread
+    events: QueueJobEvents
     message: str = "Preparing…"
     done: int = 0
     total: int = 0
     result: tuple[str, str] | None = None
+
+
+class QueueJobEvents(QObject):
+    """Give each worker a GUI-thread receiver carrying its queue ID."""
+
+    def __init__(self, window, job_id):
+        super().__init__(window)
+        self.window = window
+        self.job_id = job_id
+
+    @Slot(str, object, object)
+    def archive_progress(self, label, done, total):
+        self.window.on_archive_progress(label, done, total, job_id=self.job_id)
+
+    @Slot()
+    def archive_finished(self):
+        self.window.on_archive_finished(self.job_id)
+
+    @Slot()
+    def catalogue_ready(self):
+        self.window.on_scan_catalogue_ready(job_id=self.job_id)
+
+    @Slot(int, int, str)
+    def scan_progress(self, files, folders, path):
+        self.window.on_scan_progress(files, folders, path, job_id=self.job_id)
+
+    @Slot(int, int, str, int, int)
+    def scan_stats_progress(self, files, folders, message, done, total):
+        self.window.on_scan_stats_progress(files, folders, message, done, total, job_id=self.job_id)
+
+    @Slot(dict)
+    def scan_result(self, result):
+        self.window.on_scan_finished(result, job_id=self.job_id)
+
+    @Slot(str)
+    def scan_failed(self, details):
+        self.window.on_scan_failed(details, job_id=self.job_id)
+
+    @Slot()
+    def scan_thread_finished(self):
+        self.window.clear_scan_worker(self.job_id)
 
 
 class DeleteVolumeWorker(QObject):
@@ -5448,6 +5492,7 @@ class MainWindow(QMainWindow):
         self.operations_queue: OperationsQueue | None = None
         self.running_operations: dict[str, RunningOperation] = {}
         self.queue_writer_lock = Lock()
+        self.scan_queue_result: tuple[str, str] | None = None
         self.scan_cancel_requested = False
         self.delete_thread: QThread | None = None
         self.delete_worker: DeleteVolumeWorker | None = None
@@ -7001,13 +7046,13 @@ class MainWindow(QMainWindow):
         dialog.set_analysis_running(running)
         if not running:
             dialog.analyse_button.setEnabled(
-                self.scan_worker is None and self.delete_worker is None
+                not self.running_operations and self.delete_worker is None
             )
 
     def start_backup_analysis(self) -> None:
         if self.db is None or self.backup_analysis_worker is not None:
             return
-        if self.scan_worker is not None or self.delete_worker is not None:
+        if self.running_operations or self.delete_worker is not None:
             self._show_catalogue_job_running_message()
             return
         if self.backup_evidence_dialog is not None:
@@ -8462,10 +8507,6 @@ class MainWindow(QMainWindow):
     def scan_worker(self) -> ScanWorker | None:
         return next((entry.worker for entry in self.running_operations.values() if entry.job.kind == "scan"), None)
 
-    @property
-    def archive_thread(self) -> ArchiveThread | None:
-        return next((entry.thread for entry in self.running_operations.values() if entry.job.kind == "archive"), None)
-
     def _catalogue_job_running(self, *, allow_queue=False) -> bool:
         return (
             (not allow_queue and bool(self.running_operations))
@@ -8514,8 +8555,8 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(
                 self,
-                "Scan Running",
-                "Wait for the current scan to finish or cancel it.",
+                "Catalogue Job Running",
+                "Wait for the current jobs to finish or pause them in Queue Manager.",
             )
 
     def _set_catalogue_busy(self, busy: bool) -> None:
@@ -8752,7 +8793,6 @@ class MainWindow(QMainWindow):
 
         self.volume_table.selectRow(index.row())
         self.volume_table.setCurrentIndex(self.volume_model.index(index.row(), 0))
-        scan_running = self.scan_worker is not None
 
         new_action = menu.addAction("Add Volume…")
         new_action.triggered.connect(self.add_volume)
@@ -8783,8 +8823,12 @@ class MainWindow(QMainWindow):
         link_action.setEnabled(not busy and not self.db.read_only and volume is not None)
 
         cancel_action = menu.addAction("Cancel Scan")
-        cancel_action.triggered.connect(self.cancel_scan)
-        cancel_action.setEnabled(scan_running)
+        scan_job_id = next((
+            entry.job.id for entry in self.running_operations.values()
+            if volume is not None and entry.job.kind == "scan" and entry.job.volume_uuid == volume["uuid"]
+        ), None)
+        cancel_action.triggered.connect(lambda: self.pause_queue_job(scan_job_id))
+        cancel_action.setEnabled(scan_job_id is not None)
 
         menu.exec(self.volume_table.viewport().mapToGlobal(point))
 
@@ -9160,6 +9204,7 @@ class MainWindow(QMainWindow):
             self.operations_dialog = OperationsDialog(self)
             self.operations_dialog.apply_requested.connect(self.apply_operations)
             self.operations_dialog.pause_requested.connect(self.pause_operations)
+            self.operations_dialog.pause_job_requested.connect(self.pause_queue_job)
             self.operations_dialog.move_requested.connect(self.move_operation)
             self.operations_dialog.remove_requested.connect(self.remove_operation)
             self.operations_dialog.retry_requested.connect(self.retry_operation)
@@ -9204,6 +9249,8 @@ class MainWindow(QMainWindow):
             self.operations_dialog.refresh(
                 self.operations_queue.jobs, self.operations_timer.isActive(), preview_failure_job_id=failure_job_id,
             )
+            for running in self.running_operations.values():
+                self.operations_dialog.set_job_progress(running.job.id, running.message, running.done, running.total)
 
     def _change_operations(self, change, *args) -> bool:
         try:
@@ -9298,34 +9345,35 @@ class MainWindow(QMainWindow):
             self.pause_operations()
             self.statusBar().showMessage(f"The queue could not be saved. {exc}", 10000)
             return
-        self._start_queue_job(job, disks[job.id], volumes[job.volume_uuid]["id"])
+        self._start_queue_job(job, disks[job.id], volumes[job.volume_uuid]["id"], paths[job.id])
         QTimer.singleShot(0, self._pump_operations)
 
-    def _start_queue_job(self, job: Operation, disks: OperationDisks, volume_id: int) -> None:
-        queued = Qt.ConnectionType.QueuedConnection
+    def _start_queue_job(self, job: Operation, disks: OperationDisks, volume_id: int, path: str) -> None:
+        events = QueueJobEvents(self, job.id)
         if job.kind == "archive":
             worker = thread = ArchiveThread(
                 self.db.path, job, volume_id, self.preview_settings, self, writer_lock=self.queue_writer_lock,
+                resolved_destination=path,
             )
-            worker.progress.connect(partial(self.on_archive_progress, job_id=job.id), queued)
-            thread.finished.connect(partial(self.on_archive_finished, job.id), queued)
+            worker.progress.connect(events.archive_progress)
+            thread.finished.connect(events.archive_finished)
             message = "Preparing archive?"
         else:
             worker = ScanWorker(
                 self.db.path, volume_id, preview_settings=self.preview_settings,
-                volume_uuid=job.volume_uuid, writer_lock=self.queue_writer_lock,
+                volume_uuid=job.volume_uuid, writer_lock=self.queue_writer_lock, resolved_source_path=path,
             )
-            worker.catalogue_ready.connect(partial(self.on_scan_catalogue_ready, job_id=job.id), queued)
-            worker.progress.connect(partial(self.on_scan_progress, job_id=job.id), queued)
-            worker.stats_progress.connect(partial(self.on_scan_stats_progress, job_id=job.id), queued)
+            worker.catalogue_ready.connect(events.catalogue_ready)
+            worker.progress.connect(events.scan_progress)
+            worker.stats_progress.connect(events.scan_stats_progress)
             worker.log_message.connect(self.on_scan_log_message)
-            worker.finished.connect(partial(self.on_scan_finished, job_id=job.id), queued)
-            worker.failed.connect(partial(self.on_scan_failed, job_id=job.id), queued)
+            worker.finished.connect(events.scan_result)
+            worker.failed.connect(events.scan_failed)
             thread = _create_worker_thread(
-                self, worker, (worker.finished, worker.failed), partial(self.clear_scan_worker, job.id),
+                self, worker, (worker.finished, worker.failed), events.scan_thread_finished,
             )
             message = "Preparing scan?"
-        self.running_operations[job.id] = RunningOperation(job, disks, worker, thread)
+        self.running_operations[job.id] = RunningOperation(job, disks, worker, thread, events)
         self.scan_cancel_requested = False
         self._set_scan_running_ui(True)
         self._update_context_actions()
@@ -9335,6 +9383,7 @@ class MainWindow(QMainWindow):
 
     def _finish_operation(self, job_id: str, state: str, detail: str) -> None:
         active = self.running_operations.pop(job_id)
+        active.events.deleteLater()
         job = active.job
         if state == "failed":
             volume = next((row for row in self.db.list_volumes() if row["uuid"] == job.volume_uuid), None)
@@ -9512,7 +9561,11 @@ class MainWindow(QMainWindow):
             self.scan_log.appendPlainText(message)
 
     @Slot()
-    def on_scan_catalogue_ready(self) -> None:
+    def on_scan_catalogue_ready(self, *, job_id=None) -> None:
+        if job_id is not None:
+            self._queue_progress(job_id, "Generating previews…")
+            self.refresh_after_catalogue_write()
+            return
         self.scan_preview_phase = True
         self.refresh_after_catalogue_write()
         self.stop_scan_button.setText("Cancel Previews")
@@ -9521,13 +9574,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Catalogue updated and ready to browse. Generating previews…")
 
     def cancel_current_operation(self) -> None:
-        if self.archive_thread is not None:
-            self.pause_operations()
+        if self.running_operations:
+            if len(self.running_operations) > 1:
+                self.pause_operations()
+            else:
+                self.pause_queue_job(self.operation_id)
             self.stop_scan_button.setEnabled(False)
         else:
             self.cancel_scan()
 
     def cancel_scan(self) -> None:
+        if getattr(self, "running_operations", None):
+            job = next((entry.job for entry in self.running_operations.values() if entry.job.kind == "scan"), None)
+            if job is not None:
+                self.pause_queue_job(job.id)
+            return
         if self.scan_worker is None or self.scan_cancel_requested:
             return
         self.scan_cancel_requested = True
@@ -9542,15 +9603,20 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     @Slot(int, int, str)
-    def on_scan_progress(self, files_seen: int, folders_seen: int, current_path: str) -> None:
-        if self.scan_cancel_requested:
+    def on_scan_progress(self, files_seen: int, folders_seen: int, current_path: str, *, job_id=None) -> None:
+        if job_id is None and self.scan_cancel_requested:
             return
-        if self.scan_progress.maximum() != 0:
-            self.scan_progress.setRange(0, 0)
         if current_path.startswith(SCAN_PROGRESS_DETAIL_PREFIXES):
             text = f"{current_path} · {files_seen:,} files catalogued"
         else:
             text = f"Scanning... {files_seen:,} files, {folders_seen:,} folders - {current_path}"
+        if job_id is not None:
+            active = self.running_operations.get(job_id)
+            if active is not None and not active.worker.cancel_requested:
+                self._queue_progress(job_id, text)
+            return
+        if self.scan_progress.maximum() != 0:
+            self.scan_progress.setRange(0, 0)
         self.scan_progress.setFormat(text)
         MainWindow._show_queued_progress(self, text)
         # A busy (indeterminate) QProgressBar never paints its format text, so
@@ -9566,7 +9632,15 @@ class MainWindow(QMainWindow):
         message: str,
         done: int,
         total: int,
+        *,
+        job_id=None,
     ) -> None:
+        if job_id is not None:
+            active = self.running_operations.get(job_id)
+            if active is not None and not active.worker.cancel_requested:
+                label = self.scan_stats_progress_label(message)
+                self._queue_progress(job_id, f"{label} ({done:,}/{total:,})" if total else label, done, total)
+            return
         if self.scan_cancel_requested:
             return
         label = self.scan_stats_progress_label(message)
@@ -9594,22 +9668,24 @@ class MainWindow(QMainWindow):
         return labels.get(message, message)
 
     @Slot(dict)
-    def on_scan_finished(self, result: dict) -> None:
-        self.scan_progress.setRange(0, 1)
-        self.scan_progress.setValue(1)
+    def on_scan_finished(self, result: dict, *, job_id=None) -> None:
+        if job_id is None:
+            self.scan_progress.setRange(0, 1)
+            self.scan_progress.setValue(1)
         status = result.get("status", "completed")
         indexed = status in COMPLETED_SCAN_STATUSES
         registration_warning = str(result.get("registration_warning") or "")
         statistics = PreviewStatistics.from_dict(result.get("preview") or {})
         self.last_preview_statistics = statistics
-        self.last_preview_operation_id = self.operation_id
+        self.last_preview_operation_id = job_id
         preview_warning = status == SCAN_OUTCOME_COMPLETED_WITH_WARNINGS
         # Spec §15: never a generic "completed" when previews failed.
-        self.scan_progress.setFormat(
-            "Completed; previews interrupted" if statistics.interrupted
-            else "Completed with preview errors" if preview_warning
-            else "Completed with warnings" if registration_warning else status.title()
-        )
+        if job_id is None:
+            self.scan_progress.setFormat(
+                "Completed; previews interrupted" if statistics.interrupted
+                else "Completed with preview errors" if preview_warning
+                else "Completed with warnings" if registration_warning else status.title()
+            )
         hash_errors = int(result.get("hash_errors", 0))
         access_errors = max(0, int(result.get("errors_count", 0)) - hash_errors)
         preview_text = ""
@@ -9671,7 +9747,13 @@ class MainWindow(QMainWindow):
             else "paused" if status == "cancelled"
             else "failed"
         )
-        self.scan_queue_result = (state, detail)
+        if job_id is None:
+            self.scan_queue_result = (state, detail)
+        else:
+            active = self.running_operations[job_id]
+            if statistics.interrupted and active.worker.cancel_requested:
+                state = "paused"
+            active.result = (state, detail)
 
     def show_preview_failures(self, statistics: PreviewStatistics | None = None) -> None:
         statistics = statistics or self.last_preview_statistics
@@ -9685,32 +9767,37 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     @Slot(str)
-    def on_scan_failed(self, details: str) -> None:
-        self.scan_progress.setRange(0, 1)
-        self.scan_progress.setValue(0)
-        self.scan_progress.setFormat("Scan failed")
+    def on_scan_failed(self, details: str, *, job_id=None) -> None:
+        if job_id is None:
+            self.scan_progress.setRange(0, 1)
+            self.scan_progress.setValue(0)
+            self.scan_progress.setFormat("Scan failed")
         self.on_scan_log_message(details)
         message = details.strip().splitlines()[-1] if details.strip() else "Scan failed."
-        self.scan_queue_result = ("failed", message)
+        if job_id is None:
+            self.scan_queue_result = ("failed", message)
+        else:
+            self.running_operations[job_id].result = ("failed", message)
         self.statusBar().showMessage(message, 10000)
         self.refresh_after_catalogue_write()
 
     @Slot()
-    def clear_scan_worker(self) -> None:
+    def clear_scan_worker(self, job_id=None) -> None:
+        if job_id is not None:
+            result = self.running_operations[job_id].result or ("failed", "Scan finished without a result.")
+            self._finish_operation(job_id, *result)
+            if self.backup_evidence_dialog is not None:
+                self.refresh_backup_evidence_dialog()
+            return
         self.scan_preview_phase = False
         self.stop_scan_button.setText("Cancel Scan")
         self.stop_scan_button.setToolTip("")
-        self.scan_worker = None
-        self.scan_thread = None
         self.scan_cancel_requested = False
         self._set_scan_running_ui(False)
         self._update_archive_action()
         if self.backup_evidence_dialog is not None:
             self.refresh_backup_evidence_dialog()
-        if self.scan_queue_result is not None:
-            result = self.scan_queue_result
-            self.scan_queue_result = None
-            self._finish_operation(*result)
+        self.scan_queue_result = None
 
     @Slot(str)
     def on_delete_progress(self, message: str) -> None:

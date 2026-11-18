@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QMenu, QPushButton,
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QMenu, QProgressBar, QPushButton,
     QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
@@ -13,6 +13,7 @@ from .operations_queue import STATUS_TABS, STATUSES, Operation
 class OperationsDialog(QDialog):
     apply_requested = Signal()
     pause_requested = Signal()
+    pause_job_requested = Signal(str)
     move_requested = Signal(str, int)
     remove_requested = Signal(str)
     retry_requested = Signal(str)
@@ -58,8 +59,8 @@ class OperationsDialog(QDialog):
 
     @staticmethod
     def _operation_table() -> QTableWidget:
-        table = QTableWidget(0, 4)
-        table.setHorizontalHeaderLabels(["Operation", "Volume", "Source project", "Status"])
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["Operation", "Volume", "Source project", "Status", "Progress"])
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -67,6 +68,8 @@ class OperationsDialog(QDialog):
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(4, 130)
         return table
 
     @staticmethod
@@ -92,7 +95,9 @@ class OperationsDialog(QDialog):
             menu.addAction("Retry", lambda: self.retry_requested.emit(job.id))
         if job.id == self.preview_failure_job_id:
             menu.addAction("Preview Failures", lambda: self.preview_failures_requested.emit())
-        if job.state != "running":
+        if job.state == "running":
+            menu.addAction("Pause Job", lambda: self.pause_job_requested.emit(job.id))
+        else:
             menu.addAction("Remove", lambda: self.remove_requested.emit(job.id))
         if not menu.isEmpty():
             menu.exec(table.viewport().mapToGlobal(point))
@@ -113,12 +118,31 @@ class OperationsDialog(QDialog):
         self.pause.setEnabled(active)
         self._show_selection()
 
+    def set_job_progress(self, job_id: str, message: str, done: int, total: int) -> None:
+        table = self.tables["Pending"]
+        for row, job in enumerate(self.jobs_by_tab["Pending"]):
+            if job.id != job_id:
+                continue
+            bar = table.cellWidget(row, 4)
+            if bar is None:
+                bar = QProgressBar(table)
+                table.setCellWidget(row, 4, bar)
+            bar.setRange(0, 1000 if total else 0)
+            if total:
+                bar.setValue(min(1000, max(0, done * 1000 // total)))
+            bar.setToolTip(message)
+            table.item(row, 3).setToolTip(message)
+            if self.tabs.currentWidget() is table and table.currentRow() == row:
+                self.detail.setText(message)
+            break
+
     @staticmethod
     def _refresh_table(table, jobs, selected):
         with QSignalBlocker(table):
             table.setRowCount(len(jobs))
             selected_row = 0
             for row, job in enumerate(jobs):
+                table.removeCellWidget(row, 4)
                 values = (job.kind_label, job.volume_label, job.source, STATUSES[job.state])
                 for column, value in enumerate(values):
                     cell = QTableWidgetItem(value)
