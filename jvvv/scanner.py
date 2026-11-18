@@ -174,6 +174,7 @@ class VolumeScanner:
         catalogue_ready_callback: Callable[[], None] | None = None,
         progress_interval: float = 0.1,
         require_complete: bool = False,
+        catalogue_path: Path | None = None,
     ) -> None:
         self.db = db
         self.hash_algorithm = db.hash_algorithm
@@ -209,12 +210,8 @@ class VolumeScanner:
         # The catalogue is a folder (registry, index and volume files) with a
         # lock file beside it; none of it is archive content even when the
         # folder lives on the drive being scanned.
-        catalogue_path = os.path.normcase(os.path.abspath(str(self.db.path)))
-        self._catalogue_root_path = catalogue_path
-        self._catalogue_storage_paths = {
-            catalogue_path,
-            f"{catalogue_path}.lock",
-        }
+        roots = {self.db.path, catalogue_path or self.db.path}
+        self._catalogue_storage_paths = {os.path.normcase(os.path.abspath(path)) for path in roots}
         # A preview root inside the scanned volume must not be indexed as
         # archive content (each rescan would otherwise preview the previews).
         self._preview_root_path: str | None = None
@@ -927,9 +924,10 @@ class VolumeScanner:
 
     def _is_catalogue_storage_path(self, path: Path) -> bool:
         normalized = os.path.normcase(os.path.abspath(str(path)))
-        if normalized in self._catalogue_storage_paths:
-            return True
-        return normalized.startswith(self._catalogue_root_path + os.sep)
+        return any(
+            normalized == root or normalized == f"{root}.lock" or normalized.startswith(root + os.sep)
+            for root in self._catalogue_storage_paths
+        )
 
     def _is_preview_storage_path(self, path: Path) -> bool:
         if self._preview_root_path is None:

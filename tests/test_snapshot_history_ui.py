@@ -9,7 +9,7 @@ import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QMessageBox
 
-from jvvv.app import MainWindow, RelinkRepositoryDialog, SnapshotHistoryDialog
+from jvvv.app import MainWindow, RelinkRepositoryDialog, SnapshotHistoryDialog, VolumeConnections
 from jvvv.database import create_catalogue, open_catalogue
 from jvvv.snapshot_repository import SnapshotRepository, repository_link_settings
 
@@ -46,7 +46,7 @@ def archive(tmp_path):
 
 def open_in_window(window, path):
     window._open_catalogue_in_window(
-        open_catalogue(path, check_same_thread=False), path, None, connected_volume_snapshots=[]
+        open_catalogue(path, check_same_thread=False), path, None, volume_connections=VolumeConnections([], {})
     )
 
 

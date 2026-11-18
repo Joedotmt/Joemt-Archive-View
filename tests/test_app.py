@@ -17,6 +17,7 @@ from jvvv.app import (
     COLOR_MODE_SETTING,
     MainWindow,
     PreferencesDialog,
+    VolumeConnections,
     SEARCH_INCLUDE_PATHS_SETTING,
     SearchWorker,
     THEME_STYLE_SETTING,
@@ -80,7 +81,7 @@ def test_menus_group_actions_and_windows_for_the_current_context(monkeypatch):
 
         window._set_catalogue_open(True)
         assert visible_entries(window.file_menu) == [
-            "Add Volume…", "Archive Project…", "Operations Queue…", "Open Catalogue Folder",
+            "Add Volume…", "Archive Project…", "Queue Manager", "Open Catalogue Folder",
             "Close Catalogue / Return Home", "Exit",
         ]
         assert visible_entries(window.window_menu) == [
@@ -389,7 +390,7 @@ def test_switching_volume_clears_and_repaints_browser_before_loading():
         file_table=SimpleNamespace(viewport=lambda: file_viewport),
         clear_browser=lambda: events.append("clear"),
         show_volume_details=lambda volume: events.append(f"details:{volume['id']}"),
-        load_volume_browser=lambda volume_id: events.append(f"browser:{volume_id}"),
+        load_volume_browser=lambda volume: events.append(f"browser:{volume['id']}"),
         load_scan_log=lambda volume_id: events.append(f"log:{volume_id}"),
     )
 
@@ -944,8 +945,8 @@ def test_catalogue_open_worker_opens_and_prepares_catalogue(tmp_path):
         lambda value, maximum, message: progress.append((value, maximum, message))
     )
     worker.finished.connect(
-        lambda db, items, snapshots, lock: completed.append(
-            (db, items, snapshots, lock)
+        lambda db, items, connections, lock: completed.append(
+            (db, items, connections, lock)
         )
     )
     worker.failed.connect(failures.append)
@@ -956,9 +957,10 @@ def test_catalogue_open_worker_opens_and_prepares_catalogue(tmp_path):
     assert progress[0] == (0, 0, "Acquiring catalogue lock...")
     assert progress[1] == (0, 0, "Opening and checking catalogue...")
     assert progress[-1] == (1, 1, "Catalogue ready")
-    db, items, snapshots, lock = completed[0]
+    db, items, connections, lock = completed[0]
     assert items == []
-    assert isinstance(snapshots, list)
+    assert isinstance(connections.snapshots, list)
+    assert connections.paths == {}
     assert db.get_catalogue_info()["volume_count"] == 0
     db.close()
     lock.unlock()
@@ -1167,7 +1169,7 @@ def test_cancelled_catalogue_open_ignores_a_late_success():
         window,
         FakeDatabase(),
         [],
-        [],
+        VolumeConnections([], {}),
         FakeLock(),
     )
 

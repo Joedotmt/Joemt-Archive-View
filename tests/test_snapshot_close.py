@@ -6,7 +6,7 @@ import pytest
 from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
-from jvvv.app import MainWindow, _RepositoryWorker
+from jvvv.app import MainWindow, VolumeConnections, _RepositoryWorker
 from jvvv.database import create_catalogue, open_catalogue
 from jvvv.snapshot_repository import SnapshotCancelled, SnapshotRepository, default_repository_path
 
@@ -177,7 +177,7 @@ def test_returning_home_before_creating_another_catalogue_keeps_snapshot_flow(wi
     monkeypatch.setattr(
         window,
         "_open_catalogue_in_window",
-        lambda db, path, lock: open_in_window(db, path, lock, connected_volume_snapshots=[]),
+        lambda db, path, lock: open_in_window(db, path, lock, volume_connections=VolumeConnections([], {})),
     )
     window.new_catalogue()  # Creating another catalogue is unavailable in the workspace.
     assert window.catalogue_path == original

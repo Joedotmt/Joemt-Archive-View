@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 import ntpath
 import os
@@ -51,6 +52,7 @@ class ConnectedVolumeResolver:
         self.snapshots = snapshots if snapshots is not None else list_connected_volume_snapshots()
         self.check_source_path = check_source_path
         self._marker_roots: dict[str, list[str]] | None = None
+        self._source_snapshots: dict[str, VolumeSnapshot | None] = {}
 
     def resolve(self, volume: Any) -> str | None:
         return self.resolve_details(volume)[0]
@@ -84,7 +86,9 @@ class ConnectedVolumeResolver:
 
         if self.check_source_path:
             source_path = _record_value(volume, "source_path")
-            snapshot = capture_volume_snapshot(source_path)
+            if source_path not in self._source_snapshots:
+                self._source_snapshots[source_path] = capture_volume_snapshot(source_path)
+            snapshot = self._source_snapshots[source_path]
             if snapshot_matches_volume(snapshot, volume):
                 return snapshot.source_path, ""
             if kind == MARKER_IDENTITY and snapshot and read_drive_marker(Path(snapshot.mount_root)):
@@ -124,6 +128,43 @@ def capture_volume_snapshot(source_path: str | Path | None) -> VolumeSnapshot | 
     if platform.system() == "Windows":
         return _capture_windows_volume_snapshot(path)
     return _capture_local_path_snapshot(path)
+
+
+def physical_disk_key(path: str | Path) -> tuple[int, int] | None:
+    """Map Windows partitions and drive letters to their attached device."""
+    if platform.system() != "Windows":
+        return None
+    snapshot = capture_volume_snapshot(path)
+    if snapshot is None:
+        return None
+    root = Path(snapshot.mount_root)
+    device = snapshot.identity_token.rstrip("\\") if snapshot.identity_kind == "windows-volume-guid" else ""
+    if root.drive and root == Path(root.anchor):
+        device = "\\\\.\\" + root.drive
+    if not device:
+        return None
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_device = kernel.CreateFileW
+    open_device.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    open_device.restype = wintypes.HANDLE
+    handle = open_device(device, 0, 7, None, 3, 0, None)
+    if handle == ctypes.c_void_p(-1).value:
+        return None
+    try:
+        query = kernel.DeviceIoControl
+        query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                          wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        query.restype = wintypes.BOOL
+        number = (wintypes.DWORD * 3)()
+        returned = wintypes.DWORD()
+        if query(handle, 0x2D1080, None, 0, number, ctypes.sizeof(number), ctypes.byref(returned), None):
+            if returned.value == ctypes.sizeof(number) and number[0] == 7 and number[1] != 0xFFFFFFFF:
+                return int(number[0]), int(number[1])
+    finally:
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle(handle)
+    return None
 
 
 def rename_volume_label(source_path: str | Path, label: str) -> None:

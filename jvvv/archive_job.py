@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, nullcontext
 from dataclasses import dataclass
 import io
 import json
@@ -21,7 +21,7 @@ from .archive_io import (
 )
 from .content_hash import new_hasher
 from .database import Database, format_timestamp, utc_now
-from .drive_marker import MARKER_IDENTITY
+from .drive_marker import MARKER_IDENTITY, read_drive_marker, write_drive_marker
 from .media_metadata import MediaInspectionCancelled, MediaMetadataExtractor, media_kind_for_extension
 from .preview_cache import PreviewCancelled
 from .preview_service import PreviewService, status_record_for
@@ -34,6 +34,10 @@ RAM_PER_FILE = 64 * 1024 * 1024
 
 class ArchivePaused(Exception):
     """The current attempt was interrupted and can be resumed."""
+
+
+class ProtectedArchiveDriveError(OSError):
+    """A write location is on the protected project drive."""
 
 
 @dataclass(frozen=True)
@@ -108,12 +112,46 @@ def check_archive_write_locations(source: Path | None, *locations: Path) -> None
         if source is not None and _inside(path, source):
             raise OSError(f"An archive write location is inside the source project: {path}")
         if os.name == "nt" and (path.drive.casefold() == "q:" or location.drive.casefold() == "q:"):
-            raise OSError(f"Choose an archive write location outside the protected Q: drive: {location}")
+            raise ProtectedArchiveDriveError(f"Choose an archive write location outside the protected Q: drive: {location}")
         if protected is not None and protected.identity_token:
             existing = next((parent for parent in (path, *path.parents) if parent.is_dir()), None)
             volume = capture_volume_snapshot(existing) if existing is not None else None
             if volume is not None and _volume_key(volume) == _volume_key(protected):
-                raise OSError(f"Choose an archive write location outside the protected Q: drive: {path}")
+                raise ProtectedArchiveDriveError(f"Choose an archive write location outside the protected Q: drive: {path}")
+
+
+def register_scanned_drive(db: Database, volume) -> None:
+    """Bind a newly scanned drive root to its on-disk marker."""
+    if not is_archive_volume_root(volume) or volume["identity_kind"] == MARKER_IDENTITY:
+        return
+    source = Path(volume["source_path"])
+    try:
+        check_archive_write_locations(None, source)
+        root = source.resolve(strict=True)
+        if not volume["identity_kind"].startswith("windows-") and not root.is_mount():
+            return
+        with hold_folder(root):
+            snapshot = capture_volume_snapshot(root)
+            if not _matches_archive_volume(volume, snapshot):
+                raise OSError("The scanned drive disconnected or changed.")
+            check_archive_write_locations(None, source, root)
+            marker = read_drive_marker(root)
+            location = snapshot.as_db_fields()
+            location.update(identity_kind=MARKER_IDENTITY, identity_token=marker or volume["uuid"])
+            if marker:
+                for other in db.list_volumes():
+                    if (other["id"] != volume["id"] and other["identity_kind"] == MARKER_IDENTITY
+                            and other["identity_token"] == marker):
+                        raise OSError("This drive ID is already linked to another volume in the catalogue.")
+                candidate = {**dict(volume), **location}
+                connected = resolve_volume_source_path(candidate)
+                if connected is None or Path(connected) != root:
+                    raise OSError("JVVV could not uniquely identify this drive by its marker.")
+            else:
+                write_drive_marker(root, volume["uuid"])
+            db.update_volume_location(volume["id"], str(root), location)
+    except ProtectedArchiveDriveError:
+        return
 
 
 def _checked_folder(path: Path) -> os.stat_result:
@@ -194,8 +232,9 @@ class MediaInput:
 class ArchiveJob:
     """Own one attempt; journal completed files and commit the catalogue once."""
 
-    def __init__(self, db: Database, *, preview_settings=None, cancelled=None, progress=None):
+    def __init__(self, db: Database, *, preview_settings=None, cancelled=None, progress=None, writer_lock=None):
         self.db = db
+        self.writer_lock = writer_lock
         self.preview_settings = preview_settings
         self.cancelled = cancelled or (lambda: False)
         self.progress = progress or (lambda *_: None)
@@ -498,7 +537,8 @@ class ArchiveJob:
                     raise FileExistsError(f"An archive folder already exists: {final}")
                 work.rename(final)
             entries.append(ProjectEntry(marker_name, marker_info, False))
-            self._register(volume, current_destination, final, entries, destination_stats, digests, media)
+            with self.writer_lock if self.writer_lock is not None else nullcontext():
+                self._register(volume, current_destination, final, entries, destination_stats, digests, media)
             failures = sum(status is not None and status["status"] != "available" for _, status in media.values())
             state["result"] = {
                 "files": len(files), "bytes_copied": total, "preview_failures": failures,

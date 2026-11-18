@@ -1,4 +1,4 @@
-"""Persistent identity for a drive explicitly registered with JVVV."""
+"""Persistent identity for a drive registered with JVVV."""
 from __future__ import annotations
 
 import json

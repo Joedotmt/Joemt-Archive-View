@@ -10,7 +10,7 @@ import pytest
 from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from jvvv.app import MainWindow, load_preview_settings
+from jvvv.app import MainWindow, VolumeConnections, load_preview_settings
 from jvvv.database import CatalogueError, Database, create_catalogue, open_catalogue
 from jvvv.preview_config import (
     CATALOGUE_PREVIEW_SETTING_KEYS,
@@ -43,7 +43,7 @@ def open_in_window(window, path, *, read_only=False):
         db,
         path,
         None,
-        connected_volume_snapshots=[],
+        volume_connections=VolumeConnections([], {}),
     )
     QApplication.instance().processEvents()
 

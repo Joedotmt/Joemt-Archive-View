@@ -190,8 +190,8 @@ separately with your normal file-copy or backup software.
 1. On **Home**, choose **Create Empty Catalogue…** and name the `.jvvv` folder.
 2. Choose **File > Add Volume…**.
 3. Choose a connected drive or folder and assign its drive ID. JVVV queues an
-   initial scan. Add more drives if needed, then click **Apply** in
-   **File > Operations Queue…**.
+   initial scan. Add more drives if needed, then click **Apply** beside the
+   catalogue name.
 4. Browse the saved folder tree and file list after the scan completes.
    Double-click the volume to edit its details.
 5. Use the search bar to search across all indexed volumes.
@@ -200,21 +200,26 @@ separately with your normal file-copy or backup software.
 
 ### Run unattended operations
 
-Review, reorder, and remove pending jobs in **Operations Queue**, then click
-**Apply**. The queue runs one job at a time. A disconnected drive waits while
-independent jobs continue. Scan results and warnings appear in the queue.
+**Queue Manager** has **Pending**, **Failed**, and **Completed** tabs. The
+**Pending** tab also shows running, waiting, and paused jobs, with each job's
+current status in its row. Right-click a job to move or remove it, or to retry
+a failed job. Click **Apply** in Queue Manager or beside the catalogue
+name. When several jobs can be applied, both buttons say **Apply All**. The
+main progress bar shows the active scan or archive. A disconnected drive waits
+while independent jobs continue. Results and warnings are saved in the queue.
 The catalogue keeps its previous scan if indexing is incomplete.
 
 The queue is saved locally with the catalogue. After reopening it, click
 **Apply** to continue. **Pause Queue** stops the current operation and holds
 the remaining jobs. A paused scan restarts, and an archive resumes from its
-saved copy progress. Select a failed job and click **Retry**, then **Apply**.
+saved copy progress. Right-click a job in **Failed** and choose **Retry**,
+then apply the queue.
 
-Use **Register Archive Drive…** on a designated destination to write
-`.jvvv-drive.json` at the drive root. JVVV can then identify the drive even if
-Windows reports a different identity. If several connected drives carry the
-same ID, disconnect the duplicate. Use **Relink Drive…** when an existing
-volume needs to be matched again. Scans leave the source drive read-only.
+After the first successful scan of a writable drive root, JVVV creates or
+reuses `.jvvv-drive.json` to recognize the drive if Windows reports a different
+identity. Protected `Q:\` and folders below a drive root are excluded from
+registration. If several connected drives carry the same ID, disconnect the
+duplicate. Use **Relink Drive…** when an existing volume needs to be matched again.
 
 ### Archive a project to an HDD
 
@@ -231,7 +236,7 @@ as soon as verification finishes, without a full drive scan.
 
 **Pause Queue** leaves progress saved in the catalogue and a temporary archive
 folder on the destination drive. Reconnect the same drive and click **Apply**
-in the queue to resume. Previously copied files are checked before publication. If the
+beside the catalogue name to resume. Previously copied files are checked before publication. If the
 job was paused, JVVV also rechecks the corresponding source files before reusing
 those transfers. Start a new job if the source changed. Keep other apps that
 edit the project closed until the archive completes. On Windows, the copy opens
@@ -433,8 +438,9 @@ rotation metadata, are never upscaled, and are written with `+faststart`.
 Before every queued scan with previews enabled, JVVV re-checks the preview
 directory, FFmpeg, and the image backend. If the check fails, the scan runs
 without previews and the queue reports the reason. The completed job shows
-generated, reused, and failed counts. **Preview Failures** lists the failed
-items from the most recent scan with their stage and technical detail. If the preview
+generated, reused, and failed counts. Right-click the most recent scan and
+choose **Preview Failures** to see each failed item, its stage, and its
+technical detail. If the preview
 disk fills up or the directory becomes unavailable, generation stops for the
 rest of that scan, catalogue indexing continues, and the report distinguishes
 direct failures from previews that were not attempted. Preview failures never

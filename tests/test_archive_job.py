@@ -371,6 +371,28 @@ def test_rejects_another_mount_of_protected_drive(tmp_path, monkeypatch):
     assert not list(destination.iterdir())
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Exercises protection of the Windows Q: drive")
+def test_automatic_registration_leaves_a_protected_mount_read_only(tmp_path, project, index_volume, monkeypatch):
+    _, destination = project
+    db = create_catalogue(tmp_path / "Archive.jvvv")
+    try:
+        volume_id = index_volume(db, destination)
+        before = db.get_volume(volume_id)
+        capture = archive_job.capture_volume_snapshot
+
+        def capture_protected(path):
+            if Path(path) == Path("Q:/"):
+                return replace(capture(destination), source_path="Q:\\", mount_root="Q:\\")
+            return capture(path)
+
+        monkeypatch.setattr(archive_job, "capture_volume_snapshot", capture_protected)
+        archive_job.register_scanned_drive(db, before)
+        assert not (destination / ".jvvv-drive.json").exists()
+        assert db.get_volume(volume_id)["identity_kind"] == before["identity_kind"]
+    finally:
+        db.close()
+
+
 def test_preview_worker_overlaps_next_copy_and_reuses_matching_output(tmp_path, project, index_volume, monkeypatch):
     source, destination = project
     image_path = source / "a-first.png"
@@ -428,6 +450,15 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
     window.catalogue_path = tmp_path / "Archive.jvvv"
     window.db = create_catalogue(window.catalogue_path)
     window._set_catalogue_open(True)
+    progress_formats = []
+    set_format = window.scan_progress.setFormat
+
+    def record_progress(text):
+        if window.scan_progress.maximum() == 1000:
+            progress_formats.append(text)
+        set_format(text)
+
+    monkeypatch.setattr(window.scan_progress, "setFormat", record_progress)
     other = tmp_path / "Another Drive"
     other.mkdir()
     unscanned = tmp_path / "Unscanned"
@@ -463,6 +494,7 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
         if from_context:
             class ArchiveMenu(QMenu):
                 def exec(self, _point):
+                    assert all(action.text() != "Register Archive Drive…" for action in self.actions())
                     action = next(action for action in self.actions() if action.text() == "Archive Project…")
                     assert action.isEnabled()
                     action.trigger()
@@ -477,14 +509,41 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
             window.archive_project_action.trigger()
         assert len(shown_dialogs) == 1
         assert not (destination / source.name).exists()
-        assert window.operations_queue.jobs[0].state == "queued"
-        window.operations_dialog.apply.click()
+        queued = window.operations_queue.jobs[0]
+        assert queued.state == "queued"
+        assert window.operations_dialog is None
+        assert window.catalogue_header.isAncestorOf(window.apply_queue_button)
+        assert window.catalogue_header.isAncestorOf(window.queue_manager_button)
+        assert window.queue_summary_label.text() == queued.title
+        assert window.apply_queue_button.isEnabled()
+        assert window.apply_queue_button.text() == "Apply"
+        if from_context:
+            window.queue_manager_button.click()
+            manager = window.operations_dialog
+            assert manager.apply_button.text() == "Apply"
+            assert manager.apply_button.isEnabled()
+            manager.apply_button.click()
+        else:
+            window.apply_queue_button.click()
         wait_for_queue(lambda: window.operations_queue.jobs[0].state in {"completed", "warning", "failed"})
         job = window.operations_queue.jobs[0]
         assert job.state == "completed", job.detail
         assert len(window.db.list_volumes()) == 3
         assert window.db.get_folder_by_path(volume_id, source.name) is not None
         assert not list(other.iterdir())
+        assert any("Copying and hashing" in text for text in progress_formats)
+        assert any("Reading back the destination" in text for text in progress_formats)
+        assert window.scan_progress.value() == window.scan_progress.maximum()
+        assert window.queue_summary_label.text() == "No pending changes"
+        assert not window.apply_queue_button.isEnabled()
+        window.apply_operations()
+        assert window.operations_queue.jobs == [job]
+        window.queue_manager_button.click()
+        manager = window.operations_dialog
+        assert manager.windowTitle() == "Queue Manager"
+        assert manager.tables["Pending"].rowCount() == 0
+        assert manager.tables["Completed"].rowCount() == 1
+        assert not manager.apply_button.isEnabled()
     finally:
         window.close()
         app.processEvents()
@@ -538,14 +597,20 @@ def test_queued_scans_and_dependent_archive_continue_past_disconnected_drive(
         first, scan, archive = queue.jobs
         assert archive.requires == scan.id
         assert all(job.state == "queued" for job in queue.jobs)
+        assert window.operations_dialog is None
+        assert window.queue_summary_label.text() == "3 pending changes"
+        assert window.apply_queue_button.text() == "Apply All"
+        window.queue_manager_button.click()
+        assert window.operations_dialog.apply_button.text() == "Apply All"
         assert not window.db.get_volume(destination_id)["last_scan_at"]
         offline.rename(hidden)
-        window.apply_operations()
+        window.apply_queue_button.click()
         wait_for_queue(lambda: queue.get(archive.id).state in {"completed", "warning", "failed"})
         assert queue.get(first.id).state == "waiting"
         assert queue.get(scan.id).state == "completed", queue.get(scan.id).detail
         assert queue.get(archive.id).state == "completed", queue.get(archive.id).detail
         assert (destination / source.name / "Project.jvvv-project.json").is_file()
+        assert (destination / ".jvvv-drive.json").is_file()
         hidden.rename(offline)
         window._pump_operations()
         wait_for_queue(lambda: queue.get(first.id).state == "completed")
@@ -562,33 +627,39 @@ def test_queued_scans_and_dependent_archive_continue_past_disconnected_drive(
         app.processEvents()
 
 
-def test_register_archive_drive_survives_changed_windows_identity_and_rejects_clones(
-    tmp_path, project, index_volume, monkeypatch,
+@pytest.mark.parametrize("has_marker", [False, True])
+def test_first_scan_registers_drive_and_rejects_cloned_markers(
+    tmp_path, project, index_volume, monkeypatch, has_marker,
 ):
     import shutil
     from PySide6.QtWidgets import QMessageBox
-    import jvvv.app as app_module
     from jvvv.app import MainWindow
-    from jvvv.drive_marker import MARKER_IDENTITY, MARKER_NAME, read_drive_marker
+    from jvvv.drive_marker import MARKER_IDENTITY, MARKER_NAME, read_drive_marker, write_drive_marker
 
     source, destination = project
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
     monkeypatch.setattr(MainWindow, "_confirm_snapshot_before_close", lambda self: True)
-    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: pytest.fail("Unexpected registration question"))
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: pytest.fail(str(args[2])))
-    monkeypatch.setattr(app_module, "capture_volume_snapshot", utils.capture_volume_snapshot)
     window = MainWindow()
     window.catalogue_path = tmp_path / "Archive.jvvv"
     window.db = create_catalogue(window.catalogue_path)
     window._set_catalogue_open(True)
     try:
-        volume_id = index_volume(window.db, destination)
-        assert not (destination / MARKER_NAME).exists()
-        window.register_archive_drive(volume_id)
+        volume_id = index_volume(window.db, destination, scan=False)
+        original_id = str(uuid4()) if has_marker else window.db.get_volume(volume_id)["uuid"]
+        if has_marker:
+            write_drive_marker(destination, original_id)
+        window.start_scan(volume_id)
+        assert (destination / MARKER_NAME).exists() == has_marker
+        window.apply_queue_button.click()
+        wait_for_queue(lambda: window.operations_queue.jobs[-1].state in {"completed", "warning", "failed"})
+        job = window.operations_queue.jobs[-1]
+        assert job.state == "completed", job.detail
         volume = window.db.get_volume(volume_id)
         assert volume["identity_kind"] == MARKER_IDENTITY
-        assert read_drive_marker(destination) == volume["uuid"]
+        assert read_drive_marker(destination) == volume["identity_token"] == original_id
 
         reconnect = tmp_path / "Drive with new letter and GUID"
         clone = tmp_path / "Clone"

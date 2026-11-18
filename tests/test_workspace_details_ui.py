@@ -1,6 +1,7 @@
 """Selected-volume information and filters scoped to the file browser."""
 
 import os
+from threading import Event, get_ident
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -8,9 +9,9 @@ import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
-from jvvv.app import BackupDisplay, BrowserItem, MainWindow
+from jvvv.app import BackupDisplay, BrowserItem, MainWindow, VolumeConnections
 from jvvv.database import create_catalogue
-from jvvv.utils import format_size
+from jvvv.utils import VolumeSnapshot, format_size
 from test_catalogue_directory import populate
 
 
@@ -24,7 +25,7 @@ def window(monkeypatch, tmp_path):
     instance = MainWindow()
     path = tmp_path / "Archive.jvvv"
     db = create_catalogue(path)
-    instance._open_catalogue_in_window(db, path, None, connected_volume_snapshots=[])
+    instance._open_catalogue_in_window(db, path, None, volume_connections=VolumeConnections([], {}))
     yield instance
     instance.close()
     application.processEvents()
@@ -74,6 +75,59 @@ def test_selected_volume_uses_connected_location_and_clears_stale_information(wi
     assert all(label.text() == "-" for label in window.detail_labels.values())
     assert all(not label.toolTip() for label in window.detail_labels.values())
     assert window.detail_full.value() == 0
+
+
+def test_browsing_uses_saved_data_while_a_drive_probe_is_blocked(window, tmp_path, monkeypatch):
+    window.volume_connection_timer.stop()
+    volume = populated_volume(window, tmp_path)
+    mounted = tmp_path / "Mounted Drive"
+    mounted.mkdir()
+    snapshot = VolumeSnapshot(str(mounted), str(mounted), "", "test-device", "drive-1")
+    window.db.update_volume_location(volume["id"], volume["source_path"], snapshot.as_db_fields())
+
+    gui_thread = get_ident()
+    started = Event()
+    release = Event()
+    probes = []
+
+    def slow_probe():
+        assert get_ident() != gui_thread
+        probes.append(True)
+        started.set()
+        assert release.wait(5)
+        return [snapshot]
+
+    monkeypatch.setattr("jvvv.app.list_connected_volume_snapshots", slow_probe)
+    monkeypatch.setattr(
+        "jvvv.app.resolve_volume_source_path",
+        lambda *_: pytest.fail("Browsing should use cached connection information"),
+    )
+    window.check_connected_volumes()
+    try:
+        assert started.wait(5)
+        window.check_connected_volumes()
+        assert len(probes) == 1
+        window.refresh_volumes()
+        assert window.select_volume(volume["id"])
+        assert window.detail_labels["connection"].text() == "Offline"
+        assert window.folder_tree.topLevelItemCount() == 1
+
+        window.select_folder_path("Photos")
+        folder_id = window.current_folder_id
+        assert window.current_path_label.text() == "Photos"
+    finally:
+        release.set()
+
+    _, result = window._volume_connection_probe
+    result.result(timeout=5)
+    window.check_connected_volumes()
+    window.volume_connection_refresh_timer.stop()
+    window.refresh_after_connected_volumes_changed()
+    assert window.detail_labels["connection"].text() == "Connected"
+    assert window.detail_labels["path"].text() == str(mounted)
+    assert window.current_folder_id == folder_id
+    assert window.current_path_label.text() == "Photos"
+    assert window.offline_label.text() == ""
 
 
 def test_unscanned_volume_does_not_report_unknown_capacity_as_measured_zero(window, tmp_path, monkeypatch):

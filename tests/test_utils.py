@@ -42,6 +42,23 @@ def test_connected_volume_resolver_matches_identity_not_saved_path(tmp_path):
     assert resolver.resolve(current_drive_b) == str(mounted / "Archive")
 
 
+def test_connection_probe_checks_a_shared_saved_path_once(monkeypatch, tmp_path):
+    checked = []
+
+    def capture(path):
+        checked.append(path)
+        return None
+
+    monkeypatch.setattr(utils, "capture_volume_snapshot", capture)
+    resolver = utils.ConnectedVolumeResolver([])
+    path = str(tmp_path / "Last used drive letter")
+    for token in ("disconnected-drive-a", "disconnected-drive-b"):
+        assert resolver.resolve({
+            "source_path": path, "identity_kind": "test-device", "identity_token": token,
+        }) is None
+    assert checked == [path]
+
+
 def test_rename_volume_label_uses_the_volume_containing_the_source(monkeypatch):
     calls = []
 
