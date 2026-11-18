@@ -171,6 +171,18 @@ def test_audio_without_a_builtin_reader_explains_missing_ffprobe(tmp_path):
     assert result.message == "ffprobe was not available during this scan."
 
 
+def test_audio_only_mpeg_does_not_request_a_video_preview(monkeypatch, tmp_path):
+    path = tmp_path / "voice.mpeg"
+    path.write_bytes(b"audio placeholder")
+    payload = {"format": {"duration": "2.2"}, "streams": [
+        {"codec_type": "audio", "codec_name": "mp3", "sample_rate": "44100", "channels": 2},
+    ]}
+    monkeypatch.setattr(media_module.subprocess, "Popen",
+                        lambda *a, **kw: FinishedProcess(json.dumps(payload).encode()))
+    result = MediaMetadataExtractor("ffprobe", discover_ffprobe=False).inspect(path)
+    assert result.media_kind == "audio" and result.status == "complete"
+
+
 def test_ffprobe_uses_safe_argv_and_normalizes_selected_metadata(monkeypatch, tmp_path):
     path = tmp_path / "name beginning with spaces.mp4"
     path.write_bytes(b"video placeholder")

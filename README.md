@@ -60,6 +60,14 @@ JVVV. There is no server or cloud component.
   and silent H.264 MP4 proxies for videos, stored under a user-chosen directory
   and named by each file's content hash, algorithm, and preview profile so duplicates, renamed
   files, and several catalogues sharing one directory reuse a single preview.
+  On Python 3.12 or newer, scans and project archives use PyAV to seek to
+  preview frames when the video's timing and keyframe spacing allow it.
+  When exact seeking is expensive, JVVV can use a nearby keyframe within two
+  seconds of the intended sample. Adjacent samples can show the same frame.
+  The preview keeps its configured frame rate and duration.
+  JVVV falls back to its regular FFmpeg encoder for unsuitable files.
+  Recognized video containers include MXF, Insta360 INSV and MPEG transport streams.
+  Multi-camera files use the first video track for their preview.
   Every preview that could not be created is reported at the end of the scan.
 
 ## Installation
@@ -245,7 +253,8 @@ installed memory (at least 1 GiB) for other work and checks available memory as 
 reads. Preview staging uses the same memory policy and can spill to temporary
 storage under pressure. Complete buffered media files can start preview
 processing when the temporary workspace and preview store are on separate
-storage from the destination. Queue Manager shows the preparation progress.
+storage from the destination. During read-ahead, video previews use a temporary
+file so the same video only occupies one buffer in RAM. Queue Manager shows the preparation progress.
 The next project starts writing after the previous archive finishes successfully,
 then receives its own full read-back verification. If the earlier archive is
 paused or fails, the waiting project pauses too. Read-ahead is used when JVVV
@@ -261,8 +270,10 @@ existing source files with write and delete sharing disabled and stops if the
 source tree changes. Adding a new file through another app can trigger that stop.
 
 With offline previews enabled, JVVV reuses matching previews and makes missing
-ones in the background from temporary input captured during copying. The current
-decoders open a seekable temporary file. The archive destination, catalogue,
+ones in the background from bytes captured during copying. For videos that fit
+in available RAM, the media worker reads metadata and samples preview frames
+directly from that buffer. JVVV uses a temporary file when memory is tight or
+a decoder needs a file on disk. The archive destination, catalogue,
 preview store and temporary workspace must be outside the protected Q: drive.
 
 Choose **Window > Catalogue Settings > Catalogue hashing** before adding the first

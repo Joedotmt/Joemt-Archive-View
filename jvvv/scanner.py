@@ -474,7 +474,8 @@ class VolumeScanner:
                             and content_hash is not None
                             and previous["content_hash"] == content_hash
                             and str(previous["content_hash_algorithm"]).casefold() == self.hash_algorithm
-                            and previous["media_kind"] == media_kind
+                            and (previous["media_kind"] == media_kind
+                                 or (media_kind == "video" and previous["media_kind"] == "audio"))
                         )
                         reuse_media = preserve_previous_media and previous["status"] == "complete"
                         media_started = time.monotonic()
@@ -496,6 +497,7 @@ class VolumeScanner:
                         finally:
                             self.phase_seconds["media"] += time.monotonic() - media_started
                         if media_metadata is not None:
+                            media_kind = media_metadata.media_kind
                             if not reuse_media:
                                 self.db.replace_file_media_metadata(
                                     file_id,
@@ -756,6 +758,7 @@ class VolumeScanner:
                     f"{label} · {text}",
                 ),
                 expected_duration_ms=expected_duration_ms,
+                video_codec=media_metadata.video_codec if media_metadata else None,
                 source_stat=source_stat,
             )
         except PreviewCancelled as exc:

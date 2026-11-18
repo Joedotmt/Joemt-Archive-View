@@ -5,6 +5,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import ExitStack, closing, nullcontext
 from dataclasses import dataclass
+from importlib.util import find_spec
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,7 @@ from .drive_marker import MARKER_IDENTITY, read_drive_marker, write_drive_marker
 from .media_metadata import MediaInspectionCancelled, MediaMetadataExtractor, media_kind_for_extension
 from .preview_cache import PreviewCancelled
 from .preview_service import PreviewService, status_record_for
+from .shared_video import SharedVideo
 from .utils import capture_volume_snapshot, format_size, physical_disk_key, resolve_volume_source_path, snapshot_matches_volume
 
 
@@ -218,16 +220,26 @@ def _manifest(entries, check) -> str:
 
 
 class MediaInput:
-    """Stage media in available RAM and hand a seekable file to the decoder."""
+    """Keep the hashed input available to media workers, spilling to scratch as needed."""
 
-    def __init__(self, scratch: Path, suffix: str, size: int):
+    def __init__(self, scratch: Path, suffix: str, size: int, *, share_video=False, check=None):
         self.path = scratch / (uuid4().hex + suffix)
-        if shutil.disk_usage(scratch).free < size:
-            raise OSError(f"The temporary media cache needs {format_size(size)} of free space: {scratch}")
+        self.size = size
+        self.check = check
         headroom = archive_memory_headroom()
+        fits = size <= (FALLBACK_MEDIA_RAM if headroom is None else headroom)
+        self.shared = None
         self.blocks = deque()
-        self.stream = None if size <= (FALLBACK_MEDIA_RAM if headroom is None else headroom) else self.path.open("xb")
+        self.stream = None
         self.since_check = 0
+        if share_video and size and fits and find_spec("av"):
+            try:
+                self.shared = SharedVideo(size)
+                return
+            except (MemoryError, OSError, OverflowError):
+                fits = False
+        if not fits:
+            self._spill()
 
     def write(self, data) -> None:
         if self.stream is None:
@@ -237,6 +249,9 @@ class MediaInput:
                 headroom = archive_memory_headroom()
                 if headroom is not None and headroom < len(data):
                     self._spill()
+        if self.shared is not None:
+            self.shared.mapping.write(data)
+            return
         if self.stream is None:
             # Bytes from read-ahead can be shared; DestinationReader reuses its mutable buffer.
             try:
@@ -247,8 +262,22 @@ class MediaInput:
         self.stream.write(data)
 
     def _spill(self):
+        if shutil.disk_usage(self.path.parent).free < self.size:
+            raise OSError(f"The temporary media cache needs {format_size(self.size)} of free space: {self.path.parent}")
         self.stream = self.path.open("xb")
+        if self.shared is not None:
+            mapping = self.shared.mapping
+            count = mapping.tell()
+            with memoryview(mapping) as view:
+                for offset in range(0, count, CHUNK_SIZE):
+                    if self.check:
+                        self.check()
+                    self.stream.write(view[offset:min(offset + CHUNK_SIZE, count)])
+            self.shared.close()
+            self.shared = None
         while self.blocks:
+            if self.check:
+                self.check()
             self.stream.write(self.blocks.popleft())
 
     def materialize(self) -> Path:
@@ -258,6 +287,9 @@ class MediaInput:
         return self.path
 
     def close(self) -> None:
+        if self.shared is not None:
+            self.shared.close()
+            self.shared = None
         self.blocks.clear()
         if self.stream is not None:
             self.stream.close()
@@ -683,11 +715,12 @@ class ArchiveJob:
         with journal:
             journal.execute("INSERT OR REPLACE INTO files VALUES (?, ?)", (relative, digest))
 
-    @staticmethod
-    def _media_input(cache_root, entry):
+    def _media_input(self, cache_root, entry, *, read_ahead=False):
         suffix = PurePosixPath(entry.relative).suffix
-        if media_kind_for_extension(suffix) is not None:
-            return MediaInput(cache_root, suffix, entry.info.st_size)
+        kind = media_kind_for_extension(suffix)
+        if kind is not None:
+            return MediaInput(cache_root, suffix, entry.info.st_size,
+                             share_video=kind == "video" and not read_ahead, check=self._check)
         return None
 
     def _wait_for_destination(self):
@@ -767,7 +800,8 @@ class ArchiveJob:
                 break
             self.prefixes[entry.relative] = BufferedPrefix(blocks, count, hasher, opened.st_ctime_ns)
             if count == entry.info.st_size and media_worker_available():
-                cache = self._media_input(cache_root, entry)
+                # Reuse the immutable prefix blocks until the worker stages its input on disk.
+                cache = self._media_input(cache_root, entry, read_ahead=True)
                 if cache is not None:
                     try:
                         for block in blocks:
@@ -826,20 +860,35 @@ class ArchiveJob:
 
     def _inspect_media(self, entry, cache, digest, extractor, service):
         try:
-            path = cache.materialize()
+            self._check()
             extension = PurePosixPath(entry.relative).suffix
-            metadata = extractor.inspect(path, extension=extension, cancel_callback=self.cancelled)
-            kind = media_kind_for_extension(extension)
+            result = None
+            metadata = None
+            if cache.shared is not None:
+                if service is not None:
+                    preview = service.cache.preview_path("video", digest.hex())
+                    result, _ = service.existing_preview("video", preview)
+                metadata = extractor.inspect_shared_video(cache.shared, self.cancelled)
+            path = cache.path
+            if metadata is None or (metadata.status != "complete" and extractor.ffprobe_path):
+                path = cache.materialize()
+                inspected = extractor.inspect(path, extension=extension, cancel_callback=self.cancelled)
+                if metadata is None or metadata.status != "partial" or (inspected and inspected.status == "complete"):
+                    metadata = inspected
+            kind = metadata.media_kind if metadata is not None else media_kind_for_extension(extension)
             status = None
-            if service is not None and kind in {"image", "video"}:
+            if service is not None and kind in {"image", "video"} and result is None:
                 preview = service.cache.preview_path(kind, digest.hex())
                 check_archive_write_locations(self.guard.source, preview.parent)
                 result = service.ensure_preview(
                     media_kind=kind, source=path, content_hash=digest, relative_path=entry.relative,
                     source_name=PurePosixPath(entry.relative).name, volume_id=0,
-                    cancel_callback=self.cancelled, source_stat=path.stat(),
+                    cancel_callback=self.cancelled, source_stat=None if cache.shared is not None else path.stat(),
+                    staged_video=cache if cache.shared is not None else None,
                     expected_duration_ms=metadata.duration_ms if metadata is not None else None,
+                    video_codec=metadata.video_codec if metadata else None,
                 )
+            if result is not None and kind in {"image", "video"}:
                 status = status_record_for(result, digest, self.algorithm)
             return metadata.as_db_values() if metadata is not None else None, status
         except (PreviewCancelled, MediaInspectionCancelled) as exc:

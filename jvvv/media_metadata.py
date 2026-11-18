@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from .shared_video import SharedVideo, video_worker_command
+
 
 # Common bitmap formats decoded by Pillow.
 STANDARD_IMAGE_EXTENSIONS = frozenset(
@@ -54,7 +56,8 @@ AUDIO_EXTENSIONS = frozenset(
     {"aac", "flac", "m4a", "mp3", "ogg", "wav", "wave", "wma"}
 )
 VIDEO_EXTENSIONS = frozenset(
-    {"avi", "m4v", "mkv", "mov", "mp4", "webm", "wmv"}
+    {"3g2", "3gp", "avi", "flv", "insv", "m2t", "m2ts", "m2v", "m4v", "mkv",
+     "mov", "mp4", "mpeg", "mpg", "mts", "mxf", "ogv", "ts", "vob", "webm", "wmv"}
 )
 
 MEDIA_STATUSES = frozenset({"complete", "partial", "unavailable", "failed"})
@@ -267,6 +270,15 @@ class MediaMetadataExtractor:
             "-i",
             os.fspath(path),
         ]
+        return self._run_probe(command, media_kind, "ffprobe", cancel_callback)
+
+    def inspect_shared_video(self, shared: SharedVideo, cancel_callback: CancelCallback | None) -> MediaMetadata:
+        command = [*video_worker_command(), *shared.reader_arguments(), "--probe"]
+        return self._run_probe(command, "video", "PyAV", cancel_callback)
+
+    def _run_probe(
+        self, command: list[str], media_kind: str, backend: str, cancel_callback: CancelCallback | None,
+    ) -> MediaMetadata:
         popen_options: dict[str, object] = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
@@ -282,8 +294,8 @@ class MediaMetadataExtractor:
             return MediaMetadata(
                 status="unavailable",
                 media_kind=media_kind,
-                source="ffprobe",
-                message=_detail(f"ffprobe could not be started: {exc}"),
+                source=backend,
+                message=_detail(f"{backend} could not be started: {exc}"),
             )
 
         deadline = time.monotonic() + self.ffprobe_timeout_seconds
@@ -297,9 +309,9 @@ class MediaMetadataExtractor:
                 return MediaMetadata(
                     status="failed",
                     media_kind=media_kind,
-                    source="ffprobe",
+                    source=backend,
                     message=(
-                        "ffprobe timed out after "
+                        f"{backend} timed out after "
                         f"{self.ffprobe_timeout_seconds:g} seconds."
                     ),
                 )
@@ -313,19 +325,19 @@ class MediaMetadataExtractor:
                 return MediaMetadata(
                     status="failed",
                     media_kind=media_kind,
-                    source="ffprobe",
-                    message=_detail(f"ffprobe communication failed: {exc}"),
+                    source=backend,
+                    message=_detail(f"{backend} communication failed: {exc}"),
                 )
 
         _raise_if_cancelled(cancel_callback)
         stdout_text = _decode_process_output(stdout)
         stderr_text = _decode_process_output(stderr)
         if process.returncode != 0:
-            detail = stderr_text or f"ffprobe exited with code {process.returncode}."
+            detail = stderr_text or f"{backend} exited with code {process.returncode}."
             return MediaMetadata(
                 status="failed",
                 media_kind=media_kind,
-                source="ffprobe",
+                source=backend,
                 message=_detail(detail),
             )
 
@@ -335,17 +347,17 @@ class MediaMetadataExtractor:
             return MediaMetadata(
                 status="failed",
                 media_kind=media_kind,
-                source="ffprobe",
-                message=_detail(f"ffprobe returned invalid metadata: {exc}"),
+                source=backend,
+                message=_detail(f"{backend} returned invalid metadata: {exc}"),
             )
         if not isinstance(payload, Mapping):
             return MediaMetadata(
                 status="failed",
                 media_kind=media_kind,
-                source="ffprobe",
-                message="ffprobe returned metadata in an unexpected format.",
+                source=backend,
+                message=f"{backend} returned metadata in an unexpected format.",
             )
-        return _metadata_from_ffprobe(payload, media_kind)
+        return _metadata_from_ffprobe(payload, media_kind, backend)
 
 def _inspect_image(
     path: Path,
@@ -429,7 +441,7 @@ def _inspect_wave(
     )
 
 
-def _metadata_from_ffprobe(payload: Mapping[str, object], media_kind: str) -> MediaMetadata:
+def _metadata_from_ffprobe(payload: Mapping[str, object], media_kind: str, backend: str = "ffprobe") -> MediaMetadata:
     raw_format = payload.get("format")
     format_values = raw_format if isinstance(raw_format, Mapping) else {}
     container = _clean_optional_text(format_values.get("format_name"))
@@ -469,6 +481,11 @@ def _metadata_from_ffprobe(payload: Mapping[str, object], media_kind: str) -> Me
             if channels is None:
                 channels = _positive_int(raw_stream.get("channels"))
 
+    # MPEG and MP4 containers can also hold only audio.
+    if media_kind == "video" and audio_codecs and not any(
+        isinstance(stream, Mapping) and stream.get("codec_type") == "video" for stream in streams
+    ):
+        media_kind = "audio"
     if duration_ms is None and stream_durations:
         duration_ms = max(stream_durations)
     if bit_rate is None and stream_bit_rates:
@@ -500,13 +517,13 @@ def _metadata_from_ffprobe(payload: Mapping[str, object], media_kind: str) -> Me
     status = "complete" if complete else "partial" if facts_present else "failed"
     message = ""
     if status == "partial":
-        message = "ffprobe returned only part of the expected media metadata."
+        message = f"{backend} returned only part of the expected media metadata."
     elif status == "failed":
-        message = "ffprobe did not report recognizable media metadata."
+        message = f"{backend} did not report recognizable media metadata."
     return MediaMetadata(
         status=status,
         media_kind=media_kind,
-        source="ffprobe",
+        source=backend,
         container_format=container,
         duration_ms=duration_ms,
         width=width,

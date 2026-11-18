@@ -288,6 +288,7 @@ class FakeFfmpeg:
         self.calls: list[FakeProcess] = []
         self.factory = factory
         self.defaults = defaults
+        monkeypatch.setattr(video_module, "find_spec", lambda _: None)
         monkeypatch.setattr(video_module.subprocess, "Popen", self)
 
     def __call__(self, args, **kwargs):
@@ -1409,6 +1410,243 @@ def test_real_generate_does_not_upscale_small_source(real_ffmpeg, tmp_path):
     assert 2400 <= validation.duration_ms <= 3600
     assert validation.video_codec == "h264"
     assert files_under(cache.root) == [destination]
+
+
+@pytest.fixture
+def prores_source(real_ffmpeg, tmp_path):
+    pytest.importorskip("av", minversion="19")
+    clip = tmp_path / "camera.mov"
+    # A different luma value on each frame makes off-by-one seeks visible.
+    subprocess.run([
+        real_ffmpeg, "-v", "error", "-f", "lavfi", "-i",
+        "testsrc2=s=160x90:r=30000/1001,geq=lum='30+mod(N*37,160)':cb='90+60*gt(X,W/2)':cr=175",
+        "-frames:v", "77", "-c:v", "prores_ks", "-pix_fmt", "yuv422p10le",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", str(clip),
+    ], check=True, timeout=60)
+    return clip
+
+
+@pytest.mark.parametrize("hint,fps", [("prores", 1), (None, 2.5)])
+def test_prores_seeks_preserve_frames_colour_and_timing(real_ffmpeg, prores_source, tmp_path, hint, fps):
+    compare_sampled_preview(real_ffmpeg, prores_source, tmp_path, fps, hint)
+
+
+@pytest.mark.parametrize("mode", ["generate and reuse", "fallback", "probe fallback", "low memory", "cancel"])
+def test_archive_staged_video_worker(real_ffmpeg, prores_source, tmp_path, monkeypatch, mode):
+    from types import SimpleNamespace
+    from jvvv.archive_job import ArchiveJob, ArchivePaused, ProjectEntry
+    from jvvv.media_metadata import MediaMetadata, MediaMetadataExtractor
+    from jvvv.preview_config import PreviewSettings
+    from jvvv.preview_service import PreviewService
+
+    store = tmp_path / "previews"
+    store.mkdir()
+    service = PreviewService(PreviewSettings(enabled=True, root_directory=str(store)), ffmpeg_path=real_ffmpeg)
+    job = ArchiveJob(SimpleNamespace(hash_algorithm="sha256"))
+    job.guard = SimpleNamespace(source=prores_source.parent / "protected-project", check=lambda: None)
+    entry = ProjectEntry(prores_source.name, prores_source.stat(), False)
+    data = prores_source.read_bytes()
+    digest = hashlib.sha256(data).digest()
+    extractor = MediaMetadataExtractor(discover_ffprobe=False)
+    if mode == "probe fallback":
+        ffprobe = Path(real_ffmpeg).with_name("ffprobe" + Path(real_ffmpeg).suffix)
+        if not ffprobe.is_file():
+            pytest.skip("No ffprobe alongside the test FFmpeg")
+        extractor = MediaMetadataExtractor(ffprobe_path=ffprobe)
+        monkeypatch.setattr(extractor, "inspect_shared_video", lambda *_: MediaMetadata("failed", "video"))
+    if mode == "low memory":
+        monkeypatch.setattr("jvvv.archive_job.archive_memory_headroom", lambda: 0)
+    original = service.video_generator._run_encoder
+    commands = []
+    def encode(command, cancel, *args):
+        commands.append(command)
+        if mode == "cancel":
+            return original(command, lambda: True, *args)
+        if mode == "fallback" and "--shared-video" in command:
+            raise PreviewError(STAGE_FFMPEG_EXIT, "Unsupported sampled layout")
+        return original(command, cancel, *args)
+    monkeypatch.setattr(service.video_generator, "_run_encoder", encode)
+    for _ in range(2 if mode == "generate and reuse" else 1):
+        staged = job._media_input(tmp_path, entry)
+        if mode == "low memory":
+            assert staged.shared is None and staged.path.is_file()
+        elif staged.shared is None:
+            staged.close()
+            pytest.skip("Platform does not provide shared video input")
+        mapping = staged.shared.mapping if staged.shared is not None else None
+        staged.write(data)
+        if mode in {"generate and reuse", "cancel"}:
+            monkeypatch.setattr(staged, "materialize", lambda: pytest.fail("Unnecessary full-size scratch file"))
+        if mode == "cancel":
+            with pytest.raises(ArchivePaused):
+                job._inspect_media(entry, staged, digest, extractor, service)
+        else:
+            facts, status = job._inspect_media(entry, staged, digest, extractor, service)
+            if mode == "low memory":
+                assert facts["status"] == "unavailable"  # No ffprobe in this fixture.
+            else:
+                backend = "ffprobe" if mode == "probe fallback" else "PyAV"
+                assert (facts["source"], facts["video_codec"], facts["width"]) == (backend, "prores", 160)
+            assert status["status"] == "available"
+        assert (mapping is None or mapping.closed) and not staged.path.exists()
+    if mode in {"low memory", "probe fallback"}:
+        assert str(staged.path) in commands[0] and "--shared-video" not in commands[0]
+        return
+    assert "--shared-video" in commands[0]
+    if mode == "fallback":
+        assert len(commands) == 2 and str(staged.path) in commands[1]
+    elif mode == "cancel":
+        assert not list(store.rglob("*.mp4")) and len(commands) == 1
+    else:
+        assert len(commands) == 1 and service.statistics.video_reused == 1
+
+
+@pytest.mark.parametrize("suffix,options", [
+    (".mp4", ["-c:v", "libx264", "-g", "5", "-bf", "2"]),
+    (".mp4", ["-c:v", "libx265", "-x265-params", "keyint=5:bframes=2:pools=1"]),
+    (".mkv", ["-c:v", "ffv1"]),
+    (".avi", ["-c:v", "mjpeg", "-pix_fmt", "yuvj422p"]),
+    (".mov", ["-c:v", "prores_ks", "-profile:v", "4", "-pix_fmt", "yuva444p10le"]),
+    (".mov", ["-c:v", "qtrle", "-pix_fmt", "argb"]),
+    (".ts", ["-c:v", "mpeg2video", "-g", "3", "-bf", "0"]),
+    (".insv", ["-c:v", "libx264", "-g", "1", "-f", "mp4"]),
+    (".mp4", ["-vf", "select='not(eq(mod(n,7),1))'", "-fps_mode", "vfr", "-c:v", "libx264", "-g", "1"]),
+])
+def test_sampled_codecs_match_full_decode(real_ffmpeg, tmp_path, suffix, options):
+    pytest.importorskip("av", minversion="19")
+    source = tmp_path / ("camera" + suffix)
+    subprocess.run([
+        real_ffmpeg, "-v", "error", "-f", "lavfi", "-i",
+        "testsrc2=s=160x90:r=25:d=4.6,geq=lum='30+mod(N*37,160)':cb=90:cr=175",
+        *options, str(source),
+    ], check=True, capture_output=True, timeout=60)
+    compare_sampled_preview(real_ffmpeg, source, tmp_path, 1)
+
+
+def compare_sampled_preview(real_ffmpeg, source, tmp_path, fps, hint=None):
+    import av
+    import numpy as np
+
+    profile = VideoPreviewProfile(fps=fps, max_height=120)
+    cache = PreviewCache(tmp_path / "previews", ImagePreviewProfile(), profile)
+    reference = tmp_path / "reference.mp4"
+    subprocess.run(build_ffmpeg_arguments(real_ffmpeg, source, reference, profile, progress=False),
+                   check=True, capture_output=True, timeout=60)
+    destination = tmp_path / "sampled.mp4"
+    # A fallback would fail the test.
+    reports = []
+    VideoPreviewGenerator(cache, "no-fallback-encoder").generate(
+        source, destination, video_codec=hint,
+        progress_callback=lambda fraction, ms: reports.append(ms),
+    )
+    assert reports and reports[-1] > 0
+    with av.open(str(destination)) as actual, av.open(str(reference)) as expected:
+        a, b = actual.streams.video[0], expected.streams.video[0]
+        assert a.frames == b.frames > 1
+        assert a.duration * a.time_base == b.duration * b.time_base
+        assert (a.width, a.height, a.sample_aspect_ratio) == (b.width, b.height, b.sample_aspect_ratio)
+        assert (a.color_range, a.colorspace, a.color_primaries, a.color_trc) == (
+            b.color_range, b.colorspace, b.color_primaries, b.color_trc,
+        )
+        for left, right in zip(actual.decode(a), expected.decode(b), strict=True):
+            assert left.pts * left.time_base == right.pts * right.time_base
+            delta = left.to_ndarray(format="rgb24").astype(np.int16) - right.to_ndarray(format="rgb24")
+            assert np.abs(delta).mean() < 3
+
+
+def test_rotated_prores_sampling_keeps_portrait_orientation(real_ffmpeg, prores_source, tmp_path):
+    rotated = tmp_path / "rotated.mov"
+    subprocess.run([real_ffmpeg, "-v", "error", "-display_rotation", "90", "-i", str(prores_source),
+                    "-c", "copy", str(rotated)], check=True, timeout=60)
+    compare_sampled_preview(real_ffmpeg, rotated, tmp_path, 1)
+
+
+def test_sparse_keyframes_use_normal_encoder(real_ffmpeg, cache, tmp_path, monkeypatch):
+    pytest.importorskip("av", minversion="19")
+    source = tmp_path / "long-gop.mp4"
+    subprocess.run([real_ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=160x90:r=25:d=6",
+                    "-c:v", "libx264", "-x264-params", "keyint=250:scenecut=0", str(source)],
+                   check=True, timeout=60)
+    generator = VideoPreviewGenerator(cache, real_ffmpeg)
+    run = generator._run_encoder
+    commands = []
+
+    def record(command, *args):
+        commands.append(command[0])
+        return run(command, *args)
+
+    monkeypatch.setattr(generator, "_run_encoder", record)
+    result = generator.generate(source, tmp_path / "preview.mp4")
+    assert commands == [sys.executable, real_ffmpeg]
+    assert result.duration_ms == 6000
+
+
+@pytest.mark.parametrize("codec,params", [
+    ("libx264", ["-x264-params", "keyint=25:min-keyint=25:scenecut=0:bframes=2"]),
+    ("libx265", ["-x265-params", "keyint=75:min-keyint=75:scenecut=0:bframes=2:pools=1"]),
+])
+def test_nearby_keyframes_stay_inside_tolerance(real_ffmpeg, cache, tmp_path, codec, params):
+    av = pytest.importorskip("av", minversion="19")
+    from fractions import Fraction
+    from jvvv.sampled_preview import _sample_frames
+
+    source = tmp_path / "long-gop.mp4"
+    subprocess.run([real_ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=160x90:r=25:d=5",
+                    "-c:v", codec, *params, str(source)], check=True, capture_output=True, timeout=60)
+    with av.open(str(source)) as original:
+        video = original.streams.video[0]
+        frames = list(_sample_frames(original, video, Fraction(1)))
+        assert len(frames) == 5
+        assert all(frame.key_frame and not frame.is_corrupt for frame in frames)
+        times = [f.pts * video.time_base for f in frames]
+        assert times == sorted(times)
+        key_times = [0, 1, 2, 3, 4] if codec == "libx264" else [0, 3]
+        for i, selected in enumerate(times):
+            target = i + Fraction(12, 25)
+            assert selected == min(key_times, key=lambda value: abs(value - target))
+            assert abs(selected - target) <= 2
+    result = VideoPreviewGenerator(cache, "no-fallback").generate(source, tmp_path / "sampled.mp4")
+    assert result.duration_ms == 5000
+
+
+def test_camera_clean_aperture_keeps_the_intended_pixels():
+    av = pytest.importorskip("av", minversion="19")
+    import numpy as np
+    from fractions import Fraction
+    from types import SimpleNamespace
+    from jvvv.sampled_preview import _filter_graph, _visible_area
+
+    pixels = np.arange(24 * 32, dtype=np.uint8).reshape(24, 32)
+    frame = av.VideoFrame.from_ndarray(pixels, format="gray")
+    frame.time_base = Fraction(1, 25)
+    stream = SimpleNamespace(width=32, height=24, format=frame.format, time_base=frame.time_base,
+                             codec_context=SimpleNamespace(coded_side_data={
+                                 "frame_cropping": struct.pack("<4I", 3, 5, 4, 8),
+                             }))
+    width, height, _, filters = _visible_area(stream)
+    graph = _filter_graph(frame, filters)
+    assert (width, height) == (20, 16)
+    graph.push(frame)
+    np.testing.assert_array_equal(graph.pull().to_ndarray(), pixels[3:19, 4:24])
+
+
+@pytest.mark.parametrize("failure", [PreviewCancelled("cancelled"), PreviewError(STAGE_DISK_FULL, "full")])
+def test_prores_cancellation_and_full_disk_do_not_retry(cache, source, tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(video_module, "find_spec", lambda _: True)
+    generator = VideoPreviewGenerator(cache, "ffmpeg")
+    calls = []
+
+    def fail(command, *_args):
+        calls.append(command)
+        Path(command[3]).write_bytes(b"partial")
+        raise failure
+
+    monkeypatch.setattr(generator, "_run_encoder", fail)
+    destination = tmp_path / "output.mp4"
+    with pytest.raises(type(failure)):
+        generator.generate(source, destination, video_codec="prores")
+    assert len(calls) == 1
+    assert not destination.exists() and not Path(calls[0][3]).exists()
 
 
 def test_real_generate_undecodable_source_is_a_visible_ffmpeg_exit(real_ffmpeg, cache, tmp_path):

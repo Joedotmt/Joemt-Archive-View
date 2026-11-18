@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 dependencies = [
   "PySide6>=6.6",
   "Pillow>=11.0",
+  "av>=19; python_version >= '3.12'",
   "pillow-heif>=1.0",
   "rawpy>=0.24",
   "numpy>=1.26",

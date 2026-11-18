@@ -998,6 +998,25 @@ class PreviewService:
         )
 
     # -- main entry point ----------------------------------------------------
+    def existing_preview(self, media_kind, destination):
+        """Return a validated cache hit or the reason an existing file is corrupt."""
+        try:
+            exists = destination.is_file()
+        except OSError:
+            exists = False
+        if not exists:
+            return None, None
+        validation = (validate_image_preview(destination) if media_kind == "image"
+                      else validate_video_preview(destination))
+        if not validation.valid:
+            return None, validation.message
+        self._count(media_kind, "reused")
+        return PreviewResult(
+            status=PREVIEW_REUSED, media_kind=media_kind, profile_id=self.cache.profile_id(media_kind),
+            path=destination, size_bytes=int(validation.size_bytes), width=validation.width,
+            height=validation.height, duration_ms=getattr(validation, "duration_ms", None),
+        ), None
+
     def ensure_preview(
         self,
         *,
@@ -1011,7 +1030,9 @@ class PreviewService:
         cancel_callback: CancelCallback | None = None,
         progress_callback: Callable[[str], None] | None = None,
         expected_duration_ms: int | None = None,
+        video_codec: str | None = None,
         source_stat: os.stat_result | None = None,
+        staged_video=None,
     ) -> PreviewResult:
         """Return the explicit outcome for one hashed, stable source file.
 
@@ -1047,37 +1068,10 @@ class PreviewService:
             raise PreviewCancelled("Preview generation cancelled.")
 
         replaced_corrupt = False
-        try:
-            existing = destination.is_file()
-        except OSError:
-            existing = False
-        if existing:
-            if media_kind == "image":
-                image_validation = validate_image_preview(destination)
-                valid = image_validation.valid
-                width, height = image_validation.width, image_validation.height
-                duration_ms = None
-                size_bytes = image_validation.size_bytes
-                reason = image_validation.message
-            else:
-                video_validation = validate_video_preview(destination)
-                valid = video_validation.valid
-                width, height = video_validation.width, video_validation.height
-                duration_ms = video_validation.duration_ms
-                size_bytes = video_validation.size_bytes
-                reason = video_validation.message
-            if valid:
-                self._count(media_kind, "reused")
-                return PreviewResult(
-                    status=PREVIEW_REUSED,
-                    media_kind=media_kind,
-                    profile_id=profile_id,
-                    path=destination,
-                    size_bytes=int(size_bytes),
-                    width=width,
-                    height=height,
-                    duration_ms=duration_ms,
-                )
+        reused, reason = self.existing_preview(media_kind, destination)
+        if reused:
+            return reused
+        if reason is not None:
             if self.statistics.storage_unavailable_reason is not None:
                 # Spec §11 asks for the corrupt file to be logged; it cannot be
                 # regenerated now, so it is skipped like any other candidate.
@@ -1157,6 +1151,8 @@ class PreviewService:
                     cancel_callback=cancel_callback,
                     progress_callback=_video_progress_adapter(progress_callback),
                     expected_duration_ms=expected_duration_ms,
+                    video_codec=video_codec,
+                    **({"staged_video": staged_video} if staged_video is not None else {}),
                     source_stat=source_stat,
                 )
         except PreviewCancelled:

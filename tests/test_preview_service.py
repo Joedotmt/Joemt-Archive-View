@@ -223,6 +223,7 @@ class FakeGenerator:
         cancel_callback=None,
         progress_callback=None,
         expected_duration_ms: int | None = None,
+        video_codec=None,
         source_stat=None,
     ) -> PreviewResult:
         self.calls.append(

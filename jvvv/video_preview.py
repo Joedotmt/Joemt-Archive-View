@@ -27,9 +27,12 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator
 
+from jvvv.media_metadata import VIDEO_EXTENSIONS
+from jvvv.shared_video import video_worker_command
 from jvvv.preview_cache import (
     ensure_source_snapshot,
     PREVIEW_GENERATED,
@@ -826,7 +829,9 @@ class VideoPreviewGenerator:
         cancel_callback: CancelCallback | None = None,
         progress_callback: ProgressCallback | None = None,
         expected_duration_ms: int | None = None,
+        video_codec: str | None = None,
         source_stat: os.stat_result | None = None,
+        staged_video=None,
     ) -> PreviewResult:
         """Encode ``source`` into ``destination`` atomically.
 
@@ -838,35 +843,80 @@ class VideoPreviewGenerator:
         """
 
         _raise_if_cancelled(cancel_callback)
-        before = _lstat_source(source)
-        ensure_source_snapshot(source, before, source_stat)
+        # Archive inputs contain exactly the bytes that fed the hasher and are
+        # privately owned by this worker until generation finishes.
+        before = None
+        if staged_video is None:
+            before = _lstat_source(source)
+            ensure_source_snapshot(source, before, source_stat)
         self.cache.ensure_parent(destination)
         temp_path = self.cache.temporary_path(destination)
         try:
-            return self._encode(
-                source,
-                destination,
-                temp_path,
-                before,
-                cancel_callback,
-                progress_callback,
-                expected_duration_ms,
+            try_sampling = bool(video_codec) or source.suffix.lower().lstrip(".") in VIDEO_EXTENSIONS
+            # On short, small inputs a sequential pass commonly finishes in
+            # the time it takes to launch the sampler and inspect the index.
+            small_clip = (
+                expected_duration_ms is not None and 0 < expected_duration_ms <= 10_000
+                and before is not None and before.st_size <= 8 * 1024 * 1024
+            )
+            sample_first = staged_video is not None or (try_sampling and not small_clip and find_spec("av"))
+            for sampled in ((True, False) if sample_first else (False,)):
+                if sampled:
+                    inputs = staged_video.shared.reader_arguments() if staged_video is not None else [str(source)]
+                    command = [
+                        *video_worker_command(), *inputs, str(temp_path), self.profile.fps_text,
+                        str(self.profile.max_height), str(self.profile.crf), self.profile.preset,
+                    ]
+                else:
+                    if staged_video is not None:
+                        source = staged_video.materialize()
+                        before = _lstat_source(source)
+                    command = build_ffmpeg_arguments(self.ffmpeg_path, source, temp_path, self.profile)
+                try:
+                    stderr_tail = self._run_encoder(
+                        command, cancel_callback, progress_callback, expected_duration_ms,
+                    )
+                    _raise_if_cancelled(cancel_callback)
+                    if before is not None:
+                        _ensure_source_unchanged(source, before)
+                    validation = validate_video_preview(temp_path)
+                    if not validation.valid:
+                        raise PreviewError(STAGE_VIDEO_VALIDATE, validation.message, detail=stderr_tail)
+                    break
+                except PreviewError as exc:
+                    if not sampled or exc.stage not in {
+                        STAGE_FFMPEG_EXIT, STAGE_FFMPEG_START, STAGE_FFMPEG_TIMEOUT, STAGE_VIDEO_VALIDATE,
+                    }:
+                        raise
+                    self.cache.discard_temporary(temp_path)
+                    _raise_if_cancelled(cancel_callback)
+                    if before is not None:
+                        _ensure_source_unchanged(source, before)
+            self.cache.publish(temp_path, destination)
+            try:
+                size = int(destination.stat().st_size)
+            except OSError as exc:
+                raise PreviewError(
+                    classify_os_error(exc, STAGE_RENAME),
+                    "The finished preview could not be read back.",
+                    detail=os_error_detail(exc),
+                ) from exc
+            return PreviewResult(
+                status=PREVIEW_GENERATED, media_kind="video", profile_id=self.profile_id,
+                path=destination, bytes_written=size, size_bytes=size,
+                width=validation.width, height=validation.height, duration_ms=validation.duration_ms,
             )
         except BaseException:
             self.cache.discard_temporary(temp_path)
             raise
 
-    def _encode(
+    def _run_encoder(
         self,
-        source: Path,
-        destination: Path,
-        temp_path: Path,
-        before: os.stat_result,
+        arguments: list[str],
         cancel_callback: CancelCallback | None,
         progress_callback: ProgressCallback | None,
         expected_duration_ms: int | None,
-    ) -> PreviewResult:
-        arguments = build_ffmpeg_arguments(self.ffmpeg_path, source, temp_path, self.profile)
+    ) -> str:
         try:
             process = subprocess.Popen(arguments, **_popen_options())
         except (OSError, ValueError) as exc:
@@ -932,33 +982,7 @@ class VideoPreviewGenerator:
                 "FFmpeg could not write the preview because the disk is full.",
                 detail=stderr_tail,
             )
-        _raise_if_cancelled(cancel_callback)
-        _ensure_source_unchanged(source, before)
-
-        validation = validate_video_preview(temp_path)
-        if not validation.valid:
-            raise PreviewError(STAGE_VIDEO_VALIDATE, validation.message, detail=stderr_tail)
-
-        self.cache.publish(temp_path, destination)
-        try:
-            size = int(destination.stat().st_size)
-        except OSError as exc:
-            raise PreviewError(
-                classify_os_error(exc, STAGE_RENAME),
-                "The finished preview could not be read back.",
-                detail=os_error_detail(exc),
-            ) from exc
-        return PreviewResult(
-            status=PREVIEW_GENERATED,
-            media_kind="video",
-            profile_id=self.profile_id,
-            path=destination,
-            bytes_written=size,
-            size_bytes=size,
-            width=validation.width,
-            height=validation.height,
-            duration_ms=validation.duration_ms,
-        )
+        return stderr_tail
 
 
 def test_video_encode(

@@ -75,6 +75,41 @@ def test_pressure_limits_read_ahead_and_releases_optional_data_while_waiting(tmp
     assert not job.prefixes
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_shared_video_spills_prefix_and_releases_mapping(tmp_path, monkeypatch, cancel):
+    pytest.importorskip("av")
+    headroom = 4096
+    monkeypatch.setattr(archive_job, "archive_memory_headroom", lambda: headroom)
+    monkeypatch.setattr(archive_job, "MEMORY_RECHECK_BYTES", 1)
+    monkeypatch.setattr(archive_job, "CHUNK_SIZE", 2)
+    def check():
+        if cancel:
+            raise ArchivePaused()
+    cache = archive_job.MediaInput(tmp_path, ".mov", 10, share_video=True, check=check)
+    if cache.shared is None:
+        cache.close()
+        pytest.skip("Platform does not provide shared video input")
+    mapping = cache.shared.mapping
+    try:
+        block = bytearray(b"first")
+        cache.write(block)
+        block[:] = b"other"
+        with pytest.raises(ValueError, match="incomplete"):
+            cache.shared.reader_arguments()
+        assert not cache.path.exists()
+        headroom = 0
+        if cancel:
+            with pytest.raises(ArchivePaused):
+                cache.write(b"-last")
+        else:
+            cache.write(b"-last")
+            assert mapping.closed and cache.shared is None
+            assert cache.materialize().read_bytes() == b"first-last"
+    finally:
+        cache.close()
+    assert mapping.closed and not cache.path.exists()
+
+
 @pytest.fixture
 def index_volume(monkeypatch):
     """Model separate mounted drive roots with disposable folders."""
@@ -143,6 +178,48 @@ def test_verified_copy_keeps_source_and_catalogues_destination(tmp_path, project
         assert db.get_file(indexed_file["id"]) == indexed_file
         assert pending_archive(db.path) is None
         assert not list(destination.glob("*.partial"))
+    finally:
+        db.close()
+
+
+def test_read_ahead_previews_video_without_a_second_ram_copy(tmp_path, project, index_volume, monkeypatch):
+    from preview_fixtures import real_ffmpeg_path, write_source_mp4
+    from jvvv.video_preview import validate_video_preview
+
+    ffmpeg = real_ffmpeg_path()
+    if not ffmpeg:
+        pytest.skip("Requires FFmpeg to generate a preview")
+    source, destination = project
+    clip = write_source_mp4(source / "clip.mp4")
+    previews = tmp_path / "previews"
+    previews.mkdir()
+    ready = Future()
+    settings = PreviewSettings(enabled=True, root_directory=str(previews), ffmpeg_path=ffmpeg)
+    db = create_catalogue(tmp_path / "Archive.jvvv")
+    try:
+        volume = index_volume(db, destination)
+        job = ArchiveJob(db, preview_settings=settings, destination_ready=ready)
+        monkeypatch.setattr(archive_job, "physical_disk_key", lambda path: (7, 2 if path == destination else 1))
+        monkeypatch.setattr(archive_job, "archive_memory_headroom", lambda: 8 * 1024**2)
+        monkeypatch.setattr(archive_job, "SharedVideo", lambda *_: pytest.fail("Duplicate video allocation"))
+        inspect = job._inspect_media
+        def inspect_before_release(entry, cache, digest, extractor, service):
+            try:
+                assert not ready.done()
+                assert job.prefixes[entry.relative].size == clip.stat().st_size
+                result = inspect(entry, cache, digest, extractor, service)
+                assert result[1]["status"] == "available"
+                assert not cache.path.exists()
+                return result
+            finally:
+                ready.set_result(True)
+
+        monkeypatch.setattr(job, "_inspect_media", inspect_before_release)
+        monkeypatch.setattr(job, "_wait_for_destination", lambda: ready.result(timeout=15))
+        result = job.run(source, volume)
+        assert (result.path / clip.name).read_bytes() == clip.read_bytes()
+        preview, = previews.rglob("*.mp4")
+        assert validate_video_preview(preview).valid
     finally:
         db.close()
 

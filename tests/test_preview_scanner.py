@@ -159,6 +159,7 @@ class FakeVideoGenerator:
         self.profile_id = cache.profile_id("video")
         self.calls: list[Path] = []
         self.expected_durations: list[int | None] = []
+        self.codecs: list[str | None] = []
 
     def generate(
         self,
@@ -168,10 +169,12 @@ class FakeVideoGenerator:
         cancel_callback=None,
         progress_callback=None,
         expected_duration_ms=None,
+        video_codec=None,
         source_stat=None,
     ) -> PreviewResult:
         self.calls.append(Path(source))
         self.expected_durations.append(expected_duration_ms)
+        self.codecs.append(video_codec)
         destination = Path(destination)
         self.cache.ensure_parent(destination)
         temp_path = self.cache.temporary_path(destination)
@@ -224,6 +227,7 @@ class FailingVideoGenerator:
         cancel_callback=None,
         progress_callback=None,
         expected_duration_ms=None,
+        video_codec=None,
         source_stat=None,
     ):
         self.calls.append(Path(source))
@@ -283,6 +287,7 @@ class ExitingFfmpeg:
         self.returncode = returncode
         self.stderr = stderr
         self.calls: list[ExitingFfmpegProcess] = []
+        monkeypatch.setattr(video_module, "find_spec", lambda _: None)
         monkeypatch.setattr(video_module.subprocess, "Popen", self)
 
     def __call__(self, args, **kwargs):
@@ -494,6 +499,7 @@ def test_enabled_previews_generate_images_and_videos(catalogue, source, tmp_path
 
     # The scanner passes the media duration so FFmpeg progress can be a percentage.
     assert service.video_generator.expected_durations == [VIDEO_DURATION_MS]
+    assert service.video_generator.codecs == ["h264"]
     assert [path.name for path in service.image_generator.calls] == ["alpha.png", "beta.jpg"]
 
     history = catalogue.list_scan_history(volume_id)[0]
@@ -1244,12 +1250,14 @@ def test_audio_files_get_no_preview_status_row(catalogue, source, tmp_path):
 # ---------------------------------------------------------------------------
 # Optional: the real FFmpeg
 # ---------------------------------------------------------------------------
-def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, tmp_path):
+@pytest.mark.parametrize("extension", ["mp4", "insv"])
+def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, tmp_path, extension):
     ffmpeg = real_ffmpeg_path()
     if ffmpeg is None:
         pytest.skip("Set JVVV_TEST_FFMPEG to a real ffmpeg executable to run this test.")
-    write_source_mp4(source / "Videos" / "holiday.mp4")
-    digest = sha256_of(source / "Videos" / "holiday.mp4")
+    relative = f"Videos/holiday.{extension}"
+    write_source_mp4(source / relative)
+    digest = sha256_of(source / relative)
     settings = preview_settings(tmp_path)
     service = PreviewService(settings, ffmpeg_path=ffmpeg)
     cache = service.cache
@@ -1261,6 +1269,7 @@ def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, 
         media_extractor=MediaMetadataExtractor(discover_ffprobe=False),
         preview_service=service,
         progress_callback=lambda _files, _folders, message: messages.append(message),
+        progress_interval=0,
     ).scan(volume_id)
 
     assert result.status == "completed"
@@ -1275,7 +1284,7 @@ def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, 
     assert validation.video_codec == "h264"
     assert validation.height is not None and validation.height <= settings.video.max_height
     assert validation.duration_ms is not None and 1500 <= validation.duration_ms <= 2500
-    row = preview_rows(catalogue)["Videos/holiday.mp4"]
+    row = preview_rows(catalogue)[relative]
     assert row["status"] == "available"
     assert row["source_hash"] == digest
     assert row["preview_size"] == preview_path.stat().st_size
@@ -1283,7 +1292,7 @@ def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, 
     assert row["preview_width"] == validation.width
     assert row["preview_height"] == validation.height
     assert temporaries_under(cache.root) == []
-    assert "Creating video preview · Videos/holiday.mp4" in messages
+    assert f"Creating video preview · {relative}" in messages
     history = catalogue.list_scan_history(volume_id)[0]
     assert history["video_previews_generated"] == 1
     assert history["preview_bytes_written"] == preview_path.stat().st_size
