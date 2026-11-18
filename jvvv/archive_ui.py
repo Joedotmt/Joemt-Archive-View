@@ -12,8 +12,7 @@ from PySide6.QtWidgets import (
 
 from .archive_job import ArchiveJob, ArchivePaused, check_archive_write_locations
 from .database import Database
-from .operations_queue import prepare_operation_previews
-from .utils import ConnectedVolumeResolver
+from .operations_queue import operation_destination_problem, prepare_operation_previews
 
 
 class ArchiveThread(QThread):
@@ -33,17 +32,20 @@ class ArchiveThread(QThread):
         self.error = ""
         self.paused = False
         self.preview_problem = None
+        self.destination_problem = ""
 
     def cancel(self):
         self.pause_requested.set()
 
     def run(self) -> None:
+        volume = None
         try:
             source = Path(self.operation.source).resolve()
             check_archive_write_locations(source, self.catalogue)
             previews, self.preview_problem = prepare_operation_previews(self.preview_settings, source)
             db = Database(self.catalogue, initialize=False, create=False)
             try:
+                volume = db.get_volume(self.volume_id)
                 job = ArchiveJob(db, preview_settings=previews,
                                  cancelled=self.pause_requested.is_set, progress=self.progress.emit,
                                  writer_lock=self.writer_lock)
@@ -59,10 +61,11 @@ class ArchiveThread(QThread):
             self.paused = True
         except Exception as exc:
             self.error = str(exc) or type(exc).__name__
+            self.destination_problem = operation_destination_problem(volume)
 
 
 class ArchiveDialog(QDialog):
-    def __init__(self, db: Database, targets, parent=None, *, volume_id=None):
+    def __init__(self, db: Database, targets, parent=None, *, volume_id=None, connected_path):
         super().__init__(parent)
         self.setWindowTitle("Archive Project")
         self.setMinimumWidth(570)
@@ -77,11 +80,10 @@ class ArchiveDialog(QDialog):
 
         self.destination = QComboBox()
         self.destination.setPlaceholderText("Select a destination volume")
-        resolver = ConnectedVolumeResolver()
         for volume, dependency in targets:
             if volume_id is not None and volume["id"] != volume_id:
                 continue
-            connected = resolver.resolve(volume)
+            connected = connected_path(volume)
             if Path(connected or volume["source_path"]).drive.casefold() == "q:":
                 continue
             location = connected or "disconnected"

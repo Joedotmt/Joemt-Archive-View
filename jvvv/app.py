@@ -104,7 +104,8 @@ from .catalogue_format import CATALOGUE_DB_NAME
 from .content_hash import DEFAULT_HASH_ALGORITHM, HASH_LABELS
 from .drive_marker import MARKER_IDENTITY
 from .operations_queue import (
-    ACTIONABLE, DONE, STATUSES, Operation, OperationDisks, OperationsQueue, prepare_operation_previews,
+    ACTIONABLE, DONE, STATUSES, Operation, OperationDisks, OperationsQueue, operation_destination_problem,
+    prepare_operation_previews,
 )
 from .scan_staging import StagedScan
 from .operations_ui import OperationsDialog
@@ -454,6 +455,7 @@ MAX_UI_ZOOM = 1.6
 CONTENT_DATE_GUESS_ITEM_BUDGET = 500
 CONTENT_DATE_GUESS_TIME_BUDGET_SECONDS = 0.025
 VOLUME_CONNECTION_POLL_INTERVAL_MS = 1500
+QUEUE_DRIVE_CHECK_MESSAGE = "Checking drive connection…"
 VOLUME_CONNECTION_REFRESH_DELAY_MS = 250
 SEARCH_RESULT_BATCH_SIZE = 500
 AID_VOLUME_LABEL_RE = re.compile(r"^AID-\d{3,}$", re.IGNORECASE)
@@ -2417,6 +2419,7 @@ def connected_volume_signature(snapshots: list[VolumeSnapshot]) -> tuple[tuple[s
 
 
 VolumeLocationKey = tuple[str, str, str, str, str]
+FileOpenKey = tuple[str, str, bool]
 
 
 def volume_location_key(volume) -> VolumeLocationKey:
@@ -2445,6 +2448,78 @@ def _probe_connected_volumes(volumes, result: Future[VolumeConnections]) -> None
             if path is not None:
                 paths[volume_location_key(volume)] = path
         result.set_result(VolumeConnections(snapshots, paths))
+    except Exception as exc:
+        result.set_exception(exc)
+
+
+def _open_catalogue_file(
+    volume: sqlite3.Row, connected_path: str | None, relative_path: str, reveal: bool, result: Future[bool],
+) -> None:
+    try:
+        source = connected_path
+        if source is None or not snapshot_matches_volume(capture_volume_snapshot(source), volume):
+            source = resolve_volume_source_path(volume)
+        path = path_with_relative(source, relative_path) if source is not None else None
+        if path is not None and not path.exists():
+            path = None
+    except Exception as exc:
+        if result.set_running_or_notify_cancel():
+            result.set_exception(exc)
+        return
+
+    # Closing the catalogue can cancel the request while drive I/O is stalled.
+    if not result.set_running_or_notify_cancel():
+        return
+    try:
+        if path is not None:
+            open_in_file_manager(path, reveal=reveal)
+    except Exception as exc:
+        result.set_exception(exc)
+    else:
+        result.set_result(path is not None)
+
+
+@dataclass(frozen=True)
+class QueueDriveCheck:
+    location: VolumeLocationKey
+    path: str | None
+    problem: str
+    disks: OperationDisks | None
+
+
+def _verified_rescan_path(job: Operation, volume: sqlite3.Row, connected_path: str | None) -> str | None:
+    if job.kind != "scan" or job.state == "relink" or not volume["last_scan_at"] or connected_path is None:
+        return None
+    try:
+        snapshot = capture_volume_snapshot(connected_path)
+        if snapshot is None or not snapshot_matches_volume(snapshot, volume):
+            return None
+    except OSError:
+        return None
+    if volume["identity_kind"] == MARKER_IDENTITY:
+        # A marker can be copied to another disk. Also check the filesystem
+        # identity that was saved when this volume was catalogued.
+        serial = volume["identity_serial"]
+        if (not serial or serial.casefold() != snapshot.identity_serial.casefold()
+                or volume["identity_filesystem"].casefold() != snapshot.identity_filesystem.casefold()):
+            return None
+    return connected_path
+
+
+def _probe_queue_drives(requests, result: Future[dict[str, QueueDriveCheck]]) -> None:
+    try:
+        resolver = None
+        checks = {}
+        for job, volume, connected_path in requests:
+            path = _verified_rescan_path(job, volume, connected_path)
+            problem = ""
+            if path is None:
+                if resolver is None:
+                    resolver = ConnectedVolumeResolver()
+                path, problem = resolver.resolve_details(volume)
+            disks = OperationDisks.resolve(job, path) if path is not None else None
+            checks[job.id] = QueueDriveCheck(volume_location_key(volume), path, problem, disks)
+        result.set_result(checks)
     except Exception as exc:
         result.set_exception(exc)
 
@@ -4775,6 +4850,7 @@ class ScanWorker(QObject):
         self.writer_lock = writer_lock
         self.resolved_source_path = resolved_source_path
         self.cancel_requested = False
+        self.destination_problem = ""
         self._io_canceller = _SynchronousIoCanceller()
 
     def _build_preview_service(self) -> PreviewService | None:
@@ -4789,6 +4865,7 @@ class ScanWorker(QObject):
     def run(self) -> None:
         db: Database | None = None
         initial_scan = False
+        volume = None
         try:
             self._io_canceller.start()
             if self.volume_uuid is not None:
@@ -4840,6 +4917,8 @@ class ScanWorker(QObject):
                 except (OSError, ValueError, sqlite3.Error) as exc:
                     registration_warning = f"Could not save the drive ID. {exc}"
                     self.log_message.emit(registration_warning)
+            if result.status not in COMPLETED_SCAN_STATUSES and result.status != "cancelled":
+                self.destination_problem = operation_destination_problem(volume)
             self.finished.emit(
                 {
                     "status": result.status,
@@ -4860,7 +4939,9 @@ class ScanWorker(QObject):
                 }
             )
         except Exception:
-            self.failed.emit(traceback.format_exc())
+            details = traceback.format_exc()
+            self.destination_problem = operation_destination_problem(volume)
+            self.failed.emit(details)
         finally:
             if db is not None:
                 db.close()
@@ -5450,6 +5531,9 @@ class CatalogueOpenWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    queue_drive_probe_finished = Signal()
+    catalogue_file_open_finished = Signal(object, object)
+
     def __init__(self) -> None:
         super().__init__()
         self.settings = QSettings("JVVV", APP_NAME)
@@ -5491,6 +5575,8 @@ class MainWindow(QMainWindow):
         self.operations_dialog: OperationsDialog | None = None
         self.operations_queue: OperationsQueue | None = None
         self.running_operations: dict[str, RunningOperation] = {}
+        self._queue_drive_probe: tuple[Database, Future[dict[str, QueueDriveCheck]]] | None = None
+        self._file_open_requests: dict[FileOpenKey, Future[bool]] = {}
         self.queue_writer_lock = Lock()
         self.scan_queue_result: tuple[str, str] | None = None
         self.scan_cancel_requested = False
@@ -5568,6 +5654,10 @@ class MainWindow(QMainWindow):
         self.operations_timer = QTimer(self)
         self.operations_timer.setInterval(VOLUME_CONNECTION_POLL_INTERVAL_MS)
         self.operations_timer.timeout.connect(self._pump_operations)
+        self.queue_drive_probe_finished.connect(self._pump_operations, Qt.ConnectionType.QueuedConnection)
+        self.catalogue_file_open_finished.connect(
+            self._finish_catalogue_file_open, Qt.ConnectionType.QueuedConnection,
+        )
         self.catalogue_probe_timer = QTimer(self)
         self.catalogue_probe_timer.setSingleShot(True)
         self.catalogue_probe_timer.setInterval(CATALOGUE_PROBE_TIMEOUT_MS)
@@ -8233,6 +8323,10 @@ class MainWindow(QMainWindow):
         db = self.db
         lock = self.catalogue_lock
         self.operations_timer.stop()
+        self._queue_drive_probe = None
+        for request in self._file_open_requests.values():
+            request.cancel()
+        self._file_open_requests.clear()
         if self.operations_dialog is not None:
             self.operations_dialog.close()
             self.operations_dialog.deleteLater()
@@ -9115,7 +9209,10 @@ class MainWindow(QMainWindow):
             return
         try:
             queue = self._get_operations_queue()
-            dialog = ArchiveDialog(self.db, self.archive_targets(), self, volume_id=volume_id)
+            dialog = ArchiveDialog(
+                self.db, self.archive_targets(), self, volume_id=volume_id,
+                connected_path=self.current_source_path_for_volume,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Cannot Open Archive Project", str(exc))
             return
@@ -9285,6 +9382,7 @@ class MainWindow(QMainWindow):
 
     def pause_operations(self) -> None:
         self.operations_timer.stop()
+        self._clear_queue_check_progress()
         for job_id in list(self.running_operations):
             self.pause_queue_job(job_id)
         self._refresh_operations()
@@ -9301,52 +9399,103 @@ class MainWindow(QMainWindow):
                 or QApplication.activeModalWidget() is not None):
             return
         queue = self.operations_queue
+        candidates = [job for job in queue.jobs if job.state in ACTIONABLE]
+        if not candidates:
+            if not self.running_operations:
+                self.operations_timer.stop()
+                self._clear_queue_check_progress()
+            self._refresh_operations()
+            return
+        ready = next((job for job in candidates if job.state == "ready"), None)
+        if ready is not None and not self.running_operations:
+            self.scan_progress.setRange(0, 0)
+            self.scan_progress.setFormat(QUEUE_DRIVE_CHECK_MESSAGE)
+            self._show_queued_progress(QUEUE_DRIVE_CHECK_MESSAGE, operation=ready)
         volumes = {volume["uuid"]: volume for volume in self.db.list_volumes()}
-        resolver = ConnectedVolumeResolver()
-        paths = {}
-        disks = {}
+        probe = self._queue_drive_probe
+        if probe is None or probe[0] is not self.db:
+            requests = [
+                (job, volume, self.current_source_path_for_volume(volume))
+                for job in candidates
+                if (volume := volumes.get(job.volume_uuid)) is not None
+            ]
+            result = Future()
+            self._queue_drive_probe = (self.db, result)
+            result.add_done_callback(lambda _: self.queue_drive_probe_finished.emit())
+            Thread(
+                target=_probe_queue_drives, args=(requests, result), name="jvvv-queue-drive-probe", daemon=True,
+            ).start()
+            return
+        result = probe[1]
+        if not result.done():
+            return
+        self._queue_drive_probe = None
+        try:
+            checks = result.result()
+        except Exception as exc:
+            self.statusBar().showMessage(f"Could not check the drives for queued jobs. {exc}", 10000)
+            return
+
+        def current_check(job, volume):
+            check = checks.get(job.id)
+            return check if check is not None and check.location == volume_location_key(volume) else None
 
         def availability(job):
             volume = volumes.get(job.volume_uuid)
             if volume is None:
                 return "failed", "This volume was removed from the catalogue."
-            path, problem = resolver.resolve_details(volume)
-            if problem == "Relink Required":
-                return "relink", "Resolve the drive identity from the volume?s Relink Drive action."
-            if path is None:
+            check = current_check(job, volume)
+            if check is None:
+                return "ready", ""
+            if check.problem == "Relink Required":
+                return "relink", "Resolve the drive identity from the volume's Relink Drive action."
+            if check.path is None:
                 return "waiting", "Connect the drive linked to this volume."
             if job.kind == "archive" and not is_scanned_archive_volume(self.db, volume):
                 return "failed", "The destination needs a completed initial drive scan."
-            paths[job.id] = path
             return "ready", ""
 
         def can_start(job):
-            claim = OperationDisks.resolve(job, paths[job.id])
-            disks[job.id] = claim
-            return all(not claim.conflicts_with(active.disks) for active in self.running_operations.values())
+            check = current_check(job, volumes[job.volume_uuid])
+            return check is not None and check.disks is not None and all(
+                not check.disks.conflicts_with(active.disks) for active in self.running_operations.values()
+            )
 
         try:
-            job = queue.next_ready(availability, can_start)
-            if job is None:
-                if not self.running_operations:
-                    if not any(item.state in ACTIONABLE for item in queue.jobs):
-                        self.operations_timer.stop()
-                    else:
-                        waiting = next((item for item in queue.jobs if item.state in {"waiting", "relink"}), None)
-                        if waiting is not None:
-                            self.scan_progress.setRange(0, 1)
-                            self.scan_progress.setValue(0)
-                            self.scan_progress.setFormat(STATUSES[waiting.state])
-                            self._show_queued_progress(STATUSES[waiting.state], operation=waiting)
-                self._refresh_operations()
-                return
-            queue.set_state(job.id, "running")
+            while len(self.running_operations) < 2:
+                job = queue.next_ready(availability, can_start)
+                if job is None:
+                    break
+                queue.set_state(job.id, "running")
+                check = checks[job.id]
+                self._start_queue_job(job, check.disks, volumes[job.volume_uuid]["id"], check.path)
         except (OSError, ValueError) as exc:
             self.pause_operations()
             self.statusBar().showMessage(f"The queue could not be saved. {exc}", 10000)
             return
-        self._start_queue_job(job, disks[job.id], volumes[job.volume_uuid]["id"], paths[job.id])
-        QTimer.singleShot(0, self._pump_operations)
+        if not self.running_operations:
+            if not any(item.state in ACTIONABLE for item in queue.jobs):
+                self.operations_timer.stop()
+                self._clear_queue_check_progress()
+            else:
+                waiting = next((item for item in queue.jobs if item.state in {"waiting", "relink"}), None)
+                if waiting is not None:
+                    self.scan_progress.setRange(0, 1)
+                    self.scan_progress.setValue(0)
+                    self.scan_progress.setFormat(STATUSES[waiting.state])
+                    self._show_queued_progress(STATUSES[waiting.state], operation=waiting)
+        self._refresh_operations()
+
+    def _clear_queue_check_progress(self) -> None:
+        if self.scan_progress.format() != QUEUE_DRIVE_CHECK_MESSAGE:
+            return
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(0)
+        self.scan_progress.setFormat("Idle")
+        self.operation_progress_label.clear()
+        self.operation_progress_label.hide()
+        if self.operations_dialog is not None:
+            self.operations_dialog.progress.clear()
 
     def _start_queue_job(self, job: Operation, disks: OperationDisks, volume_id: int, path: str) -> None:
         events = QueueJobEvents(self, job.id)
@@ -9357,7 +9506,7 @@ class MainWindow(QMainWindow):
             )
             worker.progress.connect(events.archive_progress)
             thread.finished.connect(events.archive_finished)
-            message = "Preparing archive?"
+            message = "Preparing archive…"
         else:
             worker = ScanWorker(
                 self.db.path, volume_id, preview_settings=self.preview_settings,
@@ -9372,7 +9521,7 @@ class MainWindow(QMainWindow):
             thread = _create_worker_thread(
                 self, worker, (worker.finished, worker.failed), events.scan_thread_finished,
             )
-            message = "Preparing scan?"
+            message = "Preparing scan…"
         self.running_operations[job.id] = RunningOperation(job, disks, worker, thread, events)
         self.scan_cancel_requested = False
         self._set_scan_running_ui(True)
@@ -9384,15 +9533,12 @@ class MainWindow(QMainWindow):
     def _finish_operation(self, job_id: str, state: str, detail: str) -> None:
         active = self.running_operations.pop(job_id)
         active.events.deleteLater()
-        job = active.job
         if state == "failed":
-            volume = next((row for row in self.db.list_volumes() if row["uuid"] == job.volume_uuid), None)
-            if volume is not None and volume_identity_known(volume):
-                _, problem = ConnectedVolumeResolver().resolve_details(volume)
-                if problem == "Waiting for Drive":
-                    state = "waiting"
-                elif problem == "Relink Required":
-                    state = "relink"
+            problem = active.worker.destination_problem
+            if problem == "Waiting for Drive":
+                state = "waiting"
+            elif problem == "Relink Required":
+                state = "relink"
         self._set_scan_running_ui(bool(self.running_operations))
         if not self._change_operations(self.operations_queue.set_state, job_id, state, detail):
             self.operations_timer.stop()
@@ -9460,7 +9606,7 @@ class MainWindow(QMainWindow):
             operation = self.operations_queue.get(self.operation_id)
         if operation is None:
             return
-        text = f"{operation.title} ? {message}"
+        text = f"{operation.title} · {message}"
         label.setText(text)
         label.setToolTip(text)
         label.show()
@@ -9688,6 +9834,12 @@ class MainWindow(QMainWindow):
             )
         hash_errors = int(result.get("hash_errors", 0))
         access_errors = max(0, int(result.get("errors_count", 0)) - hash_errors)
+        changes = result.get("changes") or {}
+        files_removed = changes.get("files_removed", 0)
+        folders_removed = changes.get("folders_removed", 0)
+        removed_text = ""
+        if indexed and (files_removed or folders_removed):
+            removed_text = f" Removed from catalogue: {files_removed:,} files, {folders_removed:,} folders."
         preview_text = ""
         if statistics.mode == MODE_ENABLED:
             preview_text = (
@@ -9710,7 +9862,7 @@ class MainWindow(QMainWindow):
             f"{result.get('media_files', 0)} media details available "
             f"({result.get('media_metadata_reused', 0)} reused), "
             f"{access_errors} incomplete/access issues, {hash_errors} hash unavailable."
-            f"{preview_text}",
+            f"{removed_text}{preview_text}",
             8000,
         )
         self.refresh_after_catalogue_write()
@@ -9727,10 +9879,9 @@ class MainWindow(QMainWindow):
         detail = f"{result.get('files_seen', 0):,} files. {result.get('message') or ''}".strip()
         if registration_warning:
             detail += f" {registration_warning}"
-        changes = result.get("changes") or {}
         if indexed and changes:
             detail += (f" Added {changes.get('files_added', 0):,}, changed {changes.get('files_changed', 0):,},"
-                       f" missing {changes.get('files_removed', 0):,}.")
+                       f" removed {files_removed:,} files and {folders_removed:,} folders from the catalogue.")
         if indexed and statistics.mode == MODE_ENABLED:
             detail += (f" Previews generated {statistics.total_generated:,}, reused {statistics.total_reused:,},"
                        f" failed {statistics.total_failed:,}, skipped {statistics.storage_skipped:,}.")
@@ -10183,8 +10334,8 @@ class MainWindow(QMainWindow):
         *,
         include_catalogue_location: bool = False,
     ) -> QMenu:
-        real_path = self.catalogue_item_real_path(target)
-        real_available = real_path is not None and real_path.exists() and not target.missing
+        real_path = self.cached_catalogue_item_path(target)
+        real_available = real_path is not None and not target.missing
 
         menu = QMenu(self)
         open_action = menu.addAction("Open")
@@ -10287,17 +10438,41 @@ class MainWindow(QMainWindow):
         self.open_real_catalogue_item(target, reveal=not target.is_folder)
 
     def open_real_catalogue_item(self, target: CatalogueItemRef, reveal: bool) -> None:
-        real_path = self.catalogue_item_real_path(target)
-        if real_path is None or not real_path.exists() or target.missing:
+        volume = self.db.get_volume(target.volume_id) if self.db is not None else None
+        if volume is None or target.missing:
             self.statusBar().showMessage(
                 "The real item is not available because the volume is offline or changed.",
                 5000,
             )
             return
+        key = (volume["uuid"], target.relative_path, reveal)
+        if key in self._file_open_requests:
+            return
+        result = Future()
+        self._file_open_requests[key] = result
+        result.add_done_callback(lambda done: self.catalogue_file_open_finished.emit(key, done))
+        self.statusBar().showMessage("Opening file location…" if reveal else "Opening item…", 5000)
+        Thread(
+            target=_open_catalogue_file,
+            args=(volume, self.current_source_path_for_volume(volume), target.relative_path, reveal, result),
+            name="jvvv-open-catalogue-file", daemon=True,
+        ).start()
+
+    @Slot(object, object)
+    def _finish_catalogue_file_open(self, key: FileOpenKey, result: Future[bool]) -> None:
+        if self._file_open_requests.get(key) is not result:
+            return
+        del self._file_open_requests[key]
         try:
-            open_in_file_manager(real_path, reveal=reveal)
+            opened = result.result()
         except Exception as exc:
             QMessageBox.warning(self, "Open Failed", str(exc))
+        else:
+            if not opened:
+                self.statusBar().showMessage(
+                    "The real item is not available because the volume is offline or changed.",
+                    5000,
+                )
 
     def copy_catalogue_item_path(self, target: CatalogueItemRef) -> None:
         real_path = self.catalogue_item_real_path(target)
@@ -10313,6 +10488,11 @@ class MainWindow(QMainWindow):
         if volume is None:
             return None
         return self.real_path_for(volume, target.relative_path)
+
+    def cached_catalogue_item_path(self, target: CatalogueItemRef) -> Path | None:
+        volume = self.db.get_volume(target.volume_id) if self.db is not None else None
+        source = self.current_source_path_for_volume(volume)
+        return self.physical_path_for_source(source, target.relative_path) if source is not None else None
 
     def show_browser_item_properties(self, item_type: str, item_id: int) -> None:
         if self.db is None:
@@ -10942,8 +11122,7 @@ class MainWindow(QMainWindow):
 
     def on_search_selection_changed(self, selected=None, deselected=None) -> None:
         item = self.selected_search_item()
-        real_path = self.selected_search_real_path()
-        real_available = item is not None and not item.missing and real_path is not None and real_path.exists()
+        real_available = item is not None and not item.missing and item.connected
         self.open_file_button.setEnabled(item is not None and (item.is_folder or real_available))
         self.reveal_file_button.setEnabled(real_available)
         preview_button = getattr(self, "open_preview_button", None)
@@ -10999,12 +11178,6 @@ class MainWindow(QMainWindow):
             relative_path=item.relative_path,
             missing=item.missing,
         )
-
-    def selected_search_real_path(self) -> Path | None:
-        item = self.selected_search_item()
-        if item is None:
-            return None
-        return self.catalogue_item_real_path(self.catalogue_ref_for_search_item(item))
 
     def open_selected_real_item(self, reveal: bool) -> None:
         item = self.selected_search_item()

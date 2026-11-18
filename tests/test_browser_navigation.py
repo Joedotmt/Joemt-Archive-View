@@ -204,7 +204,7 @@ def build_fake_context_menu(
 ):
     monkeypatch.setattr("jvvv.app.QMenu", FakeMenu)
     window = SimpleNamespace(
-        catalogue_item_real_path=lambda candidate: real_path,
+        cached_catalogue_item_path=lambda candidate: real_path,
         open_catalogue_item=lambda candidate: None,
         open_catalogue_location_for_item=lambda candidate: None,
         open_catalogue_item_in_file_manager=lambda candidate: None,
@@ -328,10 +328,9 @@ def test_file_manager_opens_folders_and_reveals_files():
 def test_search_open_keeps_offline_catalogue_folders_available():
     open_button = ValueWidget()
     reveal_button = ValueWidget()
-    folder = SimpleNamespace(is_folder=True, missing=False)
+    folder = SimpleNamespace(is_folder=True, missing=False, connected=False)
     window = SimpleNamespace(
         selected_search_item=lambda: folder,
-        selected_search_real_path=lambda: None,
         open_file_button=open_button,
         reveal_file_button=reveal_button,
     )

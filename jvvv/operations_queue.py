@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from .archive_job import check_archive_write_locations
 from .preview_service import preflight_preview_configuration
-from .utils import physical_disk_key
+from .utils import ConnectedVolumeResolver, physical_disk_key, volume_identity_known
 
 
 DONE = {"completed", "warning"}
@@ -104,6 +104,16 @@ class OperationDisks:
             self.has_source and other.has_source and self.source == other.source
             and not (self.shared_qnap and other.shared_qnap)
         )
+
+
+def operation_destination_problem(volume) -> str:
+    """Identify a disconnected drive while reporting a worker failure."""
+    if not volume_identity_known(volume):
+        return ""
+    try:
+        return ConnectedVolumeResolver().resolve_details(volume)[1]
+    except OSError:
+        return ""
 
 
 class OperationsQueue:

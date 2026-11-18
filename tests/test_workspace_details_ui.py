@@ -7,9 +7,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QSettings
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
-from jvvv.app import BackupDisplay, BrowserItem, MainWindow, VolumeConnections
+from jvvv.app import BackupDisplay, BrowserItem, CatalogueItemRef, MainWindow, VolumeConnections, volume_location_key
 from jvvv.database import create_catalogue
 from jvvv.utils import VolumeSnapshot, format_size
 from test_catalogue_directory import populate
@@ -128,6 +129,75 @@ def test_browsing_uses_saved_data_while_a_drive_probe_is_blocked(window, tmp_pat
     assert window.current_folder_id == folder_id
     assert window.current_path_label.text() == "Photos"
     assert window.offline_label.text() == ""
+
+
+@pytest.mark.parametrize("moved", [False, True])
+def test_open_file_location_checks_identity_without_blocking_browsing(window, tmp_path, monkeypatch, moved):
+    window.volume_connection_timer.stop()
+    volume = populated_volume(window, tmp_path)
+    mounted = tmp_path / "Mounted Drive"
+    destination = tmp_path / "Reconnected Drive" if moved else mounted
+    relative_path = "Photos/report.txt"
+    file_path = destination / relative_path
+    file_path.parent.mkdir(parents=True)
+    file_path.write_text("indexed file")
+    snapshot = VolumeSnapshot(str(mounted), str(mounted), "", "test-device", "drive-1")
+    window.db.update_volume_location(volume["id"], volume["source_path"], snapshot.as_db_fields())
+    volume = window.db.get_volume(volume["id"])
+    window._connected_volume_paths[volume_location_key(volume)] = str(mounted)
+    window.refresh_volumes()
+    assert window.select_volume(volume["id"])
+
+    gui_thread = get_ident()
+    started = Event()
+    release = Event()
+    probes = []
+    opened = []
+
+    def capture(path):
+        assert get_ident() != gui_thread
+        assert path == str(mounted)
+        probes.append("cached drive")
+        started.set()
+        assert release.wait(5)
+        if moved:
+            return VolumeSnapshot(str(mounted), str(mounted), "", "test-device", "other-drive")
+        return snapshot
+
+    def resolve(_volume):
+        assert get_ident() != gui_thread
+        assert moved
+        probes.append("find moved drive")
+        return str(destination)
+
+    def open_in_file_manager(path, *, reveal):
+        assert get_ident() != gui_thread
+        opened.append((path, reveal))
+
+    monkeypatch.setattr("jvvv.app.capture_volume_snapshot", capture)
+    monkeypatch.setattr("jvvv.app.resolve_volume_source_path", resolve)
+    monkeypatch.setattr("jvvv.app.open_in_file_manager", open_in_file_manager)
+    target = CatalogueItemRef("file", 1, volume["id"], relative_path)
+    menu = window.build_catalogue_item_context_menu(target)
+    action = next(action for action in menu.actions() if action.text() == "Open File Location")
+    assert action.isEnabled()
+    try:
+        action.trigger()
+        assert started.wait(5)
+        action.trigger()
+        window.select_folder_path("Photos")
+        assert window.current_path_label.text() == "Photos"
+        assert opened == []
+    finally:
+        release.set()
+
+    for _ in range(100):
+        if not window._file_open_requests:
+            break
+        QTest.qWait(25)
+    assert not window._file_open_requests
+    assert opened == [(file_path, True)]
+    assert probes == (["cached drive", "find moved drive"] if moved else ["cached drive"])
 
 
 def test_unscanned_volume_does_not_report_unknown_capacity_as_measured_zero(window, tmp_path, monkeypatch):

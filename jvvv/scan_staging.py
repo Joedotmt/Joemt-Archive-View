@@ -132,6 +132,26 @@ class StagedScan:
                 SET folder_id = excluded.folder_id, {_upsert_values(files)}
             """, (self.volume_id, self.volume_id),
         )
+        # The completed scan removed unseen paths from its private index.
+        # Publish those removals as well as the surviving rows.
+        conn.execute(
+            """
+            DELETE FROM main.files AS live
+            WHERE live.volume_id = ? AND NOT EXISTS (
+                SELECT 1 FROM staged_scan.files AS staged
+                WHERE staged.volume_id = live.volume_id AND staged.relative_path = live.relative_path
+            )
+            """, (self.volume_id,),
+        )
+        conn.execute(
+            """
+            DELETE FROM main.folders AS live
+            WHERE live.volume_id = ? AND NOT EXISTS (
+                SELECT 1 FROM staged_scan.folders AS staged
+                WHERE staged.volume_id = live.volume_id AND staged.relative_path = live.relative_path
+            )
+            """, (self.volume_id,),
+        )
         self._publish_file_details(conn, "file_media_metadata", MEDIA_COLUMNS[1:])
 
     def _publish_file_details(self, conn, table, columns) -> None:

@@ -713,7 +713,7 @@ def make_menu_window(catalogue: Catalogue, settings: PreviewSettings):
     window = SimpleNamespace(
         db=catalogue.db,
         preview_settings=settings,
-        catalogue_item_real_path=lambda target: None,
+        cached_catalogue_item_path=lambda target: None,
         open_catalogue_item=lambda target: None,
         open_catalogue_location_for_item=lambda target: None,
         open_catalogue_item_in_file_manager=lambda target: None,
@@ -1436,7 +1436,6 @@ def make_search_window(
         db=catalogue.db,
         preview_settings=settings,
         selected_search_item=lambda: item,
-        selected_search_real_path=lambda: None,
         open_file_button=FakeButton("Open"),
         reveal_file_button=FakeButton("Reveal"),
     )

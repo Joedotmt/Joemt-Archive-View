@@ -1,12 +1,13 @@
 """Archived contents, recovery and file protection at the filesystem boundary."""
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import replace
 import hashlib
 import json
 import os
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, get_ident
 from uuid import uuid4
 
 from PIL import Image
@@ -464,6 +465,16 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
     unscanned = tmp_path / "Unscanned"
     unscanned.mkdir()
     shown_dialogs = []
+    lookup_started = Event()
+    release_lookup = Event()
+    gui_thread = get_ident()
+    list_snapshots = utils.list_connected_volume_snapshots
+
+    def slow_drive_lookup():
+        assert get_ident() != gui_thread, "Drive discovery ran on the UI thread"
+        lookup_started.set()
+        assert release_lookup.wait(8)
+        return list_snapshots()
 
     def execute(dialog):
         shown_dialogs.append(dialog)
@@ -476,6 +487,7 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
             assert dialog.destination.isEnabled()
             assert not dialog.start.isEnabled()
             dialog.destination.setCurrentIndex(choices.index(volume_id))
+        assert str(destination) in dialog.destination.currentText()
         dialog.source.setText(str(source))
         dialog.start.click()
         return dialog.result()
@@ -488,9 +500,12 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
         assert not window.archive_project_action.isEnabled()
         volume_id = index_volume(window.db, destination)
         other_id = index_volume(window.db, other)
+        volume = window.db.get_volume(volume_id)
+        window._connected_volume_paths[app_module.volume_location_key(volume)] = str(destination)
         window.refresh_volumes()
         assert window.archive_project_action.isEnabled()
         assert window.select_volume(other_id)
+        monkeypatch.setattr(utils, "list_connected_volume_snapshots", slow_drive_lookup)
         if from_context:
             class ArchiveMenu(QMenu):
                 def exec(self, _point):
@@ -525,6 +540,15 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
             manager.apply_button.click()
         else:
             window.apply_queue_button.click()
+        wait_for_queue(lookup_started.is_set)
+        assert window.operations_queue.get(queued.id).state == "ready"
+        assert window.scan_progress.format() == "Checking drive connection…"
+        assert queued.title in window.operation_progress_label.text()
+        if from_context:
+            assert "Checking drive connection…" in manager.progress.text()
+        assert window.select_volume(volume_id)
+        assert window.current_volume_id == volume_id
+        release_lookup.set()
         wait_for_queue(lambda: window.operations_queue.jobs[0].state in {"completed", "warning", "failed"})
         job = window.operations_queue.jobs[0]
         assert job.state == "completed", job.detail
@@ -545,6 +569,7 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
         assert manager.tables["Completed"].rowCount() == 1
         assert not manager.apply_button.isEnabled()
     finally:
+        release_lookup.set()
         window.close()
         app.processEvents()
 
@@ -569,6 +594,10 @@ def test_queue_runs_two_independent_jobs_and_publishes_both(tmp_path, project, i
     second.mkdir()
     for root in (destination, second):
         (root / "before.dat").write_bytes(b"indexed earlier")
+        if kind == "scan":
+            (root / "Gone").mkdir()
+            (root / "Gone" / "nested.dat").write_bytes(b"removed with its folder")
+            (root / "gone.dat").write_bytes(b"removed from a folder that stays")
 
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
@@ -601,6 +630,9 @@ def test_queue_runs_two_independent_jobs_and_publishes_both(tmp_path, project, i
 
             monkeypatch.setattr(VolumeScanner, "_hash_file", hash_file)
             for volume_id, path in zip(ids, (destination, second)):
+                (path / "Gone" / "nested.dat").unlink()
+                (path / "Gone").rmdir()
+                (path / "gone.dat").unlink()
                 (path / "new.dat").write_bytes(b"new file")
                 window.start_scan(volume_id)
         else:
@@ -638,7 +670,12 @@ def test_queue_runs_two_independent_jobs_and_publishes_both(tmp_path, project, i
             assert window.db.get_file(file_id)["name"] == "before.dat"
             if kind == "scan":
                 assert window.db.get_volume(volume_id)["indexed_file_count"] == 2
-                assert window.db.list_scan_history(volume_id)[0]["status"] == "completed"
+                root = window.db.get_root_folder(volume_id)
+                assert {row["name"] for row in window.db.list_files(volume_id, root["id"])} == {"before.dat", "new.dat"}
+                assert window.db.get_folder_by_path(volume_id, "Gone") is None
+                scan = window.db.list_scan_history(volume_id)[0]
+                assert scan["status"] == "completed"
+                assert (scan["files_removed"], scan["folders_removed"]) == (2, 1)
             else:
                 assert window.db.get_folder_by_path(volume_id, source.name) is not None
     finally:
@@ -713,6 +750,49 @@ def test_queued_scans_and_dependent_archive_continue_past_disconnected_drive(
     finally:
         window.close()
         app.processEvents()
+
+
+@pytest.mark.parametrize("case", ["rescan", "archive", "initial scan", "moved", "duplicate", "previous relink"])
+def test_queue_checks_known_rescan_directly_and_preserves_drive_discovery(tmp_path, monkeypatch, case):
+    from jvvv.app import _probe_queue_drives
+    from jvvv.drive_marker import MARKER_IDENTITY, write_drive_marker
+    from jvvv.operations_queue import Operation, OperationDisks
+
+    cached = tmp_path / "Cached drive"
+    moved = tmp_path / "Reconnected drive"
+    drive_id = str(uuid4())
+    for path in (cached, moved):
+        path.mkdir()
+        write_drive_marker(path, drive_id)
+    snapshot = VolumeSnapshot(str(cached), str(cached), "", "windows-volume-guid", "original",
+                              identity_serial="1234", identity_filesystem="exFAT")
+    relocated = replace(snapshot, source_path=str(moved), mount_root=str(moved))
+    volume = {**snapshot.as_db_fields(), "uuid": drive_id, "source_path": str(cached),
+              "identity_kind": MARKER_IDENTITY, "identity_token": drive_id,
+              "last_scan_at": None if case == "initial scan" else "earlier"}
+    job = Operation("job", "archive" if case == "archive" else "scan", drive_id, "AID-151",
+                    state="relink" if case == "previous relink" else "ready")
+    discovery_calls = []
+
+    def discover():
+        discovery_calls.append(True)
+        if case in {"duplicate", "previous relink"}:
+            return [snapshot, relocated]
+        return [relocated] if case == "moved" else [snapshot]
+
+    observed = replace(snapshot, identity_serial="4321") if case == "duplicate" else snapshot
+    monkeypatch.setattr(utils, "list_connected_volume_snapshots", discover)
+    monkeypatch.setattr("jvvv.app.capture_volume_snapshot", lambda _path: None if case == "moved" else observed)
+    monkeypatch.setattr(OperationDisks, "resolve", classmethod(lambda cls, *_: cls((7, 1))))
+    result = Future()
+    _probe_queue_drives([(job, volume, str(cached))], result)
+    check = result.result()[job.id]
+
+    assert len(discovery_calls) == (0 if case == "rescan" else 1)
+    if case in {"duplicate", "previous relink"}:
+        assert (check.path, check.problem) == (None, "Relink Required")
+    else:
+        assert (check.path, check.problem) == (str(moved if case == "moved" else cached), "")
 
 
 @pytest.mark.parametrize("has_marker", [False, True])
