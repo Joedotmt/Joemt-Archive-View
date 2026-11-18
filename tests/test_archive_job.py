@@ -35,6 +35,46 @@ def project(tmp_path):
     return source, destination
 
 
+def test_preview_input_reuses_immutable_blocks_and_spills_on_memory_pressure(tmp_path, monkeypatch):
+    headroom = 1024
+    monkeypatch.setattr(archive_job, "archive_memory_headroom", lambda: headroom)
+    monkeypatch.setattr(archive_job, "MEMORY_RECHECK_BYTES", 4)
+    cache = archive_job.MediaInput(tmp_path, ".mov", 10)
+    try:
+        first = b"first"
+        cache.write(first)
+        assert cache.blocks[0] is first
+        mutable = bytearray(b"ab")
+        cache.write(memoryview(mutable))
+        mutable[:] = b"cd"
+        headroom = 0
+        cache.write(b"end")
+        assert not cache.blocks and cache.stream is not None
+        assert cache.materialize().read_bytes() == b"firstabend"
+    finally:
+        cache.close()
+    assert not cache.path.exists()
+
+
+def test_pressure_limits_read_ahead_and_releases_optional_data_while_waiting(tmp_path, monkeypatch):
+    file = tmp_path / "project.dat"
+    file.write_bytes(b"0123456789abcdef")
+    entry = archive_job.ProjectEntry(file.name, file.stat(), False)
+    release = Future()
+    job = ArchiveJob(type("DB", (), {"hash_algorithm": "sha256"})(), destination_ready=release)
+    monkeypatch.setattr(job, "_check", lambda: None)
+    samples = iter((32, 0))
+    monkeypatch.setattr(archive_job, "archive_memory_headroom", lambda: next(samples))
+    monkeypatch.setattr(archive_job, "MEMORY_RECHECK_BYTES", 4)
+    monkeypatch.setattr(archive_job, "CHUNK_SIZE", 4)
+    job._read_ahead(tmp_path, [entry], tmp_path, None, lambda: False)
+    assert job.prefixes[file.name].size == 4
+    monkeypatch.setattr(archive_job, "archive_memory_headroom", lambda: -4)
+    release.set_result(True)
+    job._wait_for_destination()
+    assert not job.prefixes
+
+
 @pytest.fixture
 def index_volume(monkeypatch):
     """Model separate mounted drive roots with disposable folders."""
@@ -680,6 +720,86 @@ def test_queue_runs_two_independent_jobs_and_publishes_both(tmp_path, project, i
                 assert window.db.get_folder_by_path(volume_id, source.name) is not None
     finally:
         resume_retry.set()
+        window.close()
+        app.processEvents()
+
+
+@pytest.mark.parametrize("pause_first", [False, True])
+def test_next_archive_reads_ahead_while_same_disk_verifies(tmp_path, project, index_volume, monkeypatch, pause_first):
+    from jvvv.app import MainWindow
+    from jvvv.operations_queue import OperationDisks
+
+    first, destination = project
+    second = tmp_path / "Next project"
+    second.mkdir()
+    Image.new("RGB", (16, 16), "blue").save(second / "first.png")
+    payload = bytes(range(256)) * 2048
+    (second / "large.dat").write_bytes(payload)
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_confirm_snapshot_before_close", lambda self: True)
+    monkeypatch.setattr(OperationDisks, "resolve", classmethod(lambda cls, *_: cls((7, 2), (7, 1), True)))
+    monkeypatch.setattr(archive_job, "archive_memory_headroom", lambda: 8192)
+    monkeypatch.setattr(archive_job, "physical_disk_key", lambda path: (7, 2) if path == destination else (7, 1))
+    # This image-only fixture does not require a system video encoder.
+    monkeypatch.setattr("jvvv.archive_ui.prepare_operation_previews", lambda settings, source: (settings, None))
+    release = Event()
+    verifying = Event()
+    original = archive_job.DestinationReader.digest
+    buffered_sizes = {}
+    original_copy = ArchiveJob._copy_file
+
+    def copy_file(job, path, *args):
+        if path.parent == second and path.name in job.prefixes:
+            buffered_sizes[path.name] = job.prefixes[path.name].size
+        return original_copy(job, path, *args)
+
+    monkeypatch.setattr(ArchiveJob, "_copy_file", copy_file)
+
+    def digest(reader, path, *args, **kwargs):
+        if not verifying.is_set():
+            verifying.set()
+            assert release.wait(12)
+        return original(reader, path, *args, **kwargs)
+
+    monkeypatch.setattr(archive_job.DestinationReader, "digest", digest)
+    window = MainWindow()
+    window.catalogue_path = tmp_path / "Archive.jvvv"
+    window.db = create_catalogue(window.catalogue_path)
+    window._set_catalogue_open(True)
+    preview_root = tmp_path / "Previews"
+    preview_root.mkdir()
+    window.preview_settings = PreviewSettings(enabled=True, root_directory=str(preview_root))
+    try:
+        volume_id = index_volume(window.db, destination)
+        volume = window.db.get_volume(volume_id)
+        queue = window._get_operations_queue()
+        a, b = [queue.add("archive", volume, "Test HDD", source=str(path)) for path in (first, second)]
+        window.apply_operations()
+        wait_for_queue(lambda: b.id in window.running_operations and
+                       window.running_operations[b.id].message.startswith("Waiting for the previous archive"))
+        assert verifying.is_set()
+        assert not (destination / second.name).exists()
+        assert not (window.db.path / f"archive-job-{b.id}.sqlite").exists()
+        assert second.name in window.operation_progress_label.text()
+        if pause_first:
+            window.pause_queue_job(a.id)
+        release.set()
+        wait_for_queue(lambda: not window.running_operations)
+        if pause_first:
+            assert [job.state for job in queue.jobs] == ["paused", "paused"]
+            assert not (destination / second.name).exists()
+            window.apply_operations()
+            wait_for_queue(lambda: all(job.state == "completed" for job in queue.jobs))
+        assert [job.state for job in queue.jobs] == ["completed", "completed"]
+        if not pause_first:
+            assert sum(buffered_sizes.values()) == 8192
+            assert 0 < buffered_sizes["large.dat"] < len(payload)
+        assert (destination / second.name / "large.dat").read_bytes() == payload
+        assert window.db.get_folder_by_path(volume_id, second.name)
+        assert list(preview_root.rglob("*.jpg"))
+    finally:
+        release.set()
         window.close()
         app.processEvents()
 

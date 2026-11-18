@@ -87,6 +87,7 @@ from PySide6.QtWidgets import (
 
 from .config import APP_NAME
 from .archive_job import (
+    VERIFY_PHASE,
     check_archive_write_locations, is_archive_volume_root, is_scanned_archive_volume,
     pending_archive, register_scanned_drive,
 )
@@ -4964,6 +4965,8 @@ class RunningOperation:
     done: int = 0
     total: int = 0
     result: tuple[str, str] | None = None
+    verifying: bool = False
+    following_drive_checks: dict[str, QueueDriveCheck] | None = None
 
 
 class QueueJobEvents(QObject):
@@ -9412,29 +9415,23 @@ class MainWindow(QMainWindow):
             self.scan_progress.setFormat(QUEUE_DRIVE_CHECK_MESSAGE)
             self._show_queued_progress(QUEUE_DRIVE_CHECK_MESSAGE, operation=ready)
         volumes = {volume["uuid"]: volume for volume in self.db.list_volumes()}
-        probe = self._queue_drive_probe
-        if probe is None or probe[0] is not self.db:
-            requests = [
-                (job, volume, self.current_source_path_for_volume(volume))
-                for job in candidates
-                if (volume := volumes.get(job.volume_uuid)) is not None
-            ]
-            result = Future()
-            self._queue_drive_probe = (self.db, result)
-            result.add_done_callback(lambda _: self.queue_drive_probe_finished.emit())
-            Thread(
-                target=_probe_queue_drives, args=(requests, result), name="jvvv-queue-drive-probe", daemon=True,
-            ).start()
-            return
-        result = probe[1]
-        if not result.done():
-            return
-        self._queue_drive_probe = None
-        try:
-            checks = result.result()
-        except Exception as exc:
-            self.statusBar().showMessage(f"Could not check the drives for queued jobs. {exc}", 10000)
-            return
+        checks = None
+        if len(self.running_operations) == 1:
+            active = next(iter(self.running_operations.values()))
+            if all(job.volume_uuid == active.job.volume_uuid for job in candidates):
+                if not active.verifying:
+                    return
+                volume = volumes.get(active.job.volume_uuid)
+                if volume is not None and active.following_drive_checks and all(
+                    job.id in active.following_drive_checks
+                    and active.following_drive_checks[job.id].location == volume_location_key(volume)
+                    for job in candidates
+                ):
+                    checks = active.following_drive_checks
+        if checks is None:
+            checks = self._queue_drive_checks(candidates, volumes)
+            if checks is None:
+                return
 
         def current_check(job, volume):
             check = checks.get(job.id)
@@ -9464,11 +9461,31 @@ class MainWindow(QMainWindow):
         try:
             while len(self.running_operations) < 2:
                 job = queue.next_ready(availability, can_start)
+                destination_ready = None
+                if job is None and len(self.running_operations) == 1:
+                    active = next(iter(self.running_operations.values()))
+                    if active.verifying:
+                        def can_prepare(candidate):
+                            check = current_check(candidate, volumes[candidate.volume_uuid])
+                            disks = check.disks if check else None
+                            return (candidate.kind == "archive" and disks is not None
+                                    and disks.destination is not None and disks.destination == active.disks.destination
+                                    and (disks.shared_qnap or disks.source is not None)
+                                    and disks.source != disks.destination)
+
+                        job = queue.next_ready(availability, can_prepare, preparing_after=active.job)
+                        destination_ready = active.worker.finished_writing
                 if job is None:
                     break
                 queue.set_state(job.id, "running")
                 check = checks[job.id]
-                self._start_queue_job(job, check.disks, volumes[job.volume_uuid]["id"], check.path)
+                self._start_queue_job(job, check.disks, volumes[job.volume_uuid]["id"], check.path, destination_ready)
+                if job.kind == "archive":
+                    self.running_operations[job.id].following_drive_checks = {
+                        other.id: checks[other.id] for other in candidates
+                        if other.id != job.id and other.volume_uuid == job.volume_uuid and other.id in checks
+                        and checks[other.id].path == check.path
+                    }
         except (OSError, ValueError) as exc:
             self.pause_operations()
             self.statusBar().showMessage(f"The queue could not be saved. {exc}", 10000)
@@ -9486,6 +9503,31 @@ class MainWindow(QMainWindow):
                     self._show_queued_progress(STATUSES[waiting.state], operation=waiting)
         self._refresh_operations()
 
+    def _queue_drive_checks(self, candidates, volumes):
+        probe = self._queue_drive_probe
+        if probe is None or probe[0] is not self.db:
+            requests = [
+                (job, volume, self.current_source_path_for_volume(volume))
+                for job in candidates
+                if (volume := volumes.get(job.volume_uuid)) is not None
+            ]
+            result = Future()
+            self._queue_drive_probe = (self.db, result)
+            result.add_done_callback(lambda _: self.queue_drive_probe_finished.emit())
+            Thread(
+                target=_probe_queue_drives, args=(requests, result), name="jvvv-queue-drive-probe", daemon=True,
+            ).start()
+            return
+        result = probe[1]
+        if not result.done():
+            return
+        self._queue_drive_probe = None
+        try:
+            return result.result()
+        except Exception as exc:
+            self.statusBar().showMessage(f"Could not check the drives for queued jobs. {exc}", 10000)
+            return
+
     def _clear_queue_check_progress(self) -> None:
         if self.scan_progress.format() != QUEUE_DRIVE_CHECK_MESSAGE:
             return
@@ -9497,12 +9539,13 @@ class MainWindow(QMainWindow):
         if self.operations_dialog is not None:
             self.operations_dialog.progress.clear()
 
-    def _start_queue_job(self, job: Operation, disks: OperationDisks, volume_id: int, path: str) -> None:
+    def _start_queue_job(self, job: Operation, disks: OperationDisks, volume_id: int, path: str,
+                         destination_ready=None) -> None:
         events = QueueJobEvents(self, job.id)
         if job.kind == "archive":
             worker = thread = ArchiveThread(
                 self.db.path, job, volume_id, self.preview_settings, self, writer_lock=self.queue_writer_lock,
-                resolved_destination=path,
+                resolved_destination=path, destination_ready=destination_ready,
             )
             worker.progress.connect(events.archive_progress)
             thread.finished.connect(events.archive_finished)
@@ -9540,7 +9583,10 @@ class MainWindow(QMainWindow):
             elif problem == "Relink Required":
                 state = "relink"
         self._set_scan_running_ui(bool(self.running_operations))
-        if not self._change_operations(self.operations_queue.set_state, job_id, state, detail):
+        saved = self._change_operations(self.operations_queue.set_state, job_id, state, detail)
+        if active.job.kind == "archive":
+            active.worker.finished_writing.set_result(saved and state in DONE)
+        if not saved:
             self.operations_timer.stop()
             self._refresh_operations()
         if self.running_operations:
@@ -9560,6 +9606,9 @@ class MainWindow(QMainWindow):
         active = self.running_operations.get(job_id)
         if active is None or active.worker.pause_requested.is_set():
             return
+        if label == VERIFY_PHASE and not active.verifying:
+            active.verifying = True
+            QTimer.singleShot(0, self._pump_operations)
         message = f"{label} {format_size(done)} / {format_size(total)}" if total else label
         self._queue_progress(job_id, message, done, total)
         self.statusBar().showMessage(message)
@@ -9576,7 +9625,12 @@ class MainWindow(QMainWindow):
     def _render_running_progress(self) -> None:
         active = list(self.running_operations.values())
         if len(active) > 1:
-            message = f"{len(active)} jobs running ? See Queue Manager for progress"
+            message = f"{len(active)} jobs running · See Queue Manager for progress"
+            preparing = next((entry for entry in active if entry.job.kind == "archive"
+                              and entry.worker.destination_ready is not None
+                              and not entry.worker.destination_ready.done()), None)
+            if preparing is not None:
+                message = f"Preparing {Path(preparing.job.source).name} · {preparing.message}"
             self.scan_progress.setRange(0, 0)
             self.scan_progress.setFormat(message)
             self.operation_progress_label.setText(message)

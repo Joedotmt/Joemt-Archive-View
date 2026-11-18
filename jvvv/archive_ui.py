@@ -1,6 +1,7 @@
 ﻿"""Choose an archive operation and run approved copies off the UI thread."""
 from __future__ import annotations
 
+from concurrent.futures import Future
 from pathlib import Path
 from threading import Event
 
@@ -19,7 +20,7 @@ class ArchiveThread(QThread):
     progress = Signal(str, object, object)
 
     def __init__(self, catalogue, operation, volume_id, preview_settings, parent, *, writer_lock=None,
-                 resolved_destination=None):
+                 resolved_destination=None, destination_ready=None):
         super().__init__(parent)
         self.catalogue = catalogue
         self.operation = operation
@@ -27,6 +28,8 @@ class ArchiveThread(QThread):
         self.preview_settings = preview_settings
         self.writer_lock = writer_lock
         self.resolved_destination = resolved_destination
+        self.destination_ready = destination_ready
+        self.finished_writing = Future()
         self.pause_requested = Event()
         self.result = None
         self.error = ""
@@ -48,7 +51,7 @@ class ArchiveThread(QThread):
                 volume = db.get_volume(self.volume_id)
                 job = ArchiveJob(db, preview_settings=previews,
                                  cancelled=self.pause_requested.is_set, progress=self.progress.emit,
-                                 writer_lock=self.writer_lock)
+                                 writer_lock=self.writer_lock, destination_ready=self.destination_ready)
                 self.result = job.run(
                     source, self.volume_id, volume_uuid=self.operation.volume_uuid,
                     job_id=None if self.operation.legacy_journal else self.operation.id,

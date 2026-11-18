@@ -205,10 +205,13 @@ class OperationsQueue:
             raise ValueError("Remove the dependent archive jobs before removing this scan.")
         self._save([item for item in self.jobs if item.id != job_id])
 
-    def next_ready(self, availability, can_start=None) -> Operation | None:
+    def next_ready(self, availability, can_start=None, *, preparing_after=None) -> Operation | None:
         """Skip disconnected drives and blocked dependencies, preserving order per drive."""
         blocked = set()
         for job in self.jobs:
+            if preparing_after is not None:
+                if job.volume_uuid != preparing_after.volume_uuid or job.id == preparing_after.id:
+                    continue
             if job.state in DONE or job.state == "failed" or job.state == "queued":
                 continue
             if job.volume_uuid in blocked:

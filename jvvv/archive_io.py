@@ -36,6 +36,36 @@ def _kernel():
     return ctypes.WinDLL("kernel32", use_last_error=True)
 
 
+class _MemoryStatus(ctypes.Structure):
+    _fields_ = [("length", wintypes.DWORD), ("load", wintypes.DWORD)] + [
+        (field, ctypes.c_uint64) for field in (
+            "total_physical", "available_physical", "total_commit", "available_commit",
+            "total_virtual", "available_virtual", "extended_virtual",
+        )
+    ]
+
+
+def archive_memory_headroom() -> int | None:
+    """Additional bytes we can buffer, negative when other work needs memory."""
+    if os.name == "nt":
+        status = _MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if not _kernel().GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        total = status.total_physical
+        available = min(status.available_physical, status.available_commit, status.available_virtual)
+    else:
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            total = page * os.sysconf("SC_PHYS_PAGES")
+            available = page * os.sysconf("SC_AVPHYS_PAGES")
+        except (ValueError, OSError, AttributeError):
+            return None
+        if total <= 0 or available < 0:
+            return None
+    return available - max(1024**3, total // 8)
+
+
 def _win_path(path: Path) -> str:
     name = str(path)
     if name.startswith("\\\\?\\"):

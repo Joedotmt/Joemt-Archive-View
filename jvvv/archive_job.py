@@ -1,10 +1,10 @@
 """Resumable, verified copies of project folders to filesystem destinations."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import ExitStack, closing, nullcontext
 from dataclasses import dataclass
-import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -13,11 +13,12 @@ import sqlite3
 import stat
 from tempfile import TemporaryDirectory, gettempdir
 from time import monotonic
+from typing import Any
 from uuid import UUID, uuid4
 
 from .archive_io import (
     ARCHIVE_STAGE_NAME, ARCHIVE_STAGE_PREFIX, ARCHIVE_STAGE_SUFFIX, CHUNK_SIZE,
-    DestinationReader, ProjectGuard, file_identity, fingerprint, hold_folder, is_link,
+    DestinationReader, ProjectGuard, archive_memory_headroom, file_identity, fingerprint, hold_folder, is_link,
 )
 from .content_hash import new_hasher
 from .database import Database, format_timestamp, utc_now
@@ -25,11 +26,14 @@ from .drive_marker import MARKER_IDENTITY, read_drive_marker, write_drive_marker
 from .media_metadata import MediaInspectionCancelled, MediaMetadataExtractor, media_kind_for_extension
 from .preview_cache import PreviewCancelled
 from .preview_service import PreviewService, status_record_for
-from .utils import capture_volume_snapshot, format_size, resolve_volume_source_path, snapshot_matches_volume
+from .utils import capture_volume_snapshot, format_size, physical_disk_key, resolve_volume_source_path, snapshot_matches_volume
 
 
 JOB_FILE = "archive-job.sqlite"
-RAM_PER_FILE = 64 * 1024 * 1024
+VERIFY_PHASE = "Reading back the destination…"
+MEMORY_RECHECK_BYTES = 32 * 1024 * 1024
+FALLBACK_READ_AHEAD = 256 * 1024 * 1024
+FALLBACK_MEDIA_RAM = 64 * 1024 * 1024
 
 
 class ArchivePaused(Exception):
@@ -45,6 +49,14 @@ class ProjectEntry:
     relative: str
     info: os.stat_result
     directory: bool
+
+
+@dataclass
+class BufferedPrefix:
+    blocks: deque[bytes]
+    size: int
+    hasher: Any
+    change_time_ns: int
 
 
 @dataclass(frozen=True)
@@ -206,33 +218,59 @@ def _manifest(entries, check) -> str:
 
 
 class MediaInput:
-    """Keep small inputs in RAM until the existing path-based decoder needs them."""
+    """Stage media in available RAM and hand a seekable file to the decoder."""
 
     def __init__(self, scratch: Path, suffix: str, size: int):
         self.path = scratch / (uuid4().hex + suffix)
-        if size > RAM_PER_FILE and shutil.disk_usage(scratch).free < size:
+        if shutil.disk_usage(scratch).free < size:
             raise OSError(f"The temporary media cache needs {format_size(size)} of free space: {scratch}")
-        self.stream = io.BytesIO() if size <= RAM_PER_FILE else self.path.open("xb")
+        headroom = archive_memory_headroom()
+        self.blocks = deque()
+        self.stream = None if size <= (FALLBACK_MEDIA_RAM if headroom is None else headroom) else self.path.open("xb")
+        self.since_check = 0
 
     def write(self, data) -> None:
+        if self.stream is None:
+            self.since_check += len(data)
+            if self.since_check >= MEMORY_RECHECK_BYTES:
+                self.since_check = 0
+                headroom = archive_memory_headroom()
+                if headroom is not None and headroom < len(data):
+                    self._spill()
+        if self.stream is None:
+            # Bytes from read-ahead can be shared; DestinationReader reuses its mutable buffer.
+            try:
+                self.blocks.append(bytes(data))
+                return
+            except MemoryError:
+                self._spill()
         self.stream.write(data)
 
+    def _spill(self):
+        self.stream = self.path.open("xb")
+        while self.blocks:
+            self.stream.write(self.blocks.popleft())
+
     def materialize(self) -> Path:
-        if isinstance(self.stream, io.BytesIO):
-            with self.stream.getbuffer() as data, self.path.open("xb") as output:
-                output.write(data)
+        if self.stream is None:
+            self._spill()
         self.stream.close()
         return self.path
 
     def close(self) -> None:
-        self.stream.close()
+        self.blocks.clear()
+        if self.stream is not None:
+            self.stream.close()
         self.path.unlink(missing_ok=True)
 
 
 class ArchiveJob:
     """Own one attempt; journal completed files and commit the catalogue once."""
 
-    def __init__(self, db: Database, *, preview_settings=None, cancelled=None, progress=None, writer_lock=None):
+    def __init__(self, db: Database, *, preview_settings=None, cancelled=None, progress=None, writer_lock=None,
+                 destination_ready=None):
+        self.destination_ready = destination_ready
+        self.prefixes: dict[str, BufferedPrefix] = {}
         self.db = db
         self.writer_lock = writer_lock
         self.preview_settings = preview_settings
@@ -302,6 +340,7 @@ class ArchiveJob:
 
         total_start = monotonic()
         with ProjectGuard(source) as self.guard, ExitStack() as resources:
+            resources.callback(self.prefixes.clear)
             resources.enter_context(hold_folder(destination))
             destination_identity = file_identity(_checked_folder(destination))
             if not _matches_archive_volume(volume, capture_volume_snapshot(destination)):
@@ -311,6 +350,56 @@ class ArchiveJob:
             if any(entry.relative.casefold() == marker_name.casefold() for entry in entries):
                 raise OSError(f"The source already contains the reserved archive marker: {marker_name}")
             source_manifest = _manifest(entries, self._check)
+            extractor = MediaMetadataExtractor()
+            service = None
+            if self.preview_settings is not None:
+                service = PreviewService(self.preview_settings, hash_algorithm=self.algorithm)
+            cache_root = Path(resources.enter_context(TemporaryDirectory(prefix="jvvv-archive-", dir=scratch)))
+            worker = resources.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix="archive-media"))
+            pending = None
+            media = {}
+
+            def finish_media():
+                nonlocal pending
+                if pending is not None:
+                    relative, future = pending
+                    media[relative] = future.result()
+                    pending = None
+
+            def queue_media(entry, cache, digest):
+                nonlocal pending
+                try:
+                    finish_media()
+                    pending = entry.relative, worker.submit(self._inspect_media, entry, cache, digest, extractor, service)
+                except BaseException:
+                    cache.close()
+                    raise
+
+            def media_worker_available():
+                return pending is None or pending[1].done()
+
+            files = [entry for entry in entries if not entry.directory]
+            prepared_media = set()
+            if self.destination_ready is not None:
+                disk = physical_disk_key(destination)
+                source_disk = physical_disk_key(source)
+                separate_source = disk is not None and disk != source_disk and (
+                    source_disk is not None or source.drive.casefold() == "q:"
+                )
+                if separate_source and not journal_path.exists():
+                    # Keep preview and scratch writes off the HDD being verified.
+                    stores = [scratch]
+                    if service is not None:
+                        stores.append(self.preview_settings.root_path)
+                    early_media = all(
+                        (store_disk := physical_disk_key(store)) is not None and store_disk != disk for store in stores
+                    )
+                    prepared_media = self._read_ahead(
+                        source, files, cache_root, queue_media, lambda: early_media and media_worker_available(),
+                    )
+                self._wait_for_destination()
+                if not _matches_archive_volume(volume, capture_volume_snapshot(destination)):
+                    raise OSError("The selected archive drive changed during read-ahead.")
             for suffix in ("", "-journal", "-wal", "-shm"):
                 candidate = journal_path.with_name(journal_path.name + suffix)
                 if os.path.lexists(candidate):
@@ -363,7 +452,6 @@ class ArchiveJob:
                 if list(file_identity(_checked_folder(stage))) != state["stage_identity"]:
                     raise OSError(f"The archive staging folder was replaced: {stage}")
 
-            files = [entry for entry in entries if not entry.directory]
             total = sum(entry.info.st_size for entry in files)
             existing = {entry.relative: entry for entry in _scan_tree(work, self._check)}
             marker_path = work / marker_name
@@ -401,31 +489,6 @@ class ArchiveJob:
                         check_destination()
                         (work / entry.relative).mkdir()
 
-            extractor = MediaMetadataExtractor()
-            service = None
-            if self.preview_settings is not None:
-                service = PreviewService(self.preview_settings, hash_algorithm=self.algorithm)
-            cache_root = Path(resources.enter_context(TemporaryDirectory(prefix="jvvv-archive-", dir=scratch)))
-            worker = resources.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix="archive-media"))
-            pending = None
-            media = {}
-
-            def finish_media():
-                nonlocal pending
-                if pending is not None:
-                    relative, future = pending
-                    media[relative] = future.result()
-                    pending = None
-
-            def queue_media(entry, cache, digest):
-                nonlocal pending
-                try:
-                    finish_media()
-                    pending = entry.relative, worker.submit(self._inspect_media, entry, cache, digest, extractor, service)
-                except BaseException:
-                    cache.close()
-                    raise
-
             copy_started = monotonic()
             copied = 0
             self._progress("Copying and hashing originals…", 0, total, force=True)
@@ -443,7 +506,7 @@ class ArchiveJob:
                 _checked_folder(path.parent)
                 if list(file_identity(_checked_folder(stage))) != state["stage_identity"]:
                     raise OSError(f"The archive staging folder was replaced: {stage}")
-                cache = self._media_input(cache_root, entry)
+                cache = None if entry.relative in prepared_media else self._media_input(cache_root, entry)
                 try:
                     digest = self._copy_file(source / entry.relative, part, entry, cache, copied, total)
                     self._record_digest(journal, entry.relative, digest)
@@ -462,7 +525,7 @@ class ArchiveJob:
 
             verify_started = monotonic()
             verified = 0
-            self._progress("Reading back the destination…", 0, total, force=True)
+            self._progress(VERIFY_PHASE, 0, total, force=True)
             destination_stats = {}
             with DestinationReader() as reader:
                 for entry in files:
@@ -492,7 +555,7 @@ class ArchiveJob:
                         raise
                     destination_stats[entry.relative] = info
                     verified += info.st_size
-                    self._progress("Reading back the destination…", verified, total)
+                    self._progress(VERIFY_PHASE, verified, total)
                     if cache is not None:
                         queue_media(entry, cache, digest)
             verify_seconds = monotonic() - verify_started
@@ -627,17 +690,116 @@ class ArchiveJob:
             return MediaInput(cache_root, suffix, entry.info.st_size)
         return None
 
+    def _wait_for_destination(self):
+        buffered = sum(prefix.size for prefix in self.prefixes.values())
+        def show_buffered():
+            self._progress(f"Waiting for the previous archive to finish · {format_size(buffered)} buffered",
+                           0, 0, force=True)
+
+        show_buffered()
+        next_check = monotonic()
+        while True:
+            self._check()
+            if self.prefixes and monotonic() >= next_check:
+                headroom = archive_memory_headroom()
+                if headroom is not None and headroom < 0:
+                    while headroom < 0 and self.prefixes:
+                        _, prefix = self.prefixes.popitem()
+                        headroom += prefix.size
+                        buffered -= prefix.size
+                        del prefix
+                    show_buffered()
+                next_check = monotonic() + 1
+            try:
+                released = self.destination_ready.result(timeout=0.1)
+            except TimeoutError:
+                continue
+            if not released:
+                raise ArchivePaused("Previous archive did not finish. Apply the queue to resume.")
+            return
+
+    def _read_ahead(self, source, files, cache_root, queue_media, media_worker_available):
+        """Read a bounded prefix under the same source guard used for the copy."""
+        prepared_media = set()
+        headroom = archive_memory_headroom()
+        budget = FALLBACK_READ_AHEAD if headroom is None else max(0, headroom)
+        limit = min(budget, sum(entry.info.st_size for entry in files))
+        next_check = MEMORY_RECHECK_BYTES
+        buffered = 0
+        self._progress("Reading ahead from source…", 0, limit, force=True)
+        for index, entry in enumerate(files):
+            if index and index % 1024 == 0:
+                next_check = buffered
+            if buffered >= limit or self.destination_ready.done():
+                break
+            if not entry.info.st_size:
+                continue
+            blocks = deque()
+            hasher = new_hasher(self.algorithm)
+            count = 0
+            with (source / entry.relative).open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if fingerprint(opened) != fingerprint(entry.info):
+                    raise OSError(f"Source changed before read-ahead: {entry.relative}")
+                while count < entry.info.st_size and buffered < limit and not self.destination_ready.done():
+                    self._check()
+                    if buffered >= next_check:
+                        headroom = archive_memory_headroom()
+                        if headroom is not None:
+                            limit = min(limit, buffered + max(0, headroom))
+                        next_check = buffered + MEMORY_RECHECK_BYTES
+                        if buffered >= limit:
+                            break
+                    try:
+                        block = stream.read(min(CHUNK_SIZE, limit - buffered, entry.info.st_size - count))
+                        if block:
+                            blocks.append(block)
+                    except MemoryError:
+                        limit = buffered
+                        break
+                    if not block:
+                        raise OSError(f"Source changed during read-ahead: {entry.relative}")
+                    hasher.update(block)
+                    count += len(block)
+                    buffered += len(block)
+                    self._progress("Reading ahead from source…", buffered, limit)
+            if not blocks:
+                break
+            self.prefixes[entry.relative] = BufferedPrefix(blocks, count, hasher, opened.st_ctime_ns)
+            if count == entry.info.st_size and media_worker_available():
+                cache = self._media_input(cache_root, entry)
+                if cache is not None:
+                    try:
+                        for block in blocks:
+                            cache.write(block)
+                        queue_media(entry, cache, hasher.digest())
+                    except BaseException:
+                        cache.close()
+                        raise
+                    prepared_media.add(entry.relative)
+        return prepared_media
+
     def _copy_file(self, source, part, entry, cache, copied, total):
-        hasher = new_hasher(self.algorithm)
+        prefix = self.prefixes.pop(entry.relative, None)
+        hasher = prefix.hasher if prefix else new_hasher(self.algorithm)
         count = 0
         with source.open("rb") as input_file, part.open("xb") as output:
-            if fingerprint(os.fstat(input_file.fileno())) != fingerprint(entry.info):
+            current = os.fstat(input_file.fileno())
+            if fingerprint(current) != fingerprint(entry.info) or (prefix and current.st_ctime_ns != prefix.change_time_ns):
                 raise OSError(f"The source changed before copying: {source}")
-            while (block := input_file.read(CHUNK_SIZE)):
+            if prefix:
+                input_file.seek(prefix.size)
+            while True:
+                if prefix and prefix.blocks:
+                    block = prefix.blocks.popleft()
+                else:
+                    block = input_file.read(CHUNK_SIZE)
+                    if not block:
+                        break
+                    hasher.update(block)
                 self._check()
                 if count + len(block) > entry.info.st_size:
                     raise OSError(f"The source grew while copying: {source}")
-                hasher.update(block)
                 output.write(block)
                 if cache is not None:
                     cache.write(block)

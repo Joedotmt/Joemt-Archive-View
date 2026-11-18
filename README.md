@@ -238,6 +238,19 @@ adds a project marker such as `Project Name.jvvv-project.json` inside the
 copied folder. The project appears under the selected volume in the catalogue
 as soon as verification finishes, without a full drive scan.
 
+When two approved projects are queued for the same HDD, JVVV can prepare the
+next project while verifying the first. It reads and hashes the next source into
+available RAM until the destination is ready. JVVV reserves one eighth of
+installed memory (at least 1 GiB) for other work and checks available memory as it
+reads. Preview staging uses the same memory policy and can spill to temporary
+storage under pressure. Complete buffered media files can start preview
+processing when the temporary workspace and preview store are on separate
+storage from the destination. Queue Manager shows the preparation progress.
+The next project starts writing after the previous archive finishes successfully,
+then receives its own full read-back verification. If the earlier archive is
+paused or fails, the waiting project pauses too. Read-ahead is used when JVVV
+can identify the destination disk and read the next project independently.
+
 **Pause Queue** leaves progress saved in the catalogue and a temporary archive
 folder on the destination drive. Reconnect the same drive and click **Apply**
 beside the catalogue name to resume. Previously copied files are checked before publication. If the
