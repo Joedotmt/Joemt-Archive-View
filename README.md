@@ -294,18 +294,19 @@ reading all data on the drive. The scan bar and Scan Log report hashing progress
 bytes read, and files whose hash could not be recorded. Cancelling during indexing
 or encountering an incomplete read preserves the previously applied hashes and catalogue records
 atomically. Once indexing is committed, the catalogue is ready to browse while
-offline previews run in a separate background phase. **Cancel Previews** stops that
+the background worker publishes prepared previews and generates any remaining ones. **Cancel Previews** stops that
 phase and keeps the updated catalogue and completed previews. The Scan Log reports
-indexing time (including hashing and media inspection), preview time, total time,
+indexing time (including hashing, media inspection, and overlapping preview work),
+time spent on previews after indexing, total time,
 and the number of media records reused.
 If a file keeps changing or disappears while it is being hashed, it is skipped
 and reported as an incomplete scan area instead of saving a known-stale snapshot.
 
 Media details are descriptive and are never used as file identity. Image sizes
 (including HEIC/HEIF and camera RAW files, after EXIF orientation) and WAV
-details require no additional software. For broader audio/video details,
-install FFmpeg and make its `ffprobe` executable available on `PATH`; otherwise
-Properties explicitly says that those details were not collected. Rescans reuse
+details require no additional software. PyAV can read video details from a captured
+RAM buffer. For file-based audio/video inspection, install FFmpeg and make its
+`ffprobe` executable available on `PATH`. Rescans reuse
 complete media details only after a freshly calculated content hash indicates the content
 is unchanged. Missing, partial, failed, or unavailable details are probed again.
 If a retry fails, earlier useful details are retained only when the hash matches,
@@ -446,9 +447,17 @@ onto neutral grey, downsizes to the configured maximum without ever upscaling,
 and writes a JPEG that carries only the ICC profile — no EXIF, XMP, comments or
 other source metadata. Decoding is refused above 600 megapixels.
 
-Preview generation starts after catalogue indexing and change review are complete.
-Jobs are processed sequentially on the background scan worker, using a temporary
-disk queue to bound memory use. Every preview requires a recorded content hash and a
+When the scanner can identify both the temporary workspace and the preview store
+on disks separate from the source, it captures media during hashing. One worker
+prepares a missing preview while the scanner hashes the next file. Videos can use
+the same RAM-backed input as **Archive Project**. Images and decoders that need
+a file use local temporary storage. An unchanged file with a known cached preview
+skips capture and still receives a full hash check.
+
+Prepared previews remain private until indexing and change review finish. The scanner
+then checks the original file's identity and timestamp before publishing each preview.
+If capture is unavailable, the worker generates the preview from the original after
+indexing. Jobs are recorded in a temporary disk queue. Every preview requires a recorded content hash and a
 source that passed the stability checks; a source that changes
 between hashing and preview generation is reported as a failure rather than
 previewed under the old hash. If the preview directory lies inside the volume

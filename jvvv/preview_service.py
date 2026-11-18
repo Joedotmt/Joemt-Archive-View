@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .archive_io import is_link
 from .image_preview import (
     IMAGE_BACKEND_NAME,
     ImagePreviewGenerator,
@@ -38,6 +39,7 @@ from .preview_cache import (
     STAGE_PERMISSION,
     STAGE_PREVIEW_ROOT,
     STAGE_RENAME,
+    STAGE_SOURCE_CHANGED,
     STAGE_TEMP_FILE,
     STAGE_UNEXPECTED_ERROR,
     STORAGE_STAGES,
@@ -47,6 +49,7 @@ from .preview_cache import (
     PreviewFailure,
     PreviewResult,
     classify_os_error,
+    ensure_source_snapshot,
     os_error_detail,
     hash_hex,
 )
@@ -1033,6 +1036,7 @@ class PreviewService:
         video_codec: str | None = None,
         source_stat: os.stat_result | None = None,
         staged_video=None,
+        prepared_path: Path | None = None,
     ) -> PreviewResult:
         """Return the explicit outcome for one hashed, stable source file.
 
@@ -1137,14 +1141,19 @@ class PreviewService:
 
         self._in_flight.add(destination)
         try:
-            if media_kind == "image":
+            result = None
+            if prepared_path is not None and prepared_path.is_file():
+                result = self._publish_prepared(
+                    prepared_path, destination, media_kind, profile_id, source, source_stat, cancel_callback,
+                )
+            if result is None and media_kind == "image":
                 result = self.image_generator.generate(
                     Path(source),
                     destination,
                     cancel_callback=cancel_callback,
                     source_stat=source_stat,
                 )
-            else:
+            elif result is None:
                 result = self.video_generator.generate(
                     Path(source),
                     destination,
@@ -1213,6 +1222,27 @@ class PreviewService:
             self.statistics.corrupt_replaced += 1
             result = replace(result, replaced_corrupt=True)
         return result
+
+    def _publish_prepared(self, prepared, destination, kind, profile, source, expected, cancelled):
+        validation = validate_image_preview(prepared) if kind == "image" else validate_video_preview(prepared)
+        if not validation.valid:
+            return None
+        try:
+            current = source.lstat()
+        except OSError as exc:
+            raise PreviewError(STAGE_SOURCE_CHANGED, "The source is no longer available.", detail=str(exc)) from exc
+        if is_link(current) or not stat.S_ISREG(current.st_mode) or (expected and current.st_dev != expected.st_dev):
+            raise PreviewError(STAGE_SOURCE_CHANGED, "The source changed after hashing.")
+        ensure_source_snapshot(source, current, expected)
+        if cancelled and cancelled():
+            raise PreviewCancelled("Preview generation cancelled.")
+        self.cache.ensure_parent(destination)
+        self.cache.publish(prepared, destination)
+        return PreviewResult(
+            status=PREVIEW_GENERATED, media_kind=kind, profile_id=profile, path=destination,
+            bytes_written=validation.size_bytes, size_bytes=validation.size_bytes,
+            width=validation.width, height=validation.height, duration_ms=getattr(validation, "duration_ms", None),
+        )
 
 
 def _video_progress_adapter(

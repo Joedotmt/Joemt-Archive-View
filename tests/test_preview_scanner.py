@@ -327,6 +327,136 @@ def make_scanner(db: Database, service: PreviewService | None = None, **kwargs) 
     return VolumeScanner(db, preview_service=service, **kwargs)
 
 
+def test_hash_read_prepares_missing_previews_while_next_file_is_read(catalogue, source, tmp_path, monkeypatch):
+    from threading import Event
+    from jvvv import scan_preview
+
+    monkeypatch.setattr(scan_preview, "separate_disks", lambda *_: True)
+    first = source / "a.png"
+    write_test_image(first, 80, 64, "png")
+    second = source / "b.png"
+    second.write_bytes(first.read_bytes())
+    volume = catalogue.create_volume("HDD", str(source))
+    service, cache = make_service(tmp_path)
+    cache.root.mkdir()
+    started = Event()
+    second_hashed = Event()
+    generate = service.image_generator.generate
+    def encode(path, destination, **options):
+        assert path.parent != source
+        started.set()
+        assert second_hashed.wait(5)
+        return generate(path, destination, **options)
+
+    monkeypatch.setattr(service.image_generator, "generate", encode)
+    scanner = make_scanner(catalogue, service)
+    hash_file = scanner._hash_file
+    def read(path, *args):
+        if path == second:
+            assert started.wait(5)
+        result = hash_file(path, *args)
+        if path == second:
+            second_hashed.set()
+        return result
+
+    monkeypatch.setattr(scanner, "_hash_file", read)
+    result = scanner.scan(volume)
+    assert result.indexed and result.preview["image_generated"] == result.preview["image_reused"] == 1
+    assert len(service.image_generator.calls) == 1
+    assert not service.image_generator.calls[0].exists()
+    assert cache.preview_path("image", sha256_of(first)).is_file()
+    assert not list(cache.root.glob(".jvvv-scan.tmp-*"))
+
+
+def test_rescan_only_captures_changed_or_missing_previews(catalogue, source, tmp_path, monkeypatch):
+    from jvvv import scan_preview
+
+    monkeypatch.setattr(scan_preview, "separate_disks", lambda *_: True)
+    paths = [source / f"{name}.png" for name in ("cached", "changed", "missing")]
+    for index, path in enumerate(paths):
+        write_test_image(path, 80 + index, 64, "png")
+    volume = catalogue.create_volume("HDD", str(source))
+    service, cache = make_service(tmp_path)
+    cache.root.mkdir()
+    assert make_scanner(catalogue, service).scan(volume).indexed
+    write_test_image(paths[1], 96, 64, "png")
+    cache.preview_path("image", sha256_of(paths[2])).unlink()
+
+    sizes = []
+    original = scan_preview.MediaInput
+    def record(scratch, suffix, size, **kwargs):
+        sizes.append(size)
+        return original(scratch, suffix, size, **kwargs)
+
+    monkeypatch.setattr(scan_preview, "MediaInput", record)
+    service, _ = make_service(tmp_path)
+    result = make_scanner(catalogue, service).scan(volume)
+    assert result.indexed and result.files_hashed == 3
+    assert sizes == [path.stat().st_size for path in paths[1:]]
+    assert result.preview["image_reused"] == 1
+    assert result.preview["image_generated"] == 2
+
+
+@pytest.mark.parametrize("action", ["discard", "change", "cancel", "scratch failure", "write failure", "hash retry"])
+def test_prepared_preview_respects_scan_outcome(catalogue, source, tmp_path, monkeypatch, action):
+    from jvvv import scan_preview
+    from jvvv.preview_cache import STAGE_SOURCE_CHANGED
+
+    monkeypatch.setattr(scan_preview, "separate_disks", lambda *_: True)
+    path = source / "photo.png"
+    write_test_image(path, 80, 64, "png")
+    volume = catalogue.create_volume("HDD", str(source))
+    if action == "discard":
+        assert make_scanner(catalogue).scan(volume).indexed
+        write_test_image(path, 84, 64, "png")
+    digest = sha256_of(path)
+    service, cache = make_service(tmp_path)
+    cache.root.mkdir()
+    cancelled = False
+    def ready():
+        nonlocal cancelled
+        assert not cache.preview_path("image", digest).exists()
+        if action == "change":
+            write_test_image(path, 96, 64, "png")
+        cancelled = action == "cancel"
+
+    if action == "scratch failure":
+        def fail(*args, **kwargs):
+            raise OSError("Scratch unavailable")
+        monkeypatch.setattr(scan_preview, "MediaInput", fail)
+    elif action == "write failure":
+        def fail_write(*args):
+            raise OSError("Scratch full")
+        monkeypatch.setattr(scan_preview.MediaInput, "write", fail_write)
+    elif action == "hash retry":
+        from jvvv.scanner import FileChangedDuringHashError
+        original = VolumeScanner._hash_file
+        def change_once(scanner, *args):
+            result = original(scanner, *args)
+            if result[0] == digest:
+                write_test_image(path, 92, 64, "png")
+                raise FileChangedDuringHashError("Changed during first hash")
+            return result
+        monkeypatch.setattr(VolumeScanner, "_hash_file", change_once)
+    result = make_scanner(catalogue, service, catalogue_ready_callback=ready,
+                          cancel_callback=lambda: cancelled, preview_callback=lambda _: False).scan(volume)
+    assert not list(cache.root.glob(".jvvv-scan.tmp-*"))
+    if action in {"scratch failure", "write failure", "hash retry"}:
+        assert result.indexed and result.preview["image_generated"] == 1
+        assert service.image_generator.calls == [path]
+        assert preview_rows(catalogue)["photo.png"]["source_hash"] == sha256_of(path)
+        if action == "hash retry":
+            assert not cache.preview_path("image", digest).exists()
+    else:
+        assert not cache.preview_path("image", digest).exists()
+        if action == "discard":
+            assert result.status == "discarded"
+        elif action == "cancel":
+            assert result.indexed and result.preview["interrupted"]
+        else:
+            assert preview_rows(catalogue)["photo.png"]["error_stage"] == STAGE_SOURCE_CHANGED
+
+
 def make_media_tree(root: Path) -> None:
     write_test_image(root / "Photos" / "alpha.png", 800, 600, "png")
     write_test_image(root / "Photos" / "beta.jpg", 640, 480, "jpeg")
@@ -1250,8 +1380,8 @@ def test_audio_files_get_no_preview_status_row(catalogue, source, tmp_path):
 # ---------------------------------------------------------------------------
 # Optional: the real FFmpeg
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("extension", ["mp4", "insv"])
-def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, tmp_path, extension):
+@pytest.mark.parametrize("extension,prepare", [("mp4", False), ("insv", False), ("mp4", True)])
+def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, tmp_path, monkeypatch, extension, prepare):
     ffmpeg = real_ffmpeg_path()
     if ffmpeg is None:
         pytest.skip("Set JVVV_TEST_FFMPEG to a real ffmpeg executable to run this test.")
@@ -1261,6 +1391,14 @@ def test_real_ffmpeg_generates_a_video_preview_during_a_scan(catalogue, source, 
     settings = preview_settings(tmp_path)
     service = PreviewService(settings, ffmpeg_path=ffmpeg)
     cache = service.cache
+    if prepare:
+        cache.root.mkdir()
+        monkeypatch.setattr("jvvv.scan_preview.separate_disks", lambda *_: True)
+        generate = service.video_generator.generate
+        def from_capture(path, *args, **kwargs):
+            assert path != source / relative
+            return generate(path, *args, **kwargs)
+        monkeypatch.setattr(service.video_generator, "generate", from_capture)
     volume_id = catalogue.create_volume("Drive", str(source))
     messages: list[str] = []
 

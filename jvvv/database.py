@@ -2567,7 +2567,7 @@ class Database:
             row["relative_path"]: row
             for row in self.connection.execute(
                 """
-                SELECT f.relative_path, f.content_hash, f.content_hash_algorithm, m.*
+                SELECT f.relative_path, f.content_hash, f.content_hash_algorithm, f.size_bytes, f.modified_at, m.*
                 FROM files f
                 JOIN file_media_metadata m ON m.file_id = f.id
                 WHERE f.folder_id = ? AND f.missing = 0

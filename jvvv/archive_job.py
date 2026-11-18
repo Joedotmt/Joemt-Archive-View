@@ -286,6 +286,15 @@ class MediaInput:
         self.stream.close()
         return self.path
 
+    def inspect(self, extractor, extension, cancelled):
+        probe = getattr(extractor, "inspect_shared_video", None)
+        metadata = probe(self.shared, cancelled) if self.shared is not None and probe else None
+        if metadata is None or (metadata.status != "complete" and extractor.ffprobe_path):
+            inspected = extractor.inspect(self.materialize(), extension=extension, cancel_callback=cancelled)
+            if metadata is None or metadata.status != "partial" or (inspected and inspected.status == "complete"):
+                return inspected
+        return metadata
+
     def close(self) -> None:
         if self.shared is not None:
             self.shared.close()
@@ -863,18 +872,11 @@ class ArchiveJob:
             self._check()
             extension = PurePosixPath(entry.relative).suffix
             result = None
-            metadata = None
-            if cache.shared is not None:
-                if service is not None:
-                    preview = service.cache.preview_path("video", digest.hex())
-                    result, _ = service.existing_preview("video", preview)
-                metadata = extractor.inspect_shared_video(cache.shared, self.cancelled)
+            if cache.shared is not None and service is not None:
+                preview = service.cache.preview_path("video", digest.hex())
+                result, _ = service.existing_preview("video", preview)
+            metadata = cache.inspect(extractor, extension, self.cancelled)
             path = cache.path
-            if metadata is None or (metadata.status != "complete" and extractor.ffprobe_path):
-                path = cache.materialize()
-                inspected = extractor.inspect(path, extension=extension, cancel_callback=self.cancelled)
-                if metadata is None or metadata.status != "partial" or (inspected and inspected.status == "complete"):
-                    metadata = inspected
             kind = metadata.media_kind if metadata is not None else media_kind_for_extension(extension)
             status = None
             if service is not None and kind in {"image", "video"} and result is None:

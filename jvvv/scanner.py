@@ -21,6 +21,7 @@ from .media_metadata import (
     media_kind_for_extension,
 )
 from .preview_cache import PreviewCancelled
+from .scan_preview import ScanPreviewPreparation
 from .preview_service import (
     MODE_SKIPPED_PREFLIGHT,
     PreviewService,
@@ -196,6 +197,7 @@ class VolumeScanner:
         # when previews are enabled and the scan-start preflight passed;
         # ``preview_statistics`` records the reason when they were skipped.
         self.preview_service = preview_service
+        self._preview_preparation = None
         if preview_service is not None:
             self.preview_statistics = preview_service.statistics
         elif preview_statistics is not None:
@@ -300,6 +302,9 @@ class VolumeScanner:
         catalogue_committed = False
 
         try:
+            if self.preview_service is not None:
+                self._preview_preparation = ScanPreviewPreparation.open(root, self.preview_service, self._cancelled)
+            preparation = self._preview_preparation
             def on_walk_error(exc: OSError) -> None:
                 nonlocal errors_count
                 errors_count += 1
@@ -415,6 +420,10 @@ class VolumeScanner:
                             continue
 
                         extension = full_path.suffix[1:].lower() if full_path.suffix else ""
+                        media_kind = media_kind_for_extension(extension)
+                        previous = previous_media.get(rel_path)
+                        if preparation is not None:
+                            preparation.begin(media_kind, full_path.suffix, stat_result, previous)
                         content_hash: bytes | None = None
                         hash_started = time.monotonic()
                         try:
@@ -439,6 +448,8 @@ class VolumeScanner:
                             )
                             continue
                         except OSError as exc:
+                            if preparation is not None:
+                                preparation.discard_input()
                             errors_count += 1
                             self.hash_errors += 1
                             self.db.add_scan_error(
@@ -467,8 +478,6 @@ class VolumeScanner:
                                 self.hash_algorithm if content_hash is not None else None
                             ),
                         )
-                        media_kind = media_kind_for_extension(extension)
-                        previous = previous_media.get(rel_path)
                         preserve_previous_media = bool(
                             previous is not None
                             and content_hash is not None
@@ -487,9 +496,13 @@ class VolumeScanner:
                                 self._emit_progress(
                                     files_seen, folders_seen, f"Reading media details · {rel_path}",
                                 )
-                                media_metadata = self.media_extractor.inspect(
-                                    full_path, extension=extension, cancel_callback=self._cancelled,
-                                )
+                                media_metadata = None
+                                if preparation is not None and preparation.current is not None:
+                                    media_metadata = preparation.inspect(self.media_extractor, extension)
+                                if media_metadata is None:
+                                    media_metadata = self.media_extractor.inspect(
+                                        full_path, extension=extension, cancel_callback=self._cancelled,
+                                    )
                             else:
                                 media_metadata = None
                         except MediaInspectionCancelled as exc:
@@ -511,6 +524,9 @@ class VolumeScanner:
                             media_kind in {"image", "video"}
                             and self.preview_service is not None
                         ):
+                            if preparation is not None and preparation.current is not None and content_hash is not None:
+                                self._emit_progress(files_seen, folders_seen, f"Preparing offline preview · {rel_path}")
+                                preparation.submit(media_kind, content_hash, media_metadata)
                             pickle.dump(
                                 dict(
                                     file_id=file_id, media_kind=media_kind, full_path=full_path,
@@ -522,6 +538,8 @@ class VolumeScanner:
                                 preview_jobs,
                             )
                             preview_job_count += 1
+                        elif preparation is not None:
+                            preparation.discard_input()
                         files_seen += 1
                         if files_seen % self.batch_size == 0:
                             self._emit_progress(files_seen, folders_seen, rel_path)
@@ -600,6 +618,8 @@ class VolumeScanner:
                     "Catalogue ready · generating offline previews", force=True,
                 )
                 preview_started = time.monotonic()
+                if preparation is not None:
+                    preparation.finish()
                 preview_jobs.seek(0)
                 # One transaction avoids rewriting the volume for every preview.
                 # Readers can browse the committed catalogue throughout.
@@ -629,7 +649,7 @@ class VolumeScanner:
                 message = self._preview_report_message()
             self.phase_seconds["total"] = time.monotonic() - scan_started
             return self._result(status, files_seen, folders_seen, errors_count, message, changes)
-        except (ScanDiscarded, ScanCancelled) as exc:
+        except (ScanDiscarded, ScanCancelled, MediaInspectionCancelled) as exc:
             if catalogue_committed:
                 self.preview_statistics.interrupted = True
                 self.preview_statistics.message = (
@@ -660,6 +680,9 @@ class VolumeScanner:
         finally:
             if preview_jobs is not None:
                 preview_jobs.close()
+            if self._preview_preparation is not None:
+                self._preview_preparation.close()
+                self._preview_preparation = None
 
     def _finish_scan(
         self, scan_id: int, status: str, files_seen: int, folders_seen: int,
@@ -760,6 +783,8 @@ class VolumeScanner:
                 expected_duration_ms=expected_duration_ms,
                 video_codec=media_metadata.video_codec if media_metadata else None,
                 source_stat=source_stat,
+                prepared_path=(self._preview_preparation.output(media_kind, content_hash)
+                               if self._preview_preparation is not None else None),
             )
         except PreviewCancelled as exc:
             raise ScanCancelled("Scan cancelled.") from exc
@@ -836,6 +861,8 @@ class VolumeScanner:
             except ScanCancelled:
                 raise
             except (FileChangedDuringHashError, FileNotFoundError) as exc:
+                if self._preview_preparation is not None:
+                    self._preview_preparation.discard_input()
                 last_error = exc
                 if attempt + 1 >= HASH_STABILITY_ATTEMPTS:
                     break
@@ -869,6 +896,7 @@ class VolumeScanner:
         if self._cancelled():
             raise ScanCancelled("Scan cancelled.")
         hasher = new_hasher(self.hash_algorithm)
+        preparation = self._preview_preparation
         with path.open("rb") as stream:
             opened_stat = os.fstat(stream.fileno())
             if not self._same_file_snapshot(initial_stat, opened_stat):
@@ -880,6 +908,8 @@ class VolumeScanner:
                 if not chunk:
                     break
                 hasher.update(chunk)
+                if preparation is not None and preparation.current is not None:
+                    preparation.write(chunk)
                 self.bytes_hashed += len(chunk)
                 self._emit_hash_progress(files_seen, folders_seen, relative_path)
             finished_stat = os.fstat(stream.fileno())
