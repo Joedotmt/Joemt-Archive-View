@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add another drive after the first archive | JVVV manual</title>
+<link rel="stylesheet" href="manual.css">
+</head>
+<body>
+<main>
+<p><a href="index.html">Manual index</a></p>
+<h1>Add another drive after the first archive</h1>
+<p>Suppose you archived <code>Q:\Harbour Film</code> to AID-151 last month. Today you want a copy on AID-152. You need the same catalogue, the original project at its saved path, and the new destination. AID-151 can stay on the shelf.</p>
+<h2>1. Find the archived project</h2>
+<p>Open the catalogue you used last month. In AID-151’s listing, right-click the <strong>Harbour Film</strong> folder and choose <strong>Add another copy…</strong>. This works even if you cleared the completed task from Queue Manager. The command is available for projects that JVVV archived with a saved project record.</p>
+<figure><a href="images/copy-menu.png"><img src="images/copy-menu.png" alt="Add another copy on the Harbour Film folder under AID-151."></a></figure>
+<h2>2. Choose the new drive</h2>
+<p>Check the source path and the drives already verified. Tick AID-152 and click <strong>Queue Copy</strong>. If the new HDD has never been scanned, <a href="new-volume.html">add the drive to this catalogue</a> first.</p>
+<figure><a href="images/add-copy.png"><img src="images/add-copy.png" alt="Add Another Copy shows the original source, AID-151 already verified, and AID-152 selected."></a></figure>
+<h2>3. Apply and wait for verification</h2>
+<p>Click <strong>Apply</strong>. Keep the original project available while JVVV checks the file list and copies the files from <code>Q:\</code>. It then reads AID-152 and compares each file with the hash saved last month. Wait for <strong>Verified</strong> in Queue Manager before ejecting the finished drive.</p>
+<nav aria-label="Related reading"><a href="how-archiving-works.html">Where those hashes are saved and how long you can reuse them</a></nav>
+</main>
+</body>
+</html>

@@ -3,14 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Archive the same project to multiple drives | JVVV manual</title>
+<title>Queue the same project for two drives | JVVV manual</title>
 <link rel="stylesheet" href="manual.css">
 </head>
 <body>
 <main>
 <p><a href="index.html">Manual index</a></p>
-<h1>Archive the same project to multiple drives</h1>
-<p>If both HDDs are ready now, select them together. If you have only one connection, JVVV can keep the other copy in the queue until you swap drives. If the first archive has already finished, skip to <a href="#later">Add another copy later</a>.</p>
+<h1>Queue the same project for two drives</h1>
+<p>Use one archive task when you already know which drives should receive the project. You can connect both now or swap them during the job.</p>
+<p id="later">Already finished the first archive? <a href="add-another-copy.html">Add another drive to the archived project</a>.</p>
 <h2 id="select">1. Select the destinations together</h2>
 <p>Choose <strong>File → Archive Project…</strong>. Browse to your project, tick each destination, and click <strong>Queue Archive</strong> once. Each HDD needs to have been <a href="new-volume.html">added to this catalogue</a>. A known volume can be ticked even when it says <strong>disconnected</strong>.</p>
 <figure><a href="images/archive-two.png"><img src="images/archive-two.png" alt="Archive Project with AID-151 and AID-152 both checked for Harbour Film."></a></figure>
@@ -26,16 +27,11 @@
 <h2 id="complete">Check that both finished</h2>
 <p>Open <strong>Completed</strong> and expand the project. <strong>2 of 2 copies verified</strong> means each HDD passed its check against the original file hashes.</p>
 <figure><a href="images/two-verified.png"><img src="images/two-verified.png" alt="Completed project with both destination drives verified."></a></figure>
-<h2 id="later">Add another copy later</h2>
-<p>In the catalogue, right-click the <strong>archived project folder</strong> and choose <strong>Add another copy…</strong>. You can also use its completed entry in Queue Manager. The folder action works even after clearing the queue history, for projects archived with a saved project record.</p>
-<figure><a href="images/copy-menu.png"><img src="images/copy-menu.png" alt="The Harbour Film project folder’s menu with Add another copy selected."></a></figure>
-<p>Check the original source path and the list of verified drives. Tick the new destination, click <strong>Queue Copy</strong>, then <strong>Apply</strong>. The first archive HDD can stay unplugged. <a href="how-archiving-works.html#later">How JVVV makes this copy without a separate full source scan</a>.</p>
-<figure><a href="images/add-copy.png"><img src="images/add-copy.png" alt="Add Another Copy shows the original source, AID-151 already verified, and AID-152 selected."></a></figure>
 <h2 id="retry">Pause or retry a copy</h2>
 <p>Use <strong>Pause Queue</strong> to hold the work and <strong>Apply</strong> to resume. For a failed copy, select its drive row and read the message underneath. Once you have resolved the cause, right-click the failed drive row, choose <strong>Retry</strong>, and press <strong>Apply</strong>. The other verified drive keeps its result.</p>
 <figure><a href="images/retry-copy.png"><img src="images/retry-copy.png" alt="Retry on the failed destination row with the affected file named below."></a></figure>
-<p>For a content mismatch, see <a href="how-archiving-works.html#changes">What happens if the source changes?</a> For <strong>Verified with warnings</strong>, select the row for details. A preview can fail even when the project files passed verification.</p>
-<p><a href="index.html">Back to manual index</a></p>
+<p>For <strong>Verified with warnings</strong>, select the row for details. A preview can fail even when the project files passed verification.</p>
+<nav aria-label="Related reading"><a href="how-archiving-works.html">How JVVV checks each copy against the original project</a></nav>
 </main>
 </body>
 </html>
