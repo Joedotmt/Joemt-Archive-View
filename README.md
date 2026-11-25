@@ -38,21 +38,9 @@ JVVV. There is no server or cloud component.
   with Python's built-in reader, and broader audio/video duration, codec,
   dimensions, sample-rate, channel, and bit-rate details when `ffprobe` is
   available.
-- Analyse saved catalogue hashes and metadata for evidence that files and folders
-  also exist on other registered drives, without reconnecting or rescanning them.
-- Show explicit copy-evidence states that answer "does this exist on another
-  drive, and how sure are we?": aqua **Hash verified** (proven identical by
-  content hash), green **Same size & time** (contents not compared), amber **Name and
-  size** and **Content differs** for files; **Full match (hashed / partly hashed
-  / no hashes)**, **All files hash-verified / All files found**, **Found by name
-  & size only**, **Partial**, and **Not confirmed · structure repeats** for
-  folders; red **No copy found**; and grey **Not analysed / Outdated / Can't
-  tell**. Each label carries the matching drive IDs, a plain-language "Why", and
-  the exact metadata used for the conclusion.
-- Report per-volume other-copy coverage, potential whole-drive copies, and the
-  latest scan health. Successfully scanned empty drives are shown as
-  **N/A · empty** (and drives holding only system files as **N/A · system files
-  only**), not as unprotected or unhealthy.
+- Compare saved file hashes across registered drives, including offline drives.
+- Open the Browser's Backups panel to see exact folder matches, file coverage by
+  drive, and the recorded paths behind each result.
 - Keep expected protected Windows metadata warnings (such as
   `System Volume Information`) visible in the scan report without treating
   them as missing user content.
@@ -104,13 +92,13 @@ App Settings, Help, and UI zoom remain available on both screens.
 
 The Selected Volume panel shows connector type, connection, catalogue status,
 condition, capacity, used/free space, indexed file/folder counts, last scan,
-scan path, and other-copy coverage. The file list has its own **Filter files by
-copy status** control; **All items** shows everything in the current folder.
+scan path, and backup coverage. Use **Filter by backup result** to narrow the
+file list. The **Backups** button shows the details for the selection.
 
 The top bar has three menus: **File** for catalogue and volume actions, **View**
 for zoom, and **Window** for settings, managers, information, and Help. On Home,
 Window contains only **App Settings** and **Help**. With a catalogue open, it also
-offers **Catalogue Settings**, **Queue Manager**, **Snapshot Manager**, **Backup Evidence**,
+offers **Catalogue Settings**, **Queue Manager**, **Snapshot Manager**, **Backups**,
 **Preview Manager**, and **Catalogue Information**. File keeps catalogue
 opening and creation actions on Home; the workspace instead offers **Add Volume…**,
 **Open Catalogue Folder**, and **Close Catalogue**.
@@ -121,7 +109,7 @@ opening and creation actions on Home; the workspace instead offers **Add Volume�
 MyArchive.jvvv/
     catalogue.sqlite          registry: catalogue UUID and volume id <-> UUID
     volumes/<uuid>.jvvvol     one self-contained SQLite file per volume
-    index.sqlite              search index, folder aggregates and Backup Evidence
+    index.sqlite              search index, folder aggregates and backup comparisons
 ```
 
 `catalogue.sqlite` and the volume files are the source of truth. Every change
@@ -131,8 +119,8 @@ volume file carries a revision number and the SHA-256 digests of its canonical
 content. `index.sqlite` is a cache: on every open JVVV compares each volume
 file's revision with the one the index last synchronised and re-imports any
 volume that differs. Delete `index.sqlite` and it is rebuilt completely from
-the other two (Backup Evidence has to be analysed again afterwards, because it
-is derived data). A volume file that is missing from `volumes/` is reported
+the other two. Use **Compare saved hashes** again after an index rebuild. A
+volume file that is missing from `volumes/` is reported
 and the catalogue refuses to open until it is put back or restored from a
 snapshot; a volume file that is not registered is left alone and listed under
 **Window > Catalogue Information**.
@@ -312,58 +300,26 @@ is unchanged. Missing, partial, failed, or unavailable details are probed again.
 If a retry fails, earlier useful details are retained only when the hash matches,
 and Properties labels them as partial with the latest failure reason.
 
-Use **Window > Backup Evidence** to compare records already stored in the
-catalogue. This analysis reads the `.jvvv` database only: it does not access or
-rescan source drives and does not reread file contents. **Hash verified** means
-the full-file content hashes previously recorded by scans are identical, even if
-the files have different names, paths, or timestamps. Re-run the analysis when
-the application marks its results as outdated after catalogue contents change.
+Open **Backups** in the Browser or choose **View backups** for a file, folder, or
+drive. Select **Compare saved hashes** to use the file hashes and folder trees
+recorded by earlier scans. The comparison works with unplugged drives. Rescan a
+drive to record changes on disk, then compare the saved hashes again.
 
-The colour of an item answers "does this exist on another drive, and how sure
-are we?", never how the coverage arithmetic paired it, so two identical records
-on the same drive always get the same label. Aqua with a double tick is
-**Hash verified**: matching full-file content hashes. Green with a tick is
-**Same size & time**: the normalized filename, exact byte size and modified time
-(within 2 seconds, or an exact one-hour clock offset for names that are not
-generic) agree, but contents were not compared. Amber with a dash is a lead to
-look at: **Name and size** (the modified time differs, is missing, or is shared
-by so many drives that it cannot single out copies; a name that is generic
-across the catalogue is flagged as **· generic name**, but only when no modified
-time agrees within 2 seconds on a bounded number of drives, since a time match
-on that scale still counts as **Same size & time**; the one-hour offset is not
-applied to generic names) or **Content differs** (two
-comparable hashes disagree, so it is a different version or a damaged copy,
-never a match). Red is **No copy found**;
-grey is reserved for **Not analysed / Outdated / Can't tell**.
+- **Full match** means one folder on the other drive has the same names and
+  nesting inside it, including empty subfolders, and every file hash matches.
+  The outer folder name can differ. Both saved trees must be complete.
+- **10/10 file contents found** means one drive has all ten files' contents
+  somewhere on the drive. **7/10** means seven were found there. One matching
+  file can supply the contents of two identical source files.
+- **Hash match on 2 drives** means two other registered drives hold matching
+  bytes. The hash algorithm and value must agree. Files with missing hashes
+  show **Needs rescan**, and **Scan incomplete** identifies gaps in the recorded
+  tree. Protected drive-level system folders are outside the comparison.
 
-Folders follow the same tiers. **Full match** means the folder name, layout, and
-every file's name and size match on one other drive; the bracket says how much
-content was compared: **(hashed)** is aqua, **(partly hashed)** and
-**(no hashes)** are green. When a scan had errors or the folder is named
-differently there, the cell says so explicitly (**· scan errors**,
-**· different name there**). **All files hash-verified** (aqua) and **All files
-found** (green) mean every file was found on one other drive, including
-single-file folders, but the folder layout there differs; **Found by name & size
-only** is amber; **Partial** shows percentages that never round up, so 100%
-appears only when every file was found, and reads **Partial · leads only** when
-the best drive holds files by name and size but none by modified time;
-**Not confirmed · structure repeats** means the structure repeats on too many
-other drives to pair copies safely. Each
-folder is judged on its own and never rolled up from its subfolders, which is why
-a parent can be Partial while every subfolder inside it is a Full match; the
-status strip above the file list states this for the open folder. Known
-operating-system bookkeeping is excluded from coverage. Green never means
-hash-verified: a file's **Same size & time** compares name, size and modified
-time, and a folder's **Full match** compares folder name, layout, file names and
-sizes; only aqua labels prove contents identical. The whole-drive copies table in
-the Backup Evidence dialog says **Full match (layout & sizes)** for the same
-reason. The Properties dialog lists **Drives with any evidence** (drives with a
-strong match or a lead; the first 64 for very common items, and the row says how
-many there are in total), then breaks them down by tier: **Full-match
-drives** for a Full match, or **Drives holding every file** when every file was
-found there one by one; for a folder found by name and size only it reports how
-many files were found rather than a percentage, because percentages count only
-name-size-and-time matches.
+Select a drive in the panel to see its saved scan date, matching locations, and
+the files behind the count. **View in catalogue** navigates to a saved location
+even while the target drive is offline. Expand the panel with the splitter or
+collapse it using the **Backups** button.
 
 While a scan is running, use **Cancel Scan** beside the progress bar to cancel
 it. Partial results are discarded, so the existing catalogue remains intact.

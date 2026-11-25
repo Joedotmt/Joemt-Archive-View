@@ -305,12 +305,13 @@ def test_unscanned_volume_does_not_report_unknown_capacity_as_measured_zero(wind
 
 
 def test_copy_filter_is_attached_to_file_list_and_still_filters_without_hiding_parent_navigation(window):
-    assert window.browser_splitter.widget(1) is window.browser_file_pane
+    assert window.browser_splitter.widget(1) is window.backups_splitter
+    assert window.backups_splitter.widget(0) is window.browser_file_pane
     assert window.browser_file_pane.isAncestorOf(window.file_table)
     assert window.browser_file_pane.isAncestorOf(window.browser_status_strip)
     assert window.browser_file_toolbar.isAncestorOf(window.browser_backup_filter_combo)
     assert not window.browser_file_pane.isAncestorOf(window.folder_tree)
-    assert "Filter files by copy status" in {
+    assert "Filter by backup result" in {
         label.text() for label in window.browser_file_toolbar.findChildren(QLabel)
     }
     assert "How matching works" not in {button.text() for button in window.findChildren(QPushButton)}
@@ -318,16 +319,16 @@ def test_copy_filter_is_attached_to_file_list_and_still_filters_without_hiding_p
     parent = BrowserItem("folder", 0, "..", "", "Folder", is_parent_entry=True)
     verified = BrowserItem(
         "file", 1, "Copy.jpg", "Copy.jpg", "Image",
-        backup=BackupDisplay("verified", "Hash verified", "Matching content hash", 4),
+        backup=BackupDisplay("verified", "Hash match on 1 drive", "Matching content hash", 4, 1.0, "hash_match"),
     )
     unconfirmed = BrowserItem(
         "file", 2, "Only.jpg", "Only.jpg", "Image",
-        backup=BackupDisplay("none", "No copy found", "No other copy", 0),
+        backup=BackupDisplay("none", "No matching hashes", "No other copy", 0, reason="no_match"),
     )
     window.current_directory_items = [parent, verified, unconfirmed]
     window.apply_browser_backup_filter()
     assert set(item.name for item in window.browser_model.items) == {"..", "Copy.jpg", "Only.jpg"}
-    window.browser_backup_filter_combo.setCurrentIndex(window.browser_backup_filter_combo.findData("verified"))
+    window.browser_backup_filter_combo.setCurrentIndex(window.browser_backup_filter_combo.findData("matches"))
     assert set(item.name for item in window.browser_model.items) == {"..", "Copy.jpg"}
     window.browser_backup_filter_combo.setCurrentIndex(0)
     assert len(window.browser_model.items) == 3

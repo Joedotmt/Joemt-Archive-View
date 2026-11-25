@@ -137,7 +137,8 @@ def test_scan_preview_backup_and_snapshot_use_catalogue_algorithm(tmp_path, algo
         db.connection.commit()
         engine = BackupAnalysisEngine(db)
         assert engine.analyse().status == "completed"
-        assert engine.file_status(row["id"]).verified_volume_ids == (second,)
+        run_id = engine.state().active_run_id
+        assert engine.locations("file", row["id"], second, run_id)
     finally:
         db.close()
     (path / INDEX_DB_NAME).unlink()
@@ -236,13 +237,11 @@ def test_hash_stream_matches_library_digest(algorithm):
     assert hasher.digest() == constructors[algorithm](data).digest()
 
 
-def test_saved_sha256_evidence_keeps_its_meaning():
-    from jvvv.backup_analysis import (
-        FILE_EVIDENCE_HASH_CONFLICT, FILE_EVIDENCE_HASH_VERIFIED,
-        FOLDER_EVIDENCE_FULL_MATCH_HASHED, FOLDER_EVIDENCE_TRUSTED_HASHED,
-        file_reason_key, folder_reason_key,
-    )
-    assert file_reason_key(FILE_EVIDENCE_HASH_VERIFIED.replace("content hash", "SHA-256 content hash")) == "hash_verified"
-    assert file_reason_key(FILE_EVIDENCE_HASH_CONFLICT.replace("content hash", "SHA-256 content hash")) == "hash_conflict"
-    assert folder_reason_key(FOLDER_EVIDENCE_FULL_MATCH_HASHED.replace("saved content hash", "saved SHA-256 hash")) == "full_match_hashed"
-    assert folder_reason_key(FOLDER_EVIDENCE_TRUSTED_HASHED.replace("content hash", "SHA-256 content hash")) == "trusted_hashed"
+def test_saved_hash_comparison_uses_algorithm_and_checks_digest_length():
+    from jvvv.backup_analysis import _hash_key
+
+    digest = b"a" * 32
+    assert _hash_key("SHA256", digest) == _hash_key("sha256", digest)
+    assert _hash_key("sha256", digest) != _hash_key("blake3", digest)
+    assert _hash_key("xxh3_128", digest) is None
+    assert _hash_key("sha256", None) is None

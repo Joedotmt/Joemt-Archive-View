@@ -229,6 +229,7 @@ def test_catalogue_browser_menu_omits_redundant_catalogue_location(monkeypatch, 
         "Open File Location",
         "Copy Path",
         None,
+        "View backups",
         "Properties",
     ]
 
@@ -250,6 +251,7 @@ def test_search_menu_includes_catalogue_location(monkeypatch, tmp_path):
         "Open File Location",
         "Copy Path",
         None,
+        "View backups",
         "Properties",
     ]
 
@@ -265,6 +267,7 @@ def test_catalogue_item_context_menu_enables_online_file_actions(monkeypatch, tm
         True,
         True,
         True,
+        True,
     ]
 
 
@@ -275,6 +278,7 @@ def test_catalogue_item_context_menu_disables_physical_actions_when_offline(monk
         False,
         False,
         False,
+        True,
         True,
     ]
 
@@ -297,6 +301,7 @@ def test_catalogue_item_context_menu_keeps_index_actions_for_missing_item(
         False,
         True,
         True,
+        True,
     ]
 
 
@@ -307,6 +312,7 @@ def test_catalogue_item_context_menu_can_open_offline_folder_in_catalogue(monkey
         True,
         False,
         False,
+        True,
         True,
     ]
 

@@ -719,6 +719,7 @@ def test_context_menu_for_an_image_offers_open_and_reveal_preview_when_it_exists
         "Open Preview",
         "Open Preview Location",
         None,
+        "View backups",
         "Properties",
     ]
     open_action = menu.action("Open Preview")
@@ -815,6 +816,7 @@ def test_context_menu_for_a_video_offers_play_preview(monkeypatch, catalogue, tm
         "Play Preview",
         "Open Preview Location",
         None,
+        "View backups",
         "Properties",
     ]
     play_action = menu.action("Play Preview")
@@ -833,7 +835,7 @@ def test_context_menu_for_a_text_file_has_no_preview_actions(monkeypatch, catalo
         window, catalogue.target(file_id, "Projects/report.txt")
     )
 
-    assert menu.texts() == ["Open", "Open File Location", "Copy Path", None, "Properties"]
+    assert menu.texts() == ["Open", "Open File Location", "Copy Path", None, "View backups", "Properties"]
 
 
 def test_catalogue_item_media_kind_uses_the_extension_and_ignores_folders():
