@@ -10,10 +10,14 @@
 <main>
 <p><a href="index.html">Manual index</a></p>
 <h1>Where project hashes are kept</h1>
-<p>A <strong>hash</strong> is a fingerprint of one file’s contents. When JVVV verifies a project archive, it saves the original files’ hashes in the catalogue you used. <strong>There is no expiry date.</strong> You can reuse that record months or years later.</p>
+<p>A <strong>hash</strong> is a fingerprint of one file’s contents. When JVVV verifies a project archive, it saves the original files’ hashes in the catalogue you used. They have no expiry date. JVVV removes the reusable project hashes when you use <a href="delete-original.html">Delete original from Q:\…</a> and deletion succeeds. Each drive keeps its own file hashes.</p>
 <h2 id="saved">Where can I find them?</h2>
-<p>Choose <strong>File → Open Catalogue Folder</strong> to locate your catalogue in File Explorer. Inside the <code>.jvvv</code> folder, the file <code>catalogue.sqlite</code> holds the project record. For example, if you saved your catalogue as <code>D:\Catalogues\Studio.jvvv</code>, the hashes live in <code>D:\Catalogues\Studio.jvvv\catalogue.sqlite</code>.</p>
-<p>JVVV looks them up for you when you choose <strong>Add another copy…</strong>. Closing the app, clearing completed tasks, and unplugging the first HDD all leave the record in place. A new, empty catalogue has its own records. If you lose the original catalogue, a catalogue snapshot taken after the archive can restore its record.</p>
+<p>Choose <strong>File → Open Catalogue Folder</strong> to locate your catalogue in File Explorer. For a verified project, the same file hash appears in two records inside that <code>.jvvv</code> folder.</p>
+<ul>
+<li><strong>The volume’s file listing</strong> lives in <code>volumes\</code>, in a <code>.jvvvol</code> file named for the volume’s unique ID. It records the hash of the file archived on that drive. Each destination has its own listing.</li>
+<li><strong>The original project record</strong> lives in <code>catalogue.sqlite</code>. It records the hash of each source file. <strong>Add another copy…</strong> reads the expected hashes from this record to check the new HDD.</li>
+</ul>
+<p>For example, if your catalogue is on <code>D:\</code> and AID-151 is <code>E:\</code>, both catalogue records are on <code>D:\</code>. The archived video is on <code>E:\</code>. You can unplug AID-151, close JVVV, or clear completed tasks and still reuse the project record. A catalogue snapshot taken after the archive can restore that record if you lose the catalogue.</p>
 <h2 id="first">What gets saved on the first copy?</h2>
 <p>Suppose you copy <code>Q:\Harbour Film\Interview.mov</code> to AID-151. JVVV calculates the video’s hash as it copies it. Then it reads the video back from AID-151 and checks that the hashes match. JVVV adds the verified project to the drive’s catalogue listing, so you can browse it immediately.</p>
 <p>The project record keeps the source folder, the file list with sizes and modification times, each file’s hash, and which drives passed verification. It also keeps references to available previews. The video itself stays on <code>Q:\</code> and the archive HDD. A hash cannot recreate a missing video.</p>

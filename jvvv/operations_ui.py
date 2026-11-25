@@ -39,7 +39,7 @@ class OperationsDialog(QDialog):
     remove_requested = Signal(str)
     remove_project_requested = Signal(str)
     retry_requested = Signal(str)
-    add_copy_requested = Signal(str)
+    project_menu_requested = Signal(object, str)
     preview_failures_requested = Signal()
 
     def __init__(self, parent=None):
@@ -109,7 +109,7 @@ class OperationsDialog(QDialog):
         menu = QMenu(self)
         if isinstance(job, ProjectRow):
             if job.tab == "Completed":
-                menu.addAction("Add another copy…", lambda: self.add_copy_requested.emit(job.id))
+                self.project_menu_requested.emit(menu, job.id)
             if all(child.state != "running" for child in job.children):
                 menu.addAction("Remove from queue", lambda: self.remove_project_requested.emit(job.id))
             menu.addAction("Expand" if job.id in self.collapsed else "Collapse", lambda: self._toggle(tab, row, 0))
@@ -117,7 +117,7 @@ class OperationsDialog(QDialog):
             menu.deleteLater()
             return
         if job.project_id and job.state in DONE:
-            menu.addAction("Add another copy…", lambda: self.add_copy_requested.emit(job.project_id))
+            self.project_menu_requested.emit(menu, job.project_id)
         if job.reorderable:
             if row > 0 and jobs[row - 1].reorderable:
                 menu.addAction("Move Up", lambda: self.move_requested.emit(job.id, -1))

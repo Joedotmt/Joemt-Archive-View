@@ -80,7 +80,7 @@ BLOBS_DIR_NAME = "blobs"
 SNAPSHOTS_DIR_NAME = "snapshots"
 BLOB_EXTENSION = ".blob"
 SNAPSHOT_FORMAT = "jvvv-snapshot"
-SNAPSHOT_FORMAT_VERSION = 4
+SNAPSHOT_FORMAT_VERSION = 5
 SNAPSHOT_FILE_EXTENSION = ".json"
 CATALOGUE_META_REPOSITORY_KEY = "snapshot_repository"
 CATALOGUE_META_REPOSITORY_UUID_KEY = "snapshot_repository_uuid"
@@ -206,7 +206,8 @@ class SnapshotManifest:
     def to_json(self) -> dict[str, Any]:
         return {
             "format": SNAPSHOT_FORMAT,
-            "format_version": SNAPSHOT_FORMAT_VERSION if self.archive_projects else 3,
+            "format_version": (SNAPSHOT_FORMAT_VERSION if any(p.get("deleted_at") for p in self.archive_projects.values())
+                               else 4 if self.archive_projects else 3),
             "snapshot_id": self.snapshot_id,
             "created_at": self.created_at,
             "label": self.label,
@@ -232,7 +233,7 @@ class SnapshotManifest:
         if data.get("format") != SNAPSHOT_FORMAT:
             raise InvalidRepositoryError("The file is not a JVVV snapshot manifest.")
         version = int(data.get("format_version", 0))
-        if version not in (1, 2, 3, SNAPSHOT_FORMAT_VERSION):
+        if version not in (1, 2, 3, 4, SNAPSHOT_FORMAT_VERSION):
             raise InvalidRepositoryError(
                 f"The snapshot uses manifest version {version}; this build reads "
                 f"version {SNAPSHOT_FORMAT_VERSION}."
@@ -243,6 +244,9 @@ class SnapshotManifest:
             for key, project in dict(catalogue.get("archive_projects") or {}).items():
                 projects[key] = {"source": str(project["source"]), "algorithm": normalize_hash_algorithm(project["algorithm"]),
                                  "blob": str(project["blob"]), "copies": dict(project["copies"])}
+                for field in ("deleted_at", "verified_at"):
+                    if field in project:
+                        projects[key][field] = project[field]
             return cls(
                 snapshot_id=str(data["snapshot_id"]),
                 created_at=str(data["created_at"]),
@@ -664,7 +668,8 @@ class SnapshotRepository:
             try:
                 for key, project in projects.items():
                     _check_cancel(cancel_callback)
-                    digest = old_projects.get(key, {}).get("blob", "")
+                    old = old_projects.get(key, {})
+                    digest = old.get("blob", "") if old.get("deleted_at") == project.get("deleted_at") else ""
                     if deep or not digest or not self.has_blob(digest):
                         digest, size, added, stored = self._store_stream(
                             ArchiveRecords(registry).snapshot_entries(key), expected=digest,

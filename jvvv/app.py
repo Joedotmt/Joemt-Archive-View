@@ -81,6 +81,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import APP_NAME
+from .project_removal import delete_project_original, may_be_project_source, registered_copies
 from .list_ui import ListTableView, ListTableWidget, ListTreeWidget
 from .archive_job import (
     VERIFY_PHASE,
@@ -3432,6 +3433,31 @@ class DeleteVolumeWorker(QObject):
             self.failed.emit(error_details)
 
 
+class DeleteOriginalWorker(QObject):
+    progress = Signal(str)
+    finished = Signal()
+    failed = Signal(str)
+
+    def __init__(self, path, project_id, queued_sources):
+        super().__init__()
+        self.path = path
+        self.project_id = project_id
+        self.queued_sources = queued_sources
+
+    @Slot()
+    def run(self):
+        try:
+            db = Database(self.path)
+            try:
+                delete_project_original(db, self.project_id, self.progress.emit, queued_sources=self.queued_sources)
+            finally:
+                db.close()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit()
+
+
 class _CancellableWorker(QObject):
     def __init__(self) -> None:
         super().__init__()
@@ -3976,7 +4002,7 @@ class MainWindow(QMainWindow):
         self.scan_queue_result: tuple[str, str] | None = None
         self.scan_cancel_requested = False
         self.delete_thread: QThread | None = None
-        self.delete_worker: DeleteVolumeWorker | None = None
+        self.delete_worker: DeleteVolumeWorker | DeleteOriginalWorker | None = None
         self.catalogue_info_thread: QThread | None = None
         self.catalogue_info_worker: CatalogueInfoWorker | None = None
         self.repository_thread: QThread | None = None
@@ -6666,8 +6692,8 @@ class MainWindow(QMainWindow):
         if self.delete_worker is not None:
             QMessageBox.information(
                 self,
-                "Volume Deleting",
-                "Wait for the current volume delete to finish before closing the catalogue.",
+                "Deletion in progress",
+                "Wait for deletion to finish before closing the catalogue.",
             )
             return False
 
@@ -6986,8 +7012,8 @@ class MainWindow(QMainWindow):
         if self.delete_worker is not None:
             QMessageBox.information(
                 self,
-                "Volume Deleting",
-                "Wait for the current volume delete to finish.",
+                "Deletion in progress",
+                "Wait for deletion to finish.",
             )
         elif self.catalogue_info_worker is not None:
             QMessageBox.information(
@@ -7552,6 +7578,68 @@ class MainWindow(QMainWindow):
         )
         self.delete_thread.start()
 
+    def _archive_project_menu(self, menu, project_id):
+        if self.db is None or self.db.read_only:
+            return
+        project = self.db.archive_records.project(project_id)
+        if not project:
+            return
+        removal = self.db.archive_records.removal(project_id)
+        copies = registered_copies(self.db, project_id)
+        if removal and removal["deleted_at"]:
+            labels = ", ".join(v["drive_id"] or v["name"] for v, _ in copies)
+            menu.addAction(f"Original deleted · {removal['deleted_at'][:10]} · {labels}").setEnabled(False)
+            return
+        if not removal:
+            menu.addAction("Add another copy…", lambda: self.archive_project(project_id=project_id))
+        label = "Resume deletion of original…" if removal else "Delete original from Q:\\…"
+        action = menu.addAction(label, lambda: self.delete_archived_original(project_id))
+        action.setEnabled(len(copies) >= 2 and may_be_project_source(project["source"]))
+
+    def delete_archived_original(self, project_id):
+        if self.db is None or self.db.read_only or self._catalogue_job_running():
+            return
+        records = self.db.archive_records
+        project = records.project(project_id)
+        removal = records.removal(project_id)
+        copies = registered_copies(self.db, project_id)
+        if not project or (removal and removal["deleted_at"]) or len(copies) < 2:
+            return
+        source = Path(project["source"])
+        pending = [job for job in self._get_operations_queue().jobs if job.state not in DONE and job.source]
+        if any(job.project_id == project_id for job in pending):
+            QMessageBox.information(self, "Original still in use", "Finish or remove the outstanding archive task first.")
+            return
+        drives = "\n".join(f"• {self.db.volume_reference(v)} · {r['verified_at'] or 'verification date unavailable'}"
+                           for v, r in copies)
+        answer = QMessageBox.warning(
+            self, "Permanently delete original project?",
+            f"Delete this folder and its contents?\n\n{source}\n\nVerified copies on record:\n{drives}\n\n"
+            "Confirm that at least two of these copies are on separate physical drives. "
+            "JVVV will check the source file list, sizes and modification times without hashing the files again. "
+            "Files edited without changing size or modification time will pass this check. "
+            "After deletion, Add another copy will be unavailable.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes or self._catalogue_job_running():
+            return
+        self.delete_worker = DeleteOriginalWorker(self.db.path, project_id, [job.source for job in pending])
+        self._set_catalogue_busy(True)
+        self.scan_progress.setRange(0, 0)
+        self.delete_worker.progress.connect(self.on_delete_progress)
+        self.delete_worker.finished.connect(self.on_original_deleted)
+        self.delete_worker.failed.connect(self.on_delete_failed)
+        self.delete_thread = _create_worker_thread(self, self.delete_worker,
+            (self.delete_worker.finished, self.delete_worker.failed), self.clear_delete_worker)
+        self.delete_thread.start()
+
+    @Slot()
+    def on_original_deleted(self):
+        self.scan_progress.setRange(0, 1)
+        self.scan_progress.setValue(1)
+        self.scan_progress.setFormat("Original deleted")
+        self.statusBar().showMessage("Original project deleted. Verified archive copies are retained.", 8000)
+        self._refresh_operations()
+
     def archive_project(self, volume_id: int | None = None, *, project_id=None) -> None:
         if self.db is None or self.db.read_only:
             return
@@ -7563,6 +7651,8 @@ class MainWindow(QMainWindow):
             targets = self.archive_targets()
             source, verified = "", {}
             if project_id:
+                if self.db.archive_records.removal(project_id):
+                    raise OSError("Source deletion was started for this project. Further copies are disabled.")
                 record = self.db.archive_records.project(project_id)
                 if record is None:
                     raise OSError("The original project record could not be found.")
@@ -7669,7 +7759,7 @@ class MainWindow(QMainWindow):
                 lambda pid: self._change_operations(self.operations_queue.remove_project, pid)
             )
             self.operations_dialog.retry_requested.connect(self.retry_operation)
-            self.operations_dialog.add_copy_requested.connect(lambda pid: self.archive_project(project_id=pid))
+            self.operations_dialog.project_menu_requested.connect(self._archive_project_menu)
             self.operations_dialog.preview_failures_requested.connect(lambda: self.show_preview_failures())
         self._refresh_operations()
         if self.operation_id is not None:
@@ -8487,7 +8577,7 @@ class MainWindow(QMainWindow):
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(0)
         self.scan_progress.setFormat("Delete failed")
-        QMessageBox.critical(self, "Delete Volume Failed", details)
+        QMessageBox.critical(self, "Deletion Failed", details)
 
     @Slot()
     def clear_delete_worker(self) -> None:
@@ -8886,7 +8976,7 @@ class MainWindow(QMainWindow):
             volume = self.db.get_volume(target.volume_id)
             project_id = self.db.archive_records.folder_project(volume["uuid"], target.relative_path) if volume else None
             if project_id:
-                menu.addAction("Add another copy…", lambda: self.archive_project(project_id=project_id))
+                self._archive_project_menu(menu, project_id)
 
         media_kind = (
             None

@@ -249,6 +249,12 @@ after removing completed queue entries. If the original file list changes or
 destination read-back differs from the saved version, the new copy reports an
 error. Existing verified copies remain available.
 
+After two drives have verified the same project, you can right-click the
+archived project and choose **Delete original from Q:\…**. This manual action
+checks the source file list, sizes and modification times, then permanently
+deletes the original and removes its reusable hashes from the live catalogue.
+Each volume retains its file hashes. See the [deletion guide](manual/delete-original.html).
+
 When two approved projects are queued for the same HDD, JVVV can prepare the
 next project while verifying the first. It reads and hashes the next source into
 available RAM until the destination is ready. JVVV reserves one eighth of

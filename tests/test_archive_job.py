@@ -263,6 +263,89 @@ def test_later_copy_checks_saved_project_without_first_drive(tmp_path, project, 
         db.close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows source deletion uses protected file handles")
+@pytest.mark.parametrize("case", ["success", "one", "changed", "extra", "missing", "outside", "partial",
+                                  "stale", "same_disk", "mtime", "matching_metadata", "pending"])
+def test_delete_original_after_two_verified_copies(tmp_path, project, index_volume, monkeypatch, case):
+    from jvvv import project_removal
+    from jvvv.snapshot_repository import SnapshotRepository
+
+    source, first = project
+    catalogue = tmp_path / "Archive.jvvv"
+    db = create_catalogue(catalogue)
+    pid = uuid4().hex
+    second = tmp_path / "Second HDD"
+    second.mkdir()
+    monkeypatch.setattr(project_removal, "PROJECT_DRIVE", tmp_path if case != "outside" else first)
+    monkeypatch.setattr(project_removal, "physical_disk_key", lambda path: (7, 1) if case == "same_disk" else None)
+    monkeypatch.setattr(utils.ConnectedVolumeResolver, "resolve_details", lambda self, v: (v["source_path"], ""))
+    try:
+        first_id = index_volume(db, first)
+        ArchiveJob(db, project_id=pid).run(source, first_id, job_id=uuid4().hex)
+        if case != "one":
+            second_id = index_volume(db, second)
+            ArchiveJob(db, project_id=pid).run(source, second_id, job_id=uuid4().hex)
+        data = source / "nested/source.dat"
+        if case == "changed":
+            data.write_bytes(b"new contents")
+        if case == "mtime":
+            before = data.stat()
+            os.utime(data, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
+        if case == "matching_metadata":
+            before = data.stat()
+            data.write_bytes(b"x" * before.st_size)
+            os.utime(data, ns=(before.st_atime_ns, before.st_mtime_ns))
+        if case == "extra":
+            (source / "new.txt").touch()
+        if case == "missing":
+            data.unlink()
+        if case == "stale":
+            db.connection.execute("UPDATE files SET missing=1 WHERE volume_id=? AND name='source.dat'", (first_id,))
+            db.connection.commit()
+        if case not in ("success", "partial", "matching_metadata"):
+            with pytest.raises(OSError):
+                project_removal.delete_project_original(db, pid, queued_sources=[source] if case == "pending" else [])
+            assert source.is_dir() and (source / "empty.dat").exists()
+            assert db.archive_records.removal(pid) is None
+            return
+        repo = SnapshotRepository.create(tmp_path / "Snapshots.jvvvrepo")
+        repo.create_snapshot(catalogue)
+        if case == "partial":
+            mark = project_removal._mark_for_deletion
+            calls = []
+            def stop(kernel, handle):
+                if calls:
+                    raise OSError("interrupted")
+                calls.append(True)
+                mark(kernel, handle)
+            with monkeypatch.context() as patch:
+                patch.setattr(project_removal, "_mark_for_deletion", stop)
+                with pytest.raises(OSError, match="interrupted"):
+                    project_removal.delete_project_original(db, pid)
+            assert db.archive_records.removal(pid)["deleted_at"] is None
+            assert list(db.archive_records.snapshot_entries(pid))
+        project_removal.delete_project_original(db, pid)
+        assert not source.exists()
+        assert db.archive_records.removal(pid)["deleted_at"]
+        assert not list(db.archive_records.snapshot_entries(pid))
+        for disk in (first, second):
+            assert (disk / source.name / "nested/source.dat").is_file()
+        assert len(db.archive_records.copies(pid)) == 2
+        assert repo.has_changes(catalogue)
+        latest = repo.create_snapshot(catalogue).manifest
+        assert not repo.has_changes(catalogue)
+        restored = tmp_path / "Restored.jvvv"
+        repo.restore_snapshot(latest.snapshot_id, restored)
+        other = open_catalogue(restored)
+        try:
+            assert other.archive_records.removal(pid)["deleted_at"]
+            assert not list(other.archive_records.snapshot_entries(pid))
+        finally:
+            other.close()
+    finally:
+        db.close()
+
+
 def test_verified_copy_keeps_source_and_catalogues_destination(tmp_path, project, index_volume):
     source, destination = project
     original = source / "nested" / "source.dat"
@@ -825,6 +908,56 @@ def wait_for_queue(predicate):
         QApplication.processEvents()
         sleep(0.005)  # Release the GIL for Python queue workers between GUI events.
     assert predicate(), "Timed out waiting for the operations queue."
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows source deletion")
+def test_original_deletion_menu_and_worker(tmp_path, project, index_volume, monkeypatch):
+    from PySide6.QtWidgets import QMenu, QMessageBox
+    from jvvv import project_removal
+    from jvvv.app import CatalogueItemRef, MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_confirm_snapshot_before_close", lambda self: True)
+    monkeypatch.setattr(project_removal, "PROJECT_DRIVE", tmp_path)
+    monkeypatch.setattr(project_removal, "physical_disk_key", lambda path: None)
+    window = MainWindow()
+    window.catalogue_path = tmp_path / "Studio.jvvv"
+    window.db = create_catalogue(window.catalogue_path)
+    window._set_catalogue_open(True)
+    source, first = project
+    pid = uuid4().hex
+    second = tmp_path / "Second drive"
+    second.mkdir()
+    try:
+        vid = index_volume(window.db, first)
+        ArchiveJob(window.db, project_id=pid).run(source, vid, job_id=uuid4().hex)
+        folder = window.db.get_folder_by_path(vid, source.name)
+        target = CatalogueItemRef("folder", folder["id"], vid, source.name)
+        def delete_action():
+            menu = window.build_catalogue_item_context_menu(target)
+            return next(action for action in menu.actions() if action.text().startswith("Delete original"))
+        assert not delete_action().isEnabled()
+        ArchiveJob(window.db, project_id=pid).run(source, index_volume(window.db, second), job_id=uuid4().hex)
+        assert delete_action().isEnabled()
+        monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.StandardButton.Cancel)
+        delete_action().trigger()
+        assert source.is_dir() and window.delete_worker is None
+        errors = []
+        monkeypatch.setattr(QMessageBox, "critical", lambda parent, title, detail: errors.append(detail))
+        monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.StandardButton.Yes)
+        delete_action().trigger()
+        wait_for_queue(lambda: window.delete_worker is None)
+        assert not errors and not source.exists(), errors
+        window.show_operations_queue()
+        queue_menu = QMenu(window)
+        window.operations_dialog.project_menu_requested.emit(queue_menu, pid)
+        for menu in (queue_menu, window.build_catalogue_item_context_menu(target)):
+            assert any(action.text().startswith("Original deleted") for action in menu.actions())
+            assert all(action.text() != "Add another copy…" for action in menu.actions())
+    finally:
+        window.close()
+        app.processEvents()
 
 
 @pytest.mark.parametrize("swap", [False, True])

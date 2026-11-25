@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delete the original from Q: | JVVV manual</title>
+<link rel="stylesheet" href="manual.css">
+</head>
+<body>
+<main>
+<p><a href="index.html">Manual index</a></p>
+<h1>Delete the original from Q:</h1>
+<p>Use this when you have finished archiving a project to two separate drives and want the space back on Q:. The queue never deletes the original automatically.</p>
+<h2>1. Select the archived project</h2>
+<p>In the catalogue, right-click the project folder under either archive drive. Choose <strong>Delete original from Q:\…</strong>. You can also right-click the project in <strong>Queue Manager → Completed</strong>. You need two verified copies of this saved project on distinct archive volumes. Finish or remove any outstanding copy tasks for the source first.</p>
+<figure><a href="images/delete-original-menu.png"><img src="images/delete-original-menu.png" alt="The archived project’s menu with Delete original from Q: selected."></a></figure>
+<h2>2. Check the source and the drives</h2>
+<p>Read the full source path and the list of verified drives. A mapped Q: drive can appear under its network path. Confirm that you still have two copies on separate physical drives. Two partitions on one HDD give you only one physical copy. The dates show when JVVV verified each copy; older records may have no date. Offline drives can stay unplugged.</p>
+<p>Choose <strong>Cancel</strong> to keep the original, or <strong>Yes</strong> to permanently delete it after the checks. This bypasses the Recycle Bin.</p>
+<figure><a href="images/delete-original-confirm.png"><img src="images/delete-original-confirm.png" alt="Deletion confirmation showing the original path, both verified drives, and Cancel as the default."></a></figure>
+<h2>3. Wait for “Original deleted”</h2>
+<p>JVVV compares its latest catalogue listings for the archive drives with the saved project. On Q: it checks the file and folder names, file sizes and modification times. It does not reread the contents to calculate hashes. An edit that kept both the size and modification time will pass. An added or missing file, a link, or a changed file size or time stops the initial check before deletion.</p>
+<p>On success, the original folder is gone and <strong>Add another copy…</strong> is replaced by <strong>Original deleted</strong>. The archive files, each volume’s hashes, and the record of which volumes were verified remain. JVVV removes the reusable file list and hashes from the live catalogue. Snapshots taken before deletion keep their earlier catalogue records.</p>
+<p>If deletion stops partway, JVVV keeps the saved hashes. Read the error, resolve the cause, then choose <strong>Resume deletion of original…</strong> on the same project. JVVV checks the remaining files before continuing.</p>
+<nav aria-label="Related reading"><a href="how-archiving-works.html">Where the project and volume hashes are stored</a></nav>
+</main>
+</body>
+</html>

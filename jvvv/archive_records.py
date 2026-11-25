@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -25,6 +26,25 @@ class ArchiveRecords:
             "SELECT volume_uuid FROM archive_copies WHERE project_id=?", (project_id,)
         )}
 
+    def removal(self, project_id):
+        if self.registry.execute("SELECT 1 FROM sqlite_master WHERE name='archive_source_removals'").fetchone():
+            return self.registry.execute("SELECT * FROM archive_source_removals WHERE project_id=?", (project_id,)).fetchone()
+
+    def begin_removal(self, project_id, identity):
+        with self.registry as conn:
+            self._create_removals()
+            conn.execute("INSERT INTO archive_source_removals VALUES (?,?,NULL)", (project_id, identity))
+
+    def _create_removals(self):
+        self.registry.execute("CREATE TABLE IF NOT EXISTS archive_source_removals "
+                              "(project_id TEXT PRIMARY KEY, identity TEXT, deleted_at TEXT)")
+
+    def finish_removal(self, project_id):
+        with self.registry as conn:
+            conn.execute("DELETE FROM archive_entries WHERE project_id=?", (project_id,))
+            conn.execute("UPDATE archive_source_removals SET deleted_at=? WHERE project_id=?",
+                         (datetime.now(timezone.utc).isoformat(timespec="seconds"), project_id))
+
     def folder_project(self, volume_uuid, folder):
         if self._exists():
             row = self.registry.execute(
@@ -39,6 +59,16 @@ class ArchiveRecords:
                     for row in self.registry.execute("SELECT * FROM archive_projects")}
         for volume, folder, project in self.registry.execute("SELECT volume_uuid, folder, project_id FROM archive_copies"):
             projects[project]["copies"][volume] = folder
+        if self.registry.execute("SELECT 1 FROM sqlite_master WHERE name='archive_source_removals'").fetchone():
+            for project, date in self.registry.execute(
+                "SELECT project_id,deleted_at FROM archive_source_removals WHERE deleted_at IS NOT NULL"
+            ):
+                projects[project]["deleted_at"] = date
+        if self._has_copy_dates():
+            for project, volume, date in self.registry.execute(
+                "SELECT project_id,volume_uuid,verified_at FROM archive_copies WHERE verified_at IS NOT NULL"
+            ):
+                projects[project].setdefault("verified_at", {})[volume] = date
         return projects
 
     def snapshot_entries(self, project):
@@ -59,10 +89,16 @@ class ArchiveRecords:
                 yield project, path, directory, size, mtime, bytes.fromhex(digest) if digest else None, media
 
         self.registry.executemany("INSERT INTO archive_entries VALUES (?,?,?,?,?,?,?)", entries())
-        self.registry.executemany("INSERT INTO archive_copies VALUES (?,?,?)",
-                                  ((volume, folder, project) for volume, folder in record["copies"].items()))
+        self.registry.executemany("INSERT INTO archive_copies VALUES (?,?,?,?)",
+                                  ((volume, folder, project, record.get("verified_at", {}).get(volume))
+                                   for volume, folder in record["copies"].items()))
+        if record.get("deleted_at"):
+            self._create_removals()
+            self.registry.execute("INSERT INTO archive_source_removals VALUES (?,NULL,?)", (project, record["deleted_at"]))
 
     def load(self, project_id, source, algorithm, entries):
+        if self.removal(project_id):
+            raise OSError("Source deletion was started for this project. Further copies are disabled.")
         project = self.project(project_id)
         if project is None:
             return None
@@ -101,6 +137,16 @@ class ArchiveRecords:
                      "digest BLOB, media TEXT, PRIMARY KEY(project_id,path))")
         conn.execute("CREATE TABLE IF NOT EXISTS archive_copies "
                      "(volume_uuid TEXT, folder TEXT, project_id TEXT, PRIMARY KEY(volume_uuid,folder))")
+        if not self._has_copy_dates():
+            conn.execute("ALTER TABLE archive_copies ADD COLUMN verified_at TEXT")
+
+    def _has_copy_dates(self):
+        return any(row[1] == "verified_at" for row in self.registry.execute("PRAGMA table_info(archive_copies)"))
+
+    def copy_details(self, project_id):
+        date = "verified_at" if self._has_copy_dates() else "NULL AS verified_at"
+        return self.registry.execute(f"SELECT volume_uuid,folder,{date} FROM archive_copies WHERE project_id=?",
+                                     (project_id,)).fetchall()
 
     def save_version(self, project_id, source, algorithm, entries, digests, media):
         """Called under the archive writer lock before publishing any verified destination."""
@@ -121,4 +167,6 @@ class ArchiveRecords:
 
     def verified(self, project_id, volume_uuid, folder):
         with self.registry as conn:
-            conn.execute("INSERT OR REPLACE INTO archive_copies VALUES (?,?,?)", (volume_uuid, folder, project_id))
+            self._create_tables()
+            conn.execute("INSERT OR REPLACE INTO archive_copies VALUES (?,?,?,?)",
+                         (volume_uuid, folder, project_id, datetime.now(timezone.utc).isoformat(timespec="seconds")))
