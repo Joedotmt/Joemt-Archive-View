@@ -5,9 +5,9 @@ from concurrent.futures import Future
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QListWidget, QListWidgetItem, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -20,7 +20,7 @@ class ArchiveThread(QThread):
     progress = Signal(str, object, object)
 
     def __init__(self, catalogue, operation, volume_id, preview_settings, parent, *, writer_lock=None,
-                 resolved_destination=None, destination_ready=None):
+                 resolved_destination=None, destination_ready=None, session=None, shared_stream=None):
         super().__init__(parent)
         self.catalogue = catalogue
         self.operation = operation
@@ -29,6 +29,8 @@ class ArchiveThread(QThread):
         self.writer_lock = writer_lock
         self.resolved_destination = resolved_destination
         self.destination_ready = destination_ready
+        self.session = session
+        self.shared_stream = shared_stream
         self.finished_writing = Future()
         self.pause_requested = Event()
         self.result = None
@@ -51,7 +53,9 @@ class ArchiveThread(QThread):
                 volume = db.get_volume(self.volume_id)
                 job = ArchiveJob(db, preview_settings=previews,
                                  cancelled=self.pause_requested.is_set, progress=self.progress.emit,
-                                 writer_lock=self.writer_lock, destination_ready=self.destination_ready)
+                                 writer_lock=self.writer_lock, destination_ready=self.destination_ready,
+                                 session=self.session, shared_stream=self.shared_stream,
+                                 project_id=self.operation.project_id, require_record=self.operation.require_record)
                 self.result = job.run(
                     source, self.volume_id, volume_uuid=self.operation.volume_uuid,
                     job_id=None if self.operation.legacy_journal else self.operation.id,
@@ -64,13 +68,18 @@ class ArchiveThread(QThread):
             self.paused = True
         except Exception as exc:
             self.error = str(exc) or type(exc).__name__
+        finally:
+            if self.shared_stream:
+                self.shared_stream.detach(self.operation.id)
+        if self.error and not self.paused:
             self.destination_problem = operation_destination_problem(volume)
 
 
 class ArchiveDialog(QDialog):
-    def __init__(self, db: Database, targets, parent=None, *, volume_id=None, connected_path):
+    def __init__(self, db: Database, targets, parent=None, *, volume_id=None, connected_path,
+                 source="", verified=()):
         super().__init__(parent)
-        self.setWindowTitle("Archive Project")
+        self.setWindowTitle("Add Another Copy" if source else "Archive Project")
         self.setMinimumWidth(570)
         self.source = QLineEdit()
         browse = QPushButton("Browse\u2026")
@@ -80,38 +89,39 @@ class ArchiveDialog(QDialog):
         source_layout.setContentsMargins(0, 0, 0, 0)
         source_layout.addWidget(self.source, 1)
         source_layout.addWidget(browse)
+        if source:
+            self.source.setText(source)
+            self.source.setReadOnly(True)
+            browse.hide()
 
-        self.destination = QComboBox()
-        self.destination.setPlaceholderText("Select a destination volume")
+        self.destination = QListWidget()
         for volume, dependency in targets:
-            if volume_id is not None and volume["id"] != volume_id:
-                continue
             connected = connected_path(volume)
             if Path(connected or volume["source_path"]).drive.casefold() == "q:":
                 continue
             location = connected or "disconnected"
             note = ", after queued scan" if dependency else ""
-            self.destination.addItem(
-                f"{db.volume_reference(volume)} ({location}{note})",
-                (volume["id"], volume["uuid"], dependency),
-            )
-        if volume_id is not None and self.destination.count():
-            self.destination.setCurrentIndex(0)
-        self.destination.setEnabled(volume_id is None and self.destination.count() > 0)
+            item = QListWidgetItem(f"{db.volume_reference(volume)} ({location}{note})", self.destination)
+            item.setData(Qt.ItemDataRole.UserRole, (volume["id"], volume["uuid"], dependency))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if volume_id == volume["id"] else Qt.CheckState.Unchecked)
         self.status = QLabel()
         self.status.setWordWrap(True)
         if not self.destination.count():
-            self.status.setText("Add a destination drive and queue its initial scan first.")
+            self.status.setText("Choose another catalogue volume after its initial scan." if source else
+                                "Add a destination drive and queue its initial scan first.")
 
         form = QFormLayout()
         form.addRow("Source project", source_row)
-        form.addRow("Destination volume", self.destination)
+        if verified:
+            form.addRow("Verified copies", QLabel(", ".join(verified)))
+        form.addRow("Destination drives", self.destination)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        self.start = buttons.addButton("Queue Archive", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.start = buttons.addButton("Queue Copy" if source else "Queue Archive", QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.accepted.connect(self._accept_archive)
         buttons.rejected.connect(self.reject)
-        self.destination.currentIndexChanged.connect(self._update_button)
+        self.destination.itemChanged.connect(self._update_button)
         self.source.textChanged.connect(self._update_button)
         self._update_button()
 
@@ -127,7 +137,11 @@ class ArchiveDialog(QDialog):
             self.source.setText(selected)
 
     def _update_button(self):
-        self.start.setEnabled(bool(self.source.text().strip() and self.destination.currentData() is not None))
+        self.start.setEnabled(bool(self.source.text().strip() and self.selected_targets()))
+
+    def selected_targets(self):
+        return [item.data(Qt.ItemDataRole.UserRole) for index in range(self.destination.count())
+                if (item := self.destination.item(index)).checkState() == Qt.CheckState.Checked]
 
     def _accept_archive(self):
         path = Path(self.source.text().strip())

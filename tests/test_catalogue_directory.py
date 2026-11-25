@@ -511,5 +511,5 @@ def test_canonical_reader_is_independent_of_chunk_boundaries_and_stays_linear(tm
 
     lines = b"".join(b'["%d","x"]\n' % index for index in range(200_000))
     started = time.perf_counter()
-    assert sum(1 for _ in volume_store._iter_lines([lines])) == 200_000
+    assert sum(1 for _ in volume_store.iter_lines([lines])) == 200_000
     assert time.perf_counter() - started < 2.0

@@ -309,7 +309,12 @@ class ArchiveJob:
     """Own one attempt; journal completed files and commit the catalogue once."""
 
     def __init__(self, db: Database, *, preview_settings=None, cancelled=None, progress=None, writer_lock=None,
-                 destination_ready=None):
+                 destination_ready=None, project_id="", session=None, shared_stream=None, require_record=False):
+        self.project_id = project_id
+        self.session = session
+        self.shared_stream = shared_stream
+        self.require_record = require_record
+        self.saved_digests = None
         self.destination_ready = destination_ready
         self.prefixes: dict[str, BufferedPrefix] = {}
         self.db = db
@@ -321,9 +326,12 @@ class ArchiveJob:
         self.algorithm = db.hash_algorithm
 
     def _check(self) -> None:
+        self._check_cancel()
+        self.guard.check()
+
+    def _check_cancel(self) -> None:
         if self.cancelled():
             raise ArchivePaused("Archive paused. Choose Archive Project to resume.")
-        self.guard.check()
 
     def _progress(self, label, done, total, *, force=False):
         now = monotonic()
@@ -380,14 +388,19 @@ class ArchiveJob:
             marker_name = "JVVV Project.json"
 
         total_start = monotonic()
-        with ProjectGuard(source) as self.guard, ExitStack() as resources:
+        with ExitStack() as resources:
             resources.callback(self.prefixes.clear)
             resources.enter_context(hold_folder(destination))
             destination_identity = file_identity(_checked_folder(destination))
             if not _matches_archive_volume(volume, capture_volume_snapshot(destination)):
                 raise OSError("Reconnect the selected destination drive.")
             self._progress("Protecting and listing source files…", 0, 0, force=True)
-            entries = _scan_tree(source, self._check, self.guard)
+            if self.session is None:
+                self.guard = resources.enter_context(ProjectGuard(source))
+                entries = _scan_tree(source, self._check, self.guard)
+            else:
+                self.guard, entries = self.session.prepare(source, _scan_tree, self._check_cancel)
+                entries = list(entries)
             if any(entry.relative.casefold() == marker_name.casefold() for entry in entries):
                 raise OSError(f"The source already contains the reserved archive marker: {marker_name}")
             source_manifest = _manifest(entries, self._check)
@@ -398,7 +411,10 @@ class ArchiveJob:
             cache_root = Path(resources.enter_context(TemporaryDirectory(prefix="jvvv-archive-", dir=scratch)))
             worker = resources.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix="archive-media"))
             pending = None
-            media = {}
+            saved = self.db.archive_records.load(self.project_id, source, self.algorithm, entries) if self.project_id else None
+            if self.require_record and saved is None:
+                raise OSError("The saved archive project record is missing.")
+            self.saved_digests, media = saved if saved is not None else (None, {})
 
             def finish_media():
                 nonlocal pending
@@ -427,7 +443,7 @@ class ArchiveJob:
                 separate_source = disk is not None and disk != source_disk and (
                     source_disk is not None or source.drive.casefold() == "q:"
                 )
-                if separate_source and not journal_path.exists():
+                if separate_source and not journal_path.exists() and saved is None:
                     # Keep preview and scratch writes off the HDD being verified.
                     stores = [scratch]
                     if service is not None:
@@ -454,6 +470,7 @@ class ArchiveJob:
                 "project_name": source.name,
                 "archived_by": "JVVV",
                 "archive_job_id": state["id"],
+                **({"project_id": self.project_id} if self.project_id else {}),
                 "archive_started_at": state["started_at"],
             }, indent=2) + "\n").encode("utf-8")
 
@@ -531,13 +548,24 @@ class ArchiveJob:
                         (work / entry.relative).mkdir()
 
             copy_started = monotonic()
+            if self.shared_stream:
+                if reuse:
+                    raise OSError("Resume this previously started destination independently.")
+                reader_job = ArchiveJob(self.db, preview_settings=self.preview_settings,
+                                        cancelled=self.shared_stream.abandoned)
+                reader_job.guard = self.guard
+                reader_job.saved_digests = self.saved_digests
+                self.shared_stream.start(lambda send: reader_job._produce(source, files, send))
             copied = 0
-            self._progress("Copying and hashing originals…", 0, total, force=True)
+            self.copy_label = "Copying project…" if saved or self.shared_stream else "Copying and hashing originals…"
+            self._progress(self.copy_label, 0, total, force=True)
             for entry in files:
                 self._check()
                 if entry.relative in reuse:
                     # Source protections are released between attempts. Check
                     # the saved content even if the file's timestamp was restored.
+                    if saved is not None and self.saved_digests[entry.relative] != digests[entry.relative]:
+                        raise OSError(f"Saved digest differs from the original archive: {entry.relative}")
                     self._check_resumed_source(source / entry.relative, entry, digests[entry.relative])
                     copied += entry.info.st_size
                     self._progress("Checking previously copied files…", copied, total)
@@ -547,9 +575,12 @@ class ArchiveJob:
                 _checked_folder(path.parent)
                 if list(file_identity(_checked_folder(stage))) != state["stage_identity"]:
                     raise OSError(f"The archive staging folder was replaced: {stage}")
-                cache = None if entry.relative in prepared_media else self._media_input(cache_root, entry)
+                cache = None if saved or self.shared_stream or entry.relative in prepared_media else self._media_input(cache_root, entry)
                 try:
-                    digest = self._copy_file(source / entry.relative, part, entry, cache, copied, total)
+                    if self.shared_stream:
+                        digest = self._write_shared_file(job_id, part, entry, copied, total)
+                    else:
+                        digest = self._copy_file(source / entry.relative, part, entry, cache, copied, total)
                     self._record_digest(journal, entry.relative, digest)
                     digests[entry.relative] = digest
                     if os.path.lexists(path):
@@ -576,7 +607,7 @@ class ArchiveJob:
                     info = _checked_file(path)
                     # For a resumed file, feed the verification read to the
                     # media queue. This never rereads the original project.
-                    cache = self._media_input(cache_root, entry) if entry.relative in reuse else None
+                    cache = self._media_input(cache_root, entry) if entry.relative in reuse and saved is None else None
                     try:
                         digest = None
                         if info.st_size == entry.info.st_size:
@@ -587,6 +618,8 @@ class ArchiveJob:
                                 with journal:
                                     journal.execute("DELETE FROM files WHERE path = ?", (entry.relative,))
                             detail = " Resume to copy this file again." if not published else " Inspect the published archive."
+                            if saved is not None:
+                                detail = " This file does not match the original archive."
                             raise OSError(f"Destination verification failed: {entry.relative}.{detail}")
                         if fingerprint(_checked_file(path)) != fingerprint(info):
                             raise OSError(f"Destination changed during verification: {path}")
@@ -602,6 +635,8 @@ class ArchiveJob:
             verify_seconds = monotonic() - verify_started
             self._progress("Finishing previews…", 0, 0, force=True)
             finish_media()
+            if self.shared_stream:
+                media.update(self.shared_stream.media_results(self._check))
             self._check()
             if _manifest(_scan_tree(source, self._check), self._check) != source_manifest:
                 raise OSError("The project contents changed during archiving.")
@@ -619,6 +654,11 @@ class ArchiveJob:
             self._progress("Saving the verified archive to the catalogue…", 0, 0, force=True)
             self._check()
             check_destination()
+            if self.project_id and saved is None:
+                with self.writer_lock if self.writer_lock is not None else nullcontext():
+                    self.db.archive_records.save_version(self.project_id, source, self.algorithm, entries, digests, media)
+                self._check()
+                check_destination()
             if not marker_exists:
                 with part.open("xb") as output:
                     output.write(marker_bytes)
@@ -642,7 +682,10 @@ class ArchiveJob:
                 work.rename(final)
             entries.append(ProjectEntry(marker_name, marker_info, False))
             with self.writer_lock if self.writer_lock is not None else nullcontext():
+                self._check()
                 self._register(volume, current_destination, final, entries, destination_stats, digests, media)
+                if self.project_id:
+                    self.db.archive_records.verified(self.project_id, volume["uuid"], final.name)
             failures = sum(status is not None and status["status"] != "available" for _, status in media.values())
             state["result"] = {
                 "files": len(files), "bytes_copied": total, "preview_failures": failures,
@@ -822,11 +865,11 @@ class ArchiveJob:
                     prepared_media.add(entry.relative)
         return prepared_media
 
-    def _copy_file(self, source, part, entry, cache, copied, total):
+    def _read_original(self, source, entry, consume):
         prefix = self.prefixes.pop(entry.relative, None)
-        hasher = prefix.hasher if prefix else new_hasher(self.algorithm)
+        hasher = None if self.saved_digests is not None else (prefix.hasher if prefix else new_hasher(self.algorithm))
         count = 0
-        with source.open("rb") as input_file, part.open("xb") as output:
+        with source.open("rb") as input_file:
             current = os.fstat(input_file.fileno())
             if fingerprint(current) != fingerprint(entry.info) or (prefix and current.st_ctime_ns != prefix.change_time_ns):
                 raise OSError(f"The source changed before copying: {source}")
@@ -839,21 +882,75 @@ class ArchiveJob:
                     block = input_file.read(CHUNK_SIZE)
                     if not block:
                         break
-                    hasher.update(block)
+                    if hasher is not None:
+                        hasher.update(block)
                 self._check()
                 if count + len(block) > entry.info.st_size:
                     raise OSError(f"The source grew while copying: {source}")
+                count += len(block)
+                consume(block, count)
+            if count != entry.info.st_size or fingerprint(os.fstat(input_file.fileno())) != fingerprint(entry.info):
+                raise OSError(f"The source changed while copying: {source}")
+        return hasher.digest() if hasher is not None else self.saved_digests[entry.relative]
+
+    def _copy_file(self, source, part, entry, cache, copied, total):
+        with part.open("xb") as output:
+            def write(block, count):
                 output.write(block)
                 if cache is not None:
                     cache.write(block)
-                count += len(block)
-                self._progress("Copying and hashing originals…", copied + count, total)
-            if count != entry.info.st_size or fingerprint(os.fstat(input_file.fileno())) != fingerprint(entry.info):
-                raise OSError(f"The source changed while copying: {source}")
+                self._progress(self.copy_label, copied + count, total)
+            digest = self._read_original(source, entry, write)
             output.flush()
             os.fsync(output.fileno())
         os.utime(part, ns=(entry.info.st_atime_ns, entry.info.st_mtime_ns))
-        return hasher.digest()
+        return digest
+
+    def _produce(self, source, files, send):
+        """The dedicated reader owns preview inputs even if either destination fails."""
+        extractor = MediaMetadataExtractor()
+        service = PreviewService(self.preview_settings, hash_algorithm=self.algorithm) if self.preview_settings else None
+        media = {}
+        with TemporaryDirectory(prefix="jvvv-archive-") as scratch, ThreadPoolExecutor(max_workers=1) as worker:
+            previous = None
+            for entry in files:
+                self._check()
+                cache = self._media_input(Path(scratch), entry) if self.saved_digests is None else None
+                try:
+                    def distribute(block, count):
+                        if cache is not None:
+                            cache.write(block)
+                        send(entry.relative, block, None)
+                    digest = self._read_original(source / entry.relative, entry, distribute)
+                    send(entry.relative, None, digest)
+                    if cache is not None:
+                        if previous is not None:
+                            media[key] = previous.result()
+                        key = entry.relative
+                        previous = worker.submit(self._inspect_media, entry, cache, digest, extractor, service)
+                        cache = None
+                finally:
+                    if cache is not None:
+                        cache.close()
+            if previous is not None:
+                media[key] = previous.result()
+        return media
+
+    def _write_shared_file(self, job_id, part, entry, copied, total):
+        count = 0
+        with part.open("xb") as output:
+            for block, digest in self.shared_stream.read(job_id, entry.relative, self._check):
+                if block is None:
+                    break
+                output.write(block)
+                count += len(block)
+                self._progress(self.copy_label, copied + count, total)
+            if count != entry.info.st_size or digest is None:
+                raise OSError(f"Incomplete shared archive file: {entry.relative}")
+            output.flush()
+            os.fsync(output.fileno())
+        os.utime(part, ns=(entry.info.st_atime_ns, entry.info.st_mtime_ns))
+        return digest
 
     def _check_resumed_source(self, source, entry, expected_digest):
         hasher = new_hasher(self.algorithm)

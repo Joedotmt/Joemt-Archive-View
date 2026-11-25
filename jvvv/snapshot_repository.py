@@ -60,6 +60,7 @@ from .volume_store import (
     decode_record,
     encode_record,
     iter_blob_bytes,
+    iter_lines,
     iter_canonical_bytes,
     materialize_volume_file,
     read_volume_row,
@@ -67,6 +68,7 @@ from .volume_store import (
     write_blob,
 )
 from .content_hash import DEFAULT_HASH_ALGORITHM, normalize_hash_algorithm
+from .archive_records import ArchiveRecords
 from .preview_config import catalogue_preview_mapping
 
 
@@ -78,7 +80,7 @@ BLOBS_DIR_NAME = "blobs"
 SNAPSHOTS_DIR_NAME = "snapshots"
 BLOB_EXTENSION = ".blob"
 SNAPSHOT_FORMAT = "jvvv-snapshot"
-SNAPSHOT_FORMAT_VERSION = 3
+SNAPSHOT_FORMAT_VERSION = 4
 SNAPSHOT_FILE_EXTENSION = ".json"
 CATALOGUE_META_REPOSITORY_KEY = "snapshot_repository"
 CATALOGUE_META_REPOSITORY_UUID_KEY = "snapshot_repository_uuid"
@@ -179,6 +181,7 @@ class SnapshotManifest:
     hash_algorithm: str = DEFAULT_HASH_ALGORITHM
     hash_algorithm_locked: bool = False
     preview_settings: dict[str, str] = field(default_factory=catalogue_preview_mapping)
+    archive_projects: dict[str, dict] = field(default_factory=dict)
 
     @property
     def volume_count(self) -> int:
@@ -194,7 +197,7 @@ class SnapshotManifest:
 
     @property
     def blob_digests(self) -> set[str]:
-        digests: set[str] = set()
+        digests = {record["blob"] for record in self.archive_projects.values()}
         for record in self.volumes:
             digests.add(record.content_blob)
             digests.add(record.history_blob)
@@ -203,7 +206,7 @@ class SnapshotManifest:
     def to_json(self) -> dict[str, Any]:
         return {
             "format": SNAPSHOT_FORMAT,
-            "format_version": SNAPSHOT_FORMAT_VERSION,
+            "format_version": SNAPSHOT_FORMAT_VERSION if self.archive_projects else 3,
             "snapshot_id": self.snapshot_id,
             "created_at": self.created_at,
             "label": self.label,
@@ -214,6 +217,7 @@ class SnapshotManifest:
                 "hash_algorithm": self.hash_algorithm,
                 "hash_algorithm_locked": self.hash_algorithm_locked,
                 "preview_settings": self.preview_settings,
+                **({"archive_projects": self.archive_projects} if self.archive_projects else {}),
             },
             "totals": {
                 "volumes": self.volume_count,
@@ -228,13 +232,17 @@ class SnapshotManifest:
         if data.get("format") != SNAPSHOT_FORMAT:
             raise InvalidRepositoryError("The file is not a JVVV snapshot manifest.")
         version = int(data.get("format_version", 0))
-        if version not in (1, 2, SNAPSHOT_FORMAT_VERSION):
+        if version not in (1, 2, 3, SNAPSHOT_FORMAT_VERSION):
             raise InvalidRepositoryError(
                 f"The snapshot uses manifest version {version}; this build reads "
                 f"version {SNAPSHOT_FORMAT_VERSION}."
             )
         try:
             catalogue = dict(data.get("catalogue") or {})
+            projects = {}
+            for key, project in dict(catalogue.get("archive_projects") or {}).items():
+                projects[key] = {"source": str(project["source"]), "algorithm": normalize_hash_algorithm(project["algorithm"]),
+                                 "blob": str(project["blob"]), "copies": dict(project["copies"])}
             return cls(
                 snapshot_id=str(data["snapshot_id"]),
                 created_at=str(data["created_at"]),
@@ -245,6 +253,7 @@ class SnapshotManifest:
                 hash_algorithm=normalize_hash_algorithm(catalogue.get("hash_algorithm", DEFAULT_HASH_ALGORITHM)),
                 hash_algorithm_locked=bool(catalogue.get("hash_algorithm_locked", False)),
                 preview_settings=catalogue_preview_mapping(catalogue.get("preview_settings")),
+                archive_projects=projects,
                 volumes=tuple(
                     VolumeSnapshotRecord.from_json(item) for item in data.get("volumes", [])
                 ),
@@ -562,6 +571,7 @@ class SnapshotRepository:
         registry = open_registry_db(layout.catalogue_db, read_only=True)
         try:
             values = validate_registry(registry)
+            projects = ArchiveRecords(registry).snapshot_index()
             entries = read_registry(registry)
             next_volume_id = registry_next_volume_id(registry)
         finally:
@@ -574,6 +584,9 @@ class SnapshotRepository:
             or bool(values.get("hash_algorithm_locked") == "1" or next_volume_id > 1 or entries)
             != manifest.hash_algorithm_locked
             or catalogue_preview_mapping(values) != manifest.preview_settings
+            or projects != {key: {k: v for k, v in record.items() if k != "blob"}
+                            for key, record in manifest.archive_projects.items()}
+            or any(not self.has_blob(record["blob"]) for record in manifest.archive_projects.values())
         ):
             return True
         previous = {record.uuid: record for record in manifest.volumes}
@@ -623,6 +636,7 @@ class SnapshotRepository:
         registry = open_registry_db(layout.catalogue_db, read_only=True)
         try:
             registry_values = validate_registry(registry)
+            projects = ArchiveRecords(registry).snapshot_index()
             entries = read_registry(registry)
             next_volume_id = registry_next_volume_id(registry)
         finally:
@@ -643,6 +657,25 @@ class SnapshotRepository:
         bytes_written = 0
         raw_bytes = 0
         corrected: list[str] = []
+        if projects:
+            previous = self.latest_snapshot()
+            old_projects = previous.archive_projects if previous else {}
+            registry = open_registry_db(layout.catalogue_db, read_only=True)
+            try:
+                for key, project in projects.items():
+                    _check_cancel(cancel_callback)
+                    digest = old_projects.get(key, {}).get("blob", "")
+                    if deep or not digest or not self.has_blob(digest):
+                        digest, size, added, stored = self._store_stream(
+                            ArchiveRecords(registry).snapshot_entries(key), expected=digest,
+                            corrected=corrected, label=f"Archive project {key}",
+                        )
+                        raw_bytes += size
+                        blobs_added += int(added)
+                        bytes_written += stored
+                    project["blob"] = digest
+            finally:
+                registry.close()
         total = len(entries)
         for position, entry in enumerate(entries, start=1):
             _check_cancel(cancel_callback)
@@ -729,6 +762,7 @@ class SnapshotRepository:
             hash_algorithm=normalize_hash_algorithm(registry_values.get("hash_algorithm", DEFAULT_HASH_ALGORITHM)),
             hash_algorithm_locked=bool(registry_values.get("hash_algorithm_locked") == "1" or next_volume_id > 1 or entries),
             preview_settings=catalogue_preview_mapping(registry_values),
+            archive_projects=projects,
         )
         _write_json_atomic(self.snapshot_path(manifest.snapshot_id), manifest.to_json())
         if not stored_uuid or meta.get("catalogue_name") != catalogue_name:
@@ -956,6 +990,12 @@ class SnapshotRepository:
                     set_registry_meta(registry, "hash_algorithm_locked", "1" if manifest.hash_algorithm_locked else "0")
                     for key, value in manifest.preview_settings.items():
                         set_registry_meta(registry, key, value)
+                    for key, project in manifest.archive_projects.items():
+                        _check_cancel(cancel_callback)
+                        data = HashingTee(iter_blob_bytes(self.blob_path(project["blob"])))
+                        ArchiveRecords(registry).restore_project(key, project, iter_lines(data))
+                        if data.digest() != project["blob"]:
+                            raise SnapshotError(f"The saved archive record for {project['source']} is corrupt.")
                 total = len(manifest.volumes)
                 for position, record in enumerate(manifest.volumes, start=1):
                     _check_cancel(cancel_callback)

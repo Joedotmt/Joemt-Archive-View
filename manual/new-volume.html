@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add a drive and run its first scan | JVVV manual</title>
+<link rel="stylesheet" href="manual.css">
+</head>
+<body>
+<main>
+<p><a href="index.html">Manual index</a></p>
+<h1>Add a drive and run its first scan</h1>
+<p>Do this once for each new archive HDD, even an empty one. If the drive already has a completed scan in this catalogue, go straight to <a href="archive-project.html">Archive a project</a>.</p>
+<h2 id="catalogue">1. Open the catalogue</h2>
+<p>On <strong>Home</strong>, choose <strong>Open Catalogue…</strong>. If this is your first catalogue, choose <strong>Create Empty Catalogue…</strong> and give it a name. Use the same catalogue for all the drives that will hold the project.</p>
+<figure><a href="images/home.png"><img src="images/home.png" alt="Home with Open Catalogue and Create Empty Catalogue."></a></figure>
+<h2 id="root">2. Select the drive</h2>
+<p>Connect the HDD and choose <strong>File → Add Volume…</strong>.</p>
+<figure><a href="images/file-add.png"><img src="images/file-add.png" alt="The File menu with Add Volume selected."></a></figure>
+<p>In <strong>Choose Volume to Scan</strong>, choose the drive root, such as <code>E:\</code>. The root is the top level you see when you open the drive. Selecting a subfolder such as <code>E:\Projects</code> creates a folder catalogue entry that cannot receive archived projects.</p>
+<figure><a href="images/drive-root.png"><img src="images/drive-root.png" alt="The directory picker with the E drive root entered."></a></figure>
+<h2 id="drive-id">3. Confirm its drive ID</h2>
+<p>Check the path and give the drive a unique ID, such as <strong>AID-151</strong>. To keep its current Windows label, clear <strong>Rename volume label to match Drive ID</strong> and leave the label as shown. Click <strong>OK</strong>.</p>
+<figure><a href="images/drive-id.png"><img src="images/drive-id.png" alt="Confirm Drive ID with E drive and AID-151."></a></figure>
+<h2 id="scan">4. Start the initial scan</h2>
+<p>JVVV adds <strong>Scan Drive</strong> to the queue automatically. Click <strong>Apply</strong> beside the catalogue name. To scan several new drives, add each one first and then click <strong>Apply All</strong>.</p>
+<figure><a href="images/apply-scan.png"><img src="images/apply-scan.png" alt="Catalogue header showing the queued scan for AID-151 and the Apply button."></a></figure>
+<h2 id="ready">5. Check the result</h2>
+<p>Open <strong>Queue Manager → Completed</strong> and look for the drive’s <strong>Scan Drive</strong> row. Zero files is a normal result for an empty HDD. On a writable archive drive, JVVV normally creates <code>.jvvv-drive.json</code> at the root to recognise the drive when it is reconnected.</p>
+<figure><a href="images/scan-finished.png"><img src="images/scan-finished.png" alt="Completed tab showing the finished scan for AID-151."></a></figure>
+<p>You can now <a href="archive-project.html">archive a project to this drive</a>. If you queue the archive while the initial scan is still pending, JVVV waits for the scan before writing the project.</p>
+<p><a href="index.html">Back to manual index</a></p>
+</main>
+</body>
+</html>

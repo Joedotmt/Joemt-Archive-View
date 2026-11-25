@@ -319,7 +319,7 @@ def blob_digest(path: Path) -> tuple[str, int]:
     return hasher.hexdigest(), size
 
 
-def _iter_lines(chunks: Iterable[bytes]) -> Iterator[bytes]:
+def iter_lines(chunks: Iterable[bytes]) -> Iterator[bytes]:
     """Split a chunk stream into newline-terminated lines in linear time."""
 
     pending = b""
@@ -345,7 +345,7 @@ def read_canonical_tables(
     schema defaults when the rows are inserted.
     """
 
-    lines = _iter_lines(chunks)
+    lines = iter_lines(chunks)
     try:
         header = json.loads(next(lines))
     except StopIteration as exc:

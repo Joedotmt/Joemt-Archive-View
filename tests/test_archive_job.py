@@ -135,6 +135,134 @@ def index_volume(monkeypatch):
     return index
 
 
+@pytest.mark.parametrize("target_failure", [False, True])
+def test_one_source_stream_and_independent_verification(tmp_path, project, index_volume, monkeypatch, target_failure):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Lock
+    from jvvv.archive_stream import ProjectSession, SharedArchiveStream
+    from jvvv.database import Database
+
+    source, first = project
+    second = tmp_path / "Second"
+    second.mkdir()
+    Image.new("RGB", (24, 16)).save(source / "image.jpg")
+    originals = {}
+    for path in source.rglob("*"):
+        if path.is_file():
+            originals[path.relative_to(source)] = path.read_bytes()
+    catalogue = tmp_path / "Archive.jvvv"
+    db = create_catalogue(catalogue)
+    volume_ids = [index_volume(db, path) for path in (first, second)]
+    db.close()
+    pid = uuid4().hex
+    jobs = [uuid4().hex, uuid4().hex]
+    shared = SharedArchiveStream(jobs)
+    session = ProjectSession()
+    lock = Lock()
+    preview_dir = tmp_path / "Previews"
+    preview_dir.mkdir()
+    inspected = []
+    inspect = ArchiveJob._inspect_media
+    def count_inspection(self, entry, *args):
+        inspected.append(entry.relative)
+        return inspect(self, entry, *args)
+    monkeypatch.setattr(ArchiveJob, "_inspect_media", count_inspection)
+    if target_failure:
+        write = ArchiveJob._write_shared_file
+        def fail(self, job_id, *args):
+            if job_id == jobs[0]:
+                raise OSError("Test destination disconnected")
+            return write(self, job_id, *args)
+        monkeypatch.setattr(ArchiveJob, "_write_shared_file", fail)
+
+    def archive(i):
+        worker_db = Database(catalogue, initialize=False, create=False)
+        try:
+            return ArchiveJob(worker_db, project_id=pid, session=session, shared_stream=shared,
+                              preview_settings=PreviewSettings(enabled=True, root_directory=str(preview_dir)),
+                              writer_lock=lock).run(source, volume_ids[i], job_id=jobs[i])
+        finally:
+            shared.detach(jobs[i])
+            worker_db.close()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(archive, i) for i in range(2)]
+            if target_failure:
+                with pytest.raises(OSError, match="disconnected"):
+                    futures[0].result(timeout=15)
+            else:
+                assert futures[0].result(timeout=15).preview_failures == 0
+            assert futures[1].result(timeout=15).preview_failures == 0
+    finally:
+        session.close()
+    assert shared.source_bytes == sum(map(len, originals.values()))
+    assert inspected == ["image.jpg"]
+    db = open_catalogue(catalogue)
+    try:
+        assert len(db.archive_records.copies(pid)) == (1 if target_failure else 2)
+        for root in ([second] if target_failure else [first, second]):
+            for relative, data in originals.items():
+                assert (root / source.name / relative).read_bytes() == data
+        if target_failure:
+            ArchiveJob(db, project_id=pid).run(source, volume_ids[0], job_id=jobs[0])
+            assert len(db.archive_records.copies(pid)) == 2
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("restore_snapshot", [False, True])
+def test_later_copy_checks_saved_project_without_first_drive(tmp_path, project, index_volume, restore_snapshot):
+    from jvvv.operations_queue import OperationsQueue
+    source, first = project
+    catalogue = tmp_path / "Archive.jvvv"
+    db = create_catalogue(catalogue)
+    first_id = index_volume(db, first)
+    queue = OperationsQueue(catalogue, db.catalogue_uuid())
+    job, = queue.add_archive([(db.get_volume(first_id), "First", "")], str(source))
+    ArchiveJob(db, project_id=job.project_id).run(source, first_id, job_id=job.id)
+    queue.set_state(job.id, "completed")
+    queue.remove(job.id)
+    first_uuid = db.get_volume(first_id)["uuid"]
+    db.close()
+    first.rename(tmp_path / "Disconnected")
+    if restore_snapshot:
+        from jvvv.snapshot_repository import SnapshotRepository
+        repository = SnapshotRepository.create(tmp_path / "Backup.jvvvrepo")
+        snapshot = repository.create_snapshot(catalogue).manifest
+        assert not repository.has_changes(catalogue)
+        assert repository.create_snapshot(catalogue).blobs_added == 0
+        repository.prune()
+        catalogue = tmp_path / "Restored.jvvv"
+        repository.restore_snapshot(snapshot.snapshot_id, catalogue)
+        assert not repository.has_changes(catalogue)
+    db = open_catalogue(catalogue)
+    try:
+        pid = db.archive_records.folder_project(first_uuid, source.name)
+        assert pid == job.project_id
+        for name in ("Second", "Changed", "Edited"):
+            dest = tmp_path / name
+            dest.mkdir()
+            volume = index_volume(db, dest)
+            if name == "Second":
+                ArchiveJob(db, project_id=pid, require_record=True).run(source, volume, job_id=uuid4().hex)
+                continue
+            original = source / "nested/source.dat"
+            if name == "Changed":
+                before = original.stat()
+                original.write_bytes(b"X" * before.st_size)
+                os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns))
+                error = "verification failed"
+            else:
+                original.unlink()
+                error = "changed|Missing"
+            with pytest.raises(OSError, match=error):
+                ArchiveJob(db, project_id=pid, require_record=True).run(source, volume, job_id=uuid4().hex)
+            assert not (dest / source.name).exists()
+        assert len(db.archive_records.copies(pid)) == 2
+    finally:
+        db.close()
+
+
 def test_verified_copy_keeps_source_and_catalogues_destination(tmp_path, project, index_volume):
     source, destination = project
     original = source / "nested" / "source.dat"
@@ -553,8 +681,8 @@ def test_preview_worker_overlaps_next_copy_and_reuses_matching_output(tmp_path, 
         db.close()
 
 
-@pytest.mark.parametrize("from_context", [False, True])
-def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, index_volume, monkeypatch, from_context):
+@pytest.mark.parametrize("apply_from_manager", [False, True])
+def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, index_volume, monkeypatch, apply_from_manager):
     from PySide6.QtWidgets import QMenu
     import jvvv.app as app_module
     from jvvv.app import MainWindow
@@ -595,16 +723,14 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
 
     def execute(dialog):
         shown_dialogs.append(dialog)
-        choices = [dialog.destination.itemData(index)[0] for index in range(dialog.destination.count())]
-        if from_context:
-            assert choices == [volume_id]
-            assert not dialog.destination.isEnabled()
-        else:
-            assert set(choices) == {volume_id, other_id}
-            assert dialog.destination.isEnabled()
-            assert not dialog.start.isEnabled()
-            dialog.destination.setCurrentIndex(choices.index(volume_id))
-        assert str(destination) in dialog.destination.currentText()
+        from PySide6.QtCore import Qt
+        choices = [dialog.destination.item(index).data(Qt.ItemDataRole.UserRole)[0]
+                   for index in range(dialog.destination.count())]
+        assert set(choices) == {volume_id, other_id}
+        assert not dialog.selected_targets()
+        assert not dialog.start.isEnabled()
+        dialog.destination.item(choices.index(volume_id)).setCheckState(Qt.CheckState.Checked)
+        assert str(destination) in dialog.destination.item(choices.index(volume_id)).text()
         dialog.source.setText(str(source))
         dialog.start.click()
         return dialog.result()
@@ -623,13 +749,13 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
         assert window.archive_project_action.isEnabled()
         assert window.select_volume(other_id)
         monkeypatch.setattr(utils, "list_connected_volume_snapshots", slow_drive_lookup)
-        if from_context:
+        if apply_from_manager:
             class ArchiveMenu(QMenu):
                 def exec(self, _point):
-                    assert all(action.text() != "Register Archive Drive…" for action in self.actions())
-                    action = next(action for action in self.actions() if action.text() == "Archive Project…")
-                    assert action.isEnabled()
-                    action.trigger()
+                    labels = {action.text() for action in self.actions()}
+                    assert "Queue Scan" in labels
+                    assert "Register Archive Drive…" not in labels
+                    assert "Archive Project…" not in labels
 
             monkeypatch.setattr(app_module, "QMenu", ArchiveMenu)
             window.show()
@@ -637,8 +763,8 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
             row = next(row for row, item in enumerate(window.volume_model.items) if item.id == volume_id)
             point = window.volume_table.visualRect(window.volume_model.index(row, 0)).center()
             window.show_volume_context_menu(point)
-        else:
-            window.archive_project_action.trigger()
+        assert window.archive_project_action in window.file_menu.actions()
+        window.archive_project_action.trigger()
         assert len(shown_dialogs) == 1
         assert not (destination / source.name).exists()
         queued = window.operations_queue.jobs[0]
@@ -649,7 +775,7 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
         assert window.queue_summary_label.text() == queued.title
         assert window.apply_queue_button.isEnabled()
         assert window.apply_queue_button.text() == "Apply"
-        if from_context:
+        if apply_from_manager:
             window.queue_manager_button.click()
             manager = window.operations_dialog
             assert manager.apply_button.text() == "Apply"
@@ -661,7 +787,7 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
         assert window.operations_queue.get(queued.id).state == "ready"
         assert window.scan_progress.format() == "Checking drive connection…"
         assert queued.title in window.operation_progress_label.text()
-        if from_context:
+        if apply_from_manager:
             assert "Checking drive connection…" in manager.progress.text()
         assert window.select_volume(volume_id)
         assert window.current_volume_id == volume_id
@@ -692,13 +818,106 @@ def test_archive_action_uses_only_existing_scanned_volumes(tmp_path, project, in
 
 
 def wait_for_queue(predicate):
-    from time import monotonic
-    from PySide6.QtTest import QTest
+    from time import monotonic, sleep
 
     end = monotonic() + 12
     while not predicate() and monotonic() < end:
-        QTest.qWait(25)
+        QApplication.processEvents()
+        sleep(0.005)  # Release the GIL for Python queue workers between GUI events.
     assert predicate(), "Timed out waiting for the operations queue."
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_apply_group_from_dialog_then_connect_waiting_drive(tmp_path, project, index_volume, monkeypatch, swap):
+    from PySide6.QtCore import Qt
+    from jvvv.app import MainWindow
+    from jvvv.archive_stream import SharedArchiveStream
+    from jvvv.archive_ui import ArchiveDialog
+    from jvvv.operations_queue import OperationDisks
+
+    source, first = project
+    second, hidden = tmp_path / "Second drive", tmp_path / "Unplugged"
+    second.mkdir()
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow, "open_last_catalogue", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_confirm_snapshot_before_close", lambda self: True)
+    def choose(dialog):
+        dialog.source.setText(str(source))
+        assert dialog.destination.count() == 2 and len(dialog.selected_targets()) == 1
+        for i in range(2):
+            dialog.destination.item(i).setCheckState(Qt.CheckState.Checked)
+        dialog.start.click()
+        return dialog.result()
+    monkeypatch.setattr(ArchiveDialog, "exec", choose)
+    monkeypatch.setattr(OperationDisks, "resolve", classmethod(lambda cls, job, path:
+                        OperationDisks((7, 1 if Path(path) == first else 2), (7, 3), True)))
+    streams = set()
+    start = SharedArchiveStream.start
+    def track(stream, produce):
+        streams.add(stream)
+        start(stream, produce)
+    monkeypatch.setattr(SharedArchiveStream, "start", track)
+    window = MainWindow()
+    window.catalogue_path = tmp_path / "Archive.jvvv"
+    window.db = create_catalogue(window.catalogue_path)
+    window._set_catalogue_open(True)
+    try:
+        volumes = [index_volume(window.db, path) for path in (first, second)]
+        window.refresh_volumes()
+        if swap:
+            second.rename(hidden)
+        window.archive_project(volumes[0])
+        queue = window.operations_queue
+        assert len(queue.jobs) == 2 and queue.apply_count(active=False) == 1
+        window.show_operations_queue()
+        pending = window.operations_dialog.tables["Pending"]
+        assert pending.rowCount() == 3
+        window.apply_operations()
+        first_id, other_id = [job.id for job in queue.jobs]
+        if swap:
+            wait_for_queue(lambda: queue.get(first_id).state == "completed" and queue.get(other_id).state == "waiting")
+            assert "1 of 2" in pending.item(0, 3).text()
+            assert window.project_sessions[queue.get(first_id).project_id].guard is not None
+            first.rename(tmp_path / "First disconnected")
+            hidden.rename(second)
+            window._pump_operations()
+        wait_for_queue(lambda: all(j.state in {"failed", "completed", "warning"} for j in queue.jobs))
+        assert all(j.state == "completed" for j in queue.jobs), queue.jobs
+        assert pending.rowCount() == 0
+        assert not window.project_sessions
+        completed = window.operations_dialog.tables["Completed"]
+        assert "2 of 2" in completed.item(0, 3).text()
+        completed.cellClicked.emit(0, 0)
+        assert completed.rowCount() == 1
+        assert len(streams) == (0 if swap else 1)
+        if swap:
+            from jvvv.app import CatalogueItemRef
+            # The first drive is offline and its completed rows have been removed.
+            for job in list(queue.jobs):
+                queue.remove(job.id)
+            third = tmp_path / "Third drive"
+            third.mkdir()
+            third_id = index_volume(window.db, third)
+            def add_later(dialog):
+                assert dialog.source.isReadOnly() and dialog.source.text() == str(source)
+                assert dialog.destination.count() == 1
+                dialog.destination.item(0).setCheckState(Qt.CheckState.Checked)
+                assert dialog.selected_targets()[0][0] == third_id
+                dialog.start.click()
+                return dialog.result()
+            monkeypatch.setattr(ArchiveDialog, "exec", add_later)
+            folder = window.db.get_folder_by_path(volumes[0], source.name)
+            target = CatalogueItemRef("folder", folder["id"], volumes[0], source.name)
+            menu = window.build_catalogue_item_context_menu(target)
+            next(action for action in menu.actions() if action.text() == "Add another copy…").trigger()
+            assert [j.state for j in queue.jobs] == ["completed", "completed", "queued"]
+            window.apply_operations()
+            wait_for_queue(lambda: queue.jobs[-1].state in {"completed", "failed"})
+            assert queue.jobs[-1].state == "completed", queue.jobs[-1].detail
+            assert "3 of 3" in completed.item(0, 3).text()
+    finally:
+        window.close()
+        app.processEvents()
 
 
 @pytest.mark.parametrize("kind", ["scan", "archive", "pause one archive"])

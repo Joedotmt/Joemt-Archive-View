@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive the same project to multiple drives | JVVV manual</title>
+<link rel="stylesheet" href="manual.css">
+</head>
+<body>
+<main>
+<p><a href="index.html">Manual index</a></p>
+<h1>Archive the same project to multiple drives</h1>
+<p>If both HDDs are ready now, select them together. If you have only one connection, JVVV can keep the other copy in the queue until you swap drives. If the first archive has already finished, skip to <a href="#later">Add another copy later</a>.</p>
+<h2 id="select">1. Select the destinations together</h2>
+<p>Choose <strong>File → Archive Project…</strong>. Browse to your project, tick each destination, and click <strong>Queue Archive</strong> once. Each HDD needs to have been <a href="new-volume.html">added to this catalogue</a>. A known volume can be ticked even when it says <strong>disconnected</strong>.</p>
+<figure><a href="images/archive-two.png"><img src="images/archive-two.png" alt="Archive Project with AID-151 and AID-152 both checked for Harbour Film."></a></figure>
+<h2 id="queue">2. Review and apply</h2>
+<p>Open <strong>Queue Manager → Pending</strong>. Expand the project to see one <strong>Copy</strong> row for each HDD. Check the drive IDs and click <strong>Apply</strong>. Two destinations for one project count as one task.</p>
+<figure><a href="images/queue-two.png"><img src="images/queue-two.png" alt="Harbour Film expanded in the queue with two Copy rows and zero of two copies verified."></a></figure>
+<h2 id="both">3. Follow each drive</h2>
+<p>When both disks are ready at the start, JVVV can send the same source data to both. Each drive then gets its own read-back check. Expand the project to see which disk is still working.</p>
+<figure><a href="images/verify-active.png"><img src="images/verify-active.png" alt="Queue Manager showing separate read-back progress for the two destinations."></a></figure>
+<h2 id="swap">If you need to swap drives</h2>
+<p>When AID-151 says <strong>Verified</strong> and has no other active work, eject it normally. Connect AID-152. Leave JVVV running and the queue applied so the waiting copy starts automatically. Keep <code>Q:\Harbour Film</code> available. Its files supply the second copy. If you closed JVVV, reopen the same catalogue and press <strong>Apply</strong>.</p>
+<figure><a href="images/waiting.png"><img src="images/waiting.png" alt="AID-151 is verified while AID-152 shows Waiting for Drive."></a></figure>
+<h2 id="complete">Check that both finished</h2>
+<p>Open <strong>Completed</strong> and expand the project. <strong>2 of 2 copies verified</strong> means each HDD passed its check against the original file hashes.</p>
+<figure><a href="images/two-verified.png"><img src="images/two-verified.png" alt="Completed project with both destination drives verified."></a></figure>
+<h2 id="later">Add another copy later</h2>
+<p>In the catalogue, right-click the <strong>archived project folder</strong> and choose <strong>Add another copy…</strong>. You can also use its completed entry in Queue Manager. The folder action works even after clearing the queue history, for projects archived with a saved project record.</p>
+<figure><a href="images/copy-menu.png"><img src="images/copy-menu.png" alt="The Harbour Film project folder’s menu with Add another copy selected."></a></figure>
+<p>Check the original source path and the list of verified drives. Tick the new destination, click <strong>Queue Copy</strong>, then <strong>Apply</strong>. The first archive HDD can stay unplugged. <a href="how-archiving-works.html#later">How JVVV makes this copy without a separate full source scan</a>.</p>
+<figure><a href="images/add-copy.png"><img src="images/add-copy.png" alt="Add Another Copy shows the original source, AID-151 already verified, and AID-152 selected."></a></figure>
+<h2 id="retry">Pause or retry a copy</h2>
+<p>Use <strong>Pause Queue</strong> to hold the work and <strong>Apply</strong> to resume. For a failed copy, select its drive row and read the message underneath. Once you have resolved the cause, right-click the failed drive row, choose <strong>Retry</strong>, and press <strong>Apply</strong>. The other verified drive keeps its result.</p>
+<figure><a href="images/retry-copy.png"><img src="images/retry-copy.png" alt="Retry on the failed destination row with the affected file named below."></a></figure>
+<p>For a content mismatch, see <a href="how-archiving-works.html#changes">What happens if the source changes?</a> For <strong>Verified with warnings</strong>, select the row for details. A preview can fail even when the project files passed verification.</p>
+<p><a href="index.html">Back to manual index</a></p>
+</main>
+</body>
+</html>

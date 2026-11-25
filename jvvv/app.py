@@ -88,6 +88,7 @@ from .archive_job import (
     pending_archive, register_scanned_drive,
 )
 from .archive_ui import ArchiveDialog, ArchiveThread
+from .archive_stream import ProjectSession, SharedArchiveStream
 from .backup_analysis import BackupAnalysisEngine
 from .backup_ui import (
     BACKUP_COLUMN_HEADER_TOOLTIP, BACKUP_FILTER_OPTIONS, NOT_ANALYSED_BACKUP_DISPLAY,
@@ -3971,6 +3972,7 @@ class MainWindow(QMainWindow):
         self._queue_drive_probe: tuple[Database, Future[dict[str, QueueDriveCheck]]] | None = None
         self._file_open_requests: dict[FileOpenKey, Future[bool]] = {}
         self.queue_writer_lock = Lock()
+        self.project_sessions = {}
         self.scan_queue_result: tuple[str, str] | None = None
         self.scan_cancel_requested = False
         self.delete_thread: QThread | None = None
@@ -6685,6 +6687,7 @@ class MainWindow(QMainWindow):
         lock = self.catalogue_lock
         self.operations_timer.stop()
         self._queue_drive_probe = None
+        self._release_idle_projects()
         for request in self._file_open_requests.values():
             request.cancel()
         self._file_open_requests.clear()
@@ -7260,11 +7263,6 @@ class MainWindow(QMainWindow):
         scan_action = menu.addAction("Queue Scan")
         scan_action.triggered.connect(lambda: self.start_scan(volume_id=volume_id))
         scan_action.setEnabled(not busy and not self.db.read_only)
-        archive_action = menu.addAction("Archive Project…")
-        archive_action.triggered.connect(lambda: self.archive_project(volume_id))
-        archive_action.setEnabled(
-            not busy and not self.db.read_only and bool(self.archive_targets([volume]))
-        )
         link_action = menu.addAction("Relink Drive…")
         link_action.triggered.connect(lambda: self.relink_drive(volume_id))
         link_action.setEnabled(not busy and not self.db.read_only and volume is not None)
@@ -7554,7 +7552,7 @@ class MainWindow(QMainWindow):
         )
         self.delete_thread.start()
 
-    def archive_project(self, volume_id: int | None = None) -> None:
+    def archive_project(self, volume_id: int | None = None, *, project_id=None) -> None:
         if self.db is None or self.db.read_only:
             return
         if self._catalogue_job_running():
@@ -7562,8 +7560,19 @@ class MainWindow(QMainWindow):
             return
         try:
             queue = self._get_operations_queue()
+            targets = self.archive_targets()
+            source, verified = "", {}
+            if project_id:
+                record = self.db.archive_records.project(project_id)
+                if record is None:
+                    raise OSError("The original project record could not be found.")
+                source = record["source"]
+                copied = self.db.archive_records.copies(project_id)
+                occupied = copied | {job.volume_uuid for job in queue.jobs if job.project_id == project_id}
+                verified = {v["uuid"]: self.db.volume_reference(v) for v in self.db.list_volumes() if v["uuid"] in copied}
+                targets = [(v, dependency) for v, dependency in targets if v["uuid"] not in occupied]
             dialog = ArchiveDialog(
-                self.db, self.archive_targets(), self, volume_id=volume_id,
+                self.db, targets, self, volume_id=volume_id, source=source, verified=verified.values(),
                 connected_path=self.current_source_path_for_volume,
             )
         except Exception as exc:
@@ -7573,16 +7582,15 @@ class MainWindow(QMainWindow):
         self._update_context_actions()
         try:
             if dialog.exec() == QDialog.DialogCode.Accepted:
-                target_id, target_uuid, dependency = dialog.destination.currentData()
-                volume = self.db.get_volume(target_id)
-                if volume is None or volume["uuid"] != target_uuid:
-                    raise OSError("The destination volume changed. Choose the drive again.")
-                job = queue.add(
-                    "archive", volume, self.db.volume_reference(volume),
-                    source=dialog.source.text(), requires=dependency,
-                )
+                targets = []
+                for target_id, target_uuid, dependency in dialog.selected_targets():
+                    volume = self.db.get_volume(target_id)
+                    if volume is None or volume["uuid"] != target_uuid:
+                        raise OSError("The destination volume changed. Choose the drive again.")
+                    targets.append((volume, self.db.volume_reference(volume), dependency))
+                queue.add_archive(targets, dialog.source.text(), project_id, verified=verified.items())
                 self._refresh_operations()
-                self.statusBar().showMessage(f"Queued {job.title}.", 4000)
+                self.statusBar().showMessage(f"Queued {Path(dialog.source.text()).name} for {len(targets)} drive(s).", 4000)
         except (OSError, ValueError) as exc:
             self.statusBar().showMessage(str(exc), 10000)
         finally:
@@ -7657,7 +7665,11 @@ class MainWindow(QMainWindow):
             self.operations_dialog.pause_job_requested.connect(self.pause_queue_job)
             self.operations_dialog.move_requested.connect(self.move_operation)
             self.operations_dialog.remove_requested.connect(self.remove_operation)
+            self.operations_dialog.remove_project_requested.connect(
+                lambda pid: self._change_operations(self.operations_queue.remove_project, pid)
+            )
             self.operations_dialog.retry_requested.connect(self.retry_operation)
+            self.operations_dialog.add_copy_requested.connect(lambda pid: self.archive_project(project_id=pid))
             self.operations_dialog.preview_failures_requested.connect(lambda: self.show_preview_failures())
         self._refresh_operations()
         if self.operation_id is not None:
@@ -7668,10 +7680,15 @@ class MainWindow(QMainWindow):
     def _refresh_queue_controls(self) -> None:
         queue = self.operations_queue
         pending = [job for job in queue.jobs if job.state not in DONE] if queue is not None else []
-        if len(pending) == 1:
+        groups = {job.project_id or job.id for job in pending}
+        if len(groups) == 1 and pending[0].project_id and sum(
+                job.project_id == pending[0].project_id for job in queue.jobs) > 1:
+            children = [job for job in queue.jobs if job.project_id == pending[0].project_id]
+            summary = f"{Path(children[0].source).name} · {sum(j.state in DONE for j in children)} of {len(children)} copies verified"
+        elif len(pending) == 1:
             summary = pending[0].title
         else:
-            summary = f"{len(pending)} pending changes" if pending else "No pending changes"
+            summary = f"{len(groups)} pending changes" if pending else "No pending changes"
         self.queue_summary_label.setText(summary)
         self.queue_summary_label.setToolTip(summary)
         enabled = self.operations_queue_action.isEnabled()
@@ -7688,6 +7705,7 @@ class MainWindow(QMainWindow):
             self.operations_dialog.apply_button.setEnabled(can_apply)
 
     def _refresh_operations(self) -> None:
+        self._release_idle_projects()
         self._refresh_queue_controls()
         if self.operations_dialog is not None:
             previews = self.last_preview_statistics
@@ -7740,6 +7758,16 @@ class MainWindow(QMainWindow):
             self.pause_queue_job(job_id)
         self._refresh_operations()
 
+    def _release_idle_projects(self):
+        for identifier in list(self.project_sessions):
+            if any(active.job.project_id == identifier for active in self.running_operations.values()):
+                continue
+            if self.operations_timer.isActive() and self.operations_queue and any(
+                job.project_id == identifier and job.state in ACTIONABLE for job in self.operations_queue.jobs
+            ):
+                continue
+            self.project_sessions.pop(identifier).close(wait=False)
+
     def pause_queue_job(self, job_id: str) -> None:
         active = self.running_operations.get(job_id)
         if active is not None:
@@ -7752,6 +7780,17 @@ class MainWindow(QMainWindow):
                 or QApplication.activeModalWidget() is not None):
             return
         queue = self.operations_queue
+        for identifier, session in list(self.project_sessions.items()):
+            if session.guard is None or any(op.job.project_id == identifier for op in self.running_operations.values()):
+                continue
+            try:
+                session.guard.check()
+            except OSError as exc:
+                for waiting in queue.jobs:
+                    if waiting.project_id == identifier and waiting.state in ACTIONABLE:
+                        if not self._change_operations(queue.set_state, waiting.id, "failed", str(exc)):
+                            self.pause_operations()
+                            return
         candidates = [job for job in queue.jobs if job.state in ACTIONABLE]
         if not candidates:
             if not self.running_operations:
@@ -7797,13 +7836,15 @@ class MainWindow(QMainWindow):
             if check.problem == "Relink Required":
                 return "relink", "Resolve the drive identity from the volume's Relink Drive action."
             if check.path is None:
-                return "waiting", "Connect the drive linked to this volume."
+                return "waiting", f"Connect {job.volume_label} to continue."
             if job.kind == "archive" and not is_scanned_archive_volume(self.db, volume):
                 return "failed", "The destination needs a completed initial drive scan."
             return "ready", ""
 
         def can_start(job):
             check = current_check(job, volumes[job.volume_uuid])
+            if job.project_id and any(a.job.project_id == job.project_id for a in self.running_operations.values()):
+                return False
             return check is not None and check.disks is not None and all(
                 not check.disks.conflicts_with(active.disks) for active in self.running_operations.values()
             )
@@ -7827,6 +7868,13 @@ class MainWindow(QMainWindow):
                         destination_ready = active.worker.finished_writing
                 if job is None:
                     break
+                if job.project_id and destination_ready is None:
+                    peers = self._archive_stream_group(job, queue.ready_jobs(availability, can_start), checks)
+                    if len(peers) > 1:
+                        if self.running_operations:
+                            break
+                        self._start_archive_group(peers, checks, volumes)
+                        continue
                 queue.set_state(job.id, "running")
                 check = checks[job.id]
                 self._start_queue_job(job, check.disks, volumes[job.volume_uuid]["id"], check.path, destination_ready)
@@ -7850,8 +7898,42 @@ class MainWindow(QMainWindow):
                     self.scan_progress.setRange(0, 1)
                     self.scan_progress.setValue(0)
                     self.scan_progress.setFormat(STATUSES[waiting.state])
-                    self._show_queued_progress(STATUSES[waiting.state], operation=waiting)
+                    session = self.project_sessions.get(waiting.project_id)
+                    protection = "Source protected · " if session and session.guard is not None else ""
+                    self._show_queued_progress(protection + (waiting.detail or STATUSES[waiting.state]), operation=waiting)
         self._refresh_operations()
+
+    def _archive_stream_group(self, first, ready_jobs, checks):
+        """Fresh writers to distinct disks can consume one ordered stream."""
+        peers = []
+        disks = set()
+        for job in ready_jobs:
+            if job.project_id != first.project_id:
+                continue
+            disk = checks[job.id].disks
+            # Partial archives may need to resume at different source files.
+            if (disk.destination is None or disk.destination == disk.source or disk.destination in disks
+                    or (self.db.path / f"archive-job-{job.id}.sqlite").exists()):
+                if job.id == first.id:
+                    return [first]
+                continue
+            peers.append(job)
+            disks.add(disk.destination)
+        return peers
+
+    def _start_archive_group(self, peers, checks, volumes):
+        stream = SharedArchiveStream([job.id for job in peers])
+        try:
+            for job in peers:
+                target = checks[job.id]
+                self.operations_queue.set_state(job.id, "running")
+                self._start_queue_job(job, target.disks, volumes[job.volume_uuid]["id"],
+                                      target.path, shared_stream=stream)
+        finally:
+            for job in peers:
+                if job.id not in self.running_operations:
+                    stream.detach(job.id)
+                    self.operations_queue.set_state(job.id, "paused", "Could not start the archive writer.")
 
     def _queue_drive_checks(self, candidates, volumes):
         probe = self._queue_drive_probe
@@ -7890,12 +7972,20 @@ class MainWindow(QMainWindow):
             self.operations_dialog.progress.clear()
 
     def _start_queue_job(self, job: Operation, disks: OperationDisks, volume_id: int, path: str,
-                         destination_ready=None) -> None:
+                         destination_ready=None, *, shared_stream=None) -> None:
         events = QueueJobEvents(self, job.id)
         if job.kind == "archive":
+            session = self.project_sessions.get(job.project_id)
+            if job.project_id and session is None and any(
+                other.project_id == job.project_id and other.id != job.id and other.tab == "Pending"
+                for other in self.operations_queue.jobs
+            ):
+                session = self.project_sessions[job.project_id] = ProjectSession()
             worker = thread = ArchiveThread(
                 self.db.path, job, volume_id, self.preview_settings, self, writer_lock=self.queue_writer_lock,
                 resolved_destination=path, destination_ready=destination_ready,
+                session=session,
+                shared_stream=shared_stream,
             )
             worker.progress.connect(events.archive_progress)
             thread.finished.connect(events.archive_finished)
@@ -7974,6 +8064,31 @@ class MainWindow(QMainWindow):
 
     def _render_running_progress(self) -> None:
         active = list(self.running_operations.values())
+        project_id = active[0].job.project_id
+        if project_id and all(a.job.project_id == project_id for a in active):
+            members = [j for j in self.operations_queue.jobs if j.project_id == project_id]
+            if len(members) > 1:
+                completed = sum(j.state in DONE for j in members)
+                # Each disk has two byte passes: writing and reading back.
+                passes = 2.0 * completed
+                for entry in active:
+                    passes += int(entry.verifying)
+                    if entry.total:
+                        passes += min(1, entry.done / entry.total)
+                    elif entry.verifying:
+                        passes += 1  # verification finished; catalogue or previews are being finalized
+                message = f"{Path(active[0].job.source).name} · {completed} of {len(members)} copies verified"
+                detail = " · ".join(f"{a.job.volume_label}: {a.message}" for a in active)
+                self.scan_progress.setRange(0, 1000)
+                self.scan_progress.setValue(round(1000 * passes / (2 * len(members))))
+                self.scan_progress.setFormat(f"{message} (%p%)")
+                self.operation_progress_label.setText(detail)
+                self.operation_progress_label.setToolTip(detail)
+                self.operation_progress_label.show()
+                self.stop_scan_button.setText("Pause Queue")
+                if self.operations_dialog is not None:
+                    self.operations_dialog.progress.setText(message)
+                return
         if len(active) > 1:
             message = f"{len(active)} jobs running · See Queue Manager for progress"
             preparing = next((entry for entry in active if entry.job.kind == "archive"
@@ -8766,6 +8881,12 @@ class MainWindow(QMainWindow):
         copy_action.triggered.connect(
             lambda checked=False, target=target: self.copy_catalogue_item_path(target)
         )
+
+        if target.is_folder and self.db and not self.db.read_only and len(PurePosixPath(target.relative_path).parts) == 1:
+            volume = self.db.get_volume(target.volume_id)
+            project_id = self.db.archive_records.folder_project(volume["uuid"], target.relative_path) if volume else None
+            if project_id:
+                menu.addAction("Add another copy…", lambda: self.archive_project(project_id=project_id))
 
         media_kind = (
             None

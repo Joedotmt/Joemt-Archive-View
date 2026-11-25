@@ -789,6 +789,11 @@ class Database:
                 raise InvalidCatalogueError(str(exc)) from exc
         return self._registry_connection
 
+    @property
+    def archive_records(self):
+        from .archive_records import ArchiveRecords
+        return ArchiveRecords(self._registry())
+
     def catalogue_meta(self) -> dict[str, str]:
         """Return the registry's key/value metadata (format, UUID, settings)."""
 

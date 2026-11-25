@@ -204,6 +204,7 @@ def build_fake_context_menu(
 ):
     monkeypatch.setattr("jvvv.app.QMenu", FakeMenu)
     window = SimpleNamespace(
+        db=None,
         cached_catalogue_item_path=lambda candidate: real_path,
         open_catalogue_item=lambda candidate: None,
         open_catalogue_location_for_item=lambda candidate: None,

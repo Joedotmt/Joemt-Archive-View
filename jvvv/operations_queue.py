@@ -55,6 +55,8 @@ class Operation:
     state: str = "queued"
     detail: str = ""
     legacy_journal: bool = False
+    project_id: str = ""
+    require_record: bool = False
 
     @property
     def tab(self) -> str:
@@ -161,6 +163,26 @@ class OperationsQueue:
         self._save([*self.jobs, job])
         return job
 
+    def add_archive(self, targets, source, project_id=None, *, verified=()):
+        identifier = project_id or uuid4().hex
+        jobs = [Operation(uuid4().hex, "archive", volume["uuid"], label, source, dependency,
+                          project_id=identifier, require_record=bool(project_id))
+                for volume, label, dependency in targets]
+        occupied = {job.volume_uuid for job in self.jobs if job.project_id == identifier}
+        history = []
+        for uuid, label in verified:
+            if uuid not in occupied:
+                history.append(Operation(uuid4().hex, "archive", uuid, label, source,
+                                         state="completed", detail="Verified in the catalogue.",
+                                         project_id=identifier))
+                occupied.add(uuid)
+        for job in jobs:
+            if job.volume_uuid in occupied:
+                raise ValueError("This destination already belongs to this archive task.")
+            occupied.add(job.volume_uuid)
+        self._save([*self.jobs, *history, *jobs])
+        return jobs
+
     def set_state(self, job_id: str, state: str, detail: str = "") -> None:
         current = self.get(job_id)
         if current is not None and (state, detail) != (current.state, current.detail):
@@ -177,7 +199,7 @@ class OperationsQueue:
         states = {"queued", "paused"}
         if not active:
             states |= ACTIONABLE
-        return sum(job.state in states for job in self.jobs)
+        return len({job.project_id or job.id for job in self.jobs if job.state in states})
 
     def move(self, job_id: str, offset: int) -> None:
         job = self.get(job_id)
@@ -205,7 +227,15 @@ class OperationsQueue:
             raise ValueError("Remove the dependent archive jobs before removing this scan.")
         self._save([item for item in self.jobs if item.id != job_id])
 
+    def remove_project(self, project_id):
+        members = [j for j in self.jobs if j.project_id == project_id]
+        if project_id and members and all(j.state != "running" for j in members):
+            self._save([j for j in self.jobs if j.project_id != project_id])
+
     def next_ready(self, availability, can_start=None, *, preparing_after=None) -> Operation | None:
+        return next(self.ready_jobs(availability, can_start, preparing_after=preparing_after), None)
+
+    def ready_jobs(self, availability, can_start=None, *, preparing_after=None):
         """Skip disconnected drives and blocked dependencies, preserving order per drive."""
         blocked = set()
         for job in self.jobs:
@@ -226,7 +256,6 @@ class OperationsQueue:
             state, detail = availability(job)
             if state == "ready":
                 if can_start is None or can_start(job):
-                    return job
+                    yield job
                 continue
             self.set_state(job.id, state, detail)
-        return None

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How JVVV copies and verifies a project | JVVV manual</title>
+<link rel="stylesheet" href="manual.css">
+</head>
+<body>
+<main>
+<p><a href="index.html">Manual index</a></p>
+<h1>How JVVV copies and verifies a project</h1>
+<h2 id="first">What happens on the first copy?</h2>
+<p>Suppose you archive <code>Q:\Harbour Film</code> to AID-151. JVVV lists the project’s folders and files. As it reads each file to write it to AID-151, it calculates a <strong>hash</strong>, a short fingerprint of the file’s contents. With previews enabled, JVVV can use the data being copied to prepare a preview, or reuse a matching preview it already has.</p>
+<p>After writing, JVVV reads each file <em>from AID-151</em> and calculates its hash again. A match tells JVVV the file it read back has the same contents as the original. Once the project passes, JVVV records the verified files directly in AID-151’s catalogue entry. That is why the project appears immediately without scanning everything else on the HDD.</p>
+<h2 id="saved">What does the catalogue keep?</h2>
+<ul>
+<li>The original project folder path, the relative paths inside it, and file details including sizes and modification times.</li>
+<li>The original hash for each file and the algorithm used to calculate it.</li>
+<li>Media information and preview references where available. The preview files live in the configured preview directory.</li>
+<li>The volumes that received verified copies of this project.</li>
+</ul>
+<p>The original media stays in the source folder and on the HDDs you copied it to. Clearing completed queue entries leaves the project record in the catalogue. A hash or preview cannot recreate the media file.</p>
+<h2 id="later">Where do the bytes for the second HDD come from?</h2>
+<p><strong>Both HDDs connected together.</strong> When both fresh destinations are ready to write, JVVV reads a block from <code>Q:\</code> and sends that block to both drives before releasing it. Each source file needs one content read and one original hash. Each destination still needs its own verification read.</p>
+<p><strong>Second HDD connected tomorrow.</strong> Suppose you unplugged AID-151 yesterday and now choose <strong>Add another copy…</strong> for AID-152. JVVV needs the original project at its saved path. Here is what happens to <code>Footage\Interview.mov</code>:</p>
+<ol>
+<li>JVVV checks the project listing against the saved version, including the file’s name, size and modification time. Checking these details does not require reading the video from beginning to end.</li>
+<li>JVVV opens the video on <code>Q:\</code> and reads its bytes to write them to AID-152. It already has the original hash and preview record, so a fresh later copy needs no separate pass over the video to calculate another source hash.</li>
+<li>JVVV reads the video back from AID-152, hashes those bytes, and compares the result with the original hash saved yesterday.</li>
+</ol>
+<p>This is what “without rescanning” means here. There is still a file-list check, a source read to supply the copy, and a destination read to verify it. No project-sized copy is kept on the PC between drives. If the source is offline, the saved record alone cannot supply the next copy.</p>
+<h2 id="changes">What happens if the source changes?</h2>
+<p>On Windows, JVVV holds source files open against writes and deletions while copying and watches the folder for changes. It can keep this protection while an applied project waits for a planned drive swap. Pausing the queue or closing the app releases the protection once active work stops.</p>
+<p>If a file has been added, removed, renamed, or visibly edited since the first archive, the saved listing can catch that before a later copy starts. If a file was edited but kept the same size and timestamp, the destination hash check can still catch the difference. JVVV reports the mismatch and leaves that destination unverified. A mismatch alone cannot distinguish an edited source from a copy error.</p>
+<p>Resuming an interrupted archive is a different case. JVVV can recheck previously copied source files before reusing partial progress. Use <a href="multiple-drives.html#retry">Retry</a> after resolving the reported problem.</p>
+<p><a href="multiple-drives.html#later">Steps to add another copy</a></p>
+<p><a href="index.html">Back to manual index</a></p>
+</main>
+</body>
+</html>

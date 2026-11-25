@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive a project to a drive | JVVV manual</title>
+<link rel="stylesheet" href="manual.css">
+</head>
+<body>
+<main>
+<p><a href="index.html">Manual index</a></p>
+<h1>Archive a project to a drive</h1>
+<p>This example copies <code>Q:\Harbour Film</code> to <code>E:\Harbour Film</code> on AID-151. The original stays on <code>Q:\</code>. If your destination HDD is new, <a href="new-volume.html">add it to the catalogue and queue its first scan</a>.</p>
+<h2 id="start">1. Open Archive Project</h2>
+<p>Open your catalogue for editing and choose <strong>File → Archive Project…</strong>.</p>
+<figure><a href="images/file-archive.png"><img src="images/file-archive.png" alt="The File menu with Archive Project selected."></a></figure>
+<h2 id="choose">2. Choose what to copy and where it goes</h2>
+<p>Click <strong>Browse…</strong> beside <strong>Source project</strong> and select the finished project folder. Under <strong>Destination drives</strong>, tick the HDD that should receive the copy. Check the source path and drive ID, then click <strong>Queue Archive</strong>.</p>
+<figure><a href="images/archive-one.png"><img src="images/archive-one.png" alt="Harbour Film selected as the source with AID-151 ticked as the destination."></a></figure>
+<p>If you already know you want two copies, <a href="multiple-drives.html#select">tick both drives in this dialog</a> before queuing.</p>
+<h2 id="apply">3. Apply the archive</h2>
+<p>Beside the catalogue name, check the queued project and destination. Click <strong>Apply</strong> to start. If several tasks are queued, the button says <strong>Apply All</strong>. The same button is available in <strong>Queue Manager</strong>.</p>
+<figure><a href="images/apply-archive.png"><img src="images/apply-archive.png" alt="Catalogue header with the Harbour Film archive queued and Apply available."></a></figure>
+<h2 id="verify">4. Wait for Verified</h2>
+<p>Keep the source available and the HDD connected. JVVV copies each file and calculates its hash. When the status says <strong>Reading back the destination…</strong>, it is reading the copy from the HDD and checking it against that hash. Wait for <strong>Verified</strong> before ejecting a drive that has finished all its work.</p>
+<figure><a href="images/one-verified.png"><img src="images/one-verified.png" alt="Queue Manager showing the archive on AID-151 as Verified."></a></figure>
+<h2 id="find">5. Browse the copy</h2>
+<p>In the catalogue, select AID-151 and open <strong>Harbour Film</strong>. JVVV added the files it verified to that volume’s index. The copy contains the project files and a marker named <code>Harbour Film.jvvv-project.json</code>.</p>
+<figure><a href="images/catalogue-folder.png"><img src="images/catalogue-folder.png" alt="Harbour Film in the catalogue with its Footage folder and JVVV project marker."></a></figure>
+<p><a href="how-archiving-works.html">What the catalogue remembers</a> · <a href="multiple-drives.html#later">Add another copy later</a></p>
+<p><a href="index.html">Back to manual index</a></p>
+</main>
+</body>
+</html>

@@ -221,11 +221,12 @@ identity. Protected `Q:\` and folders below a drive root are excluded from
 registration. If several connected drives carry the same ID, disconnect the
 duplicate. Use **Relink Drive…** when an existing volume needs to be matched again.
 
-### Archive a project to an HDD
+### Archive a project to one or more HDDs
 
-Add the archive drive from its root, even if the drive is empty. Right-click
-its volume and choose **Archive Project…**, then pick the source project
-folder. You can also choose a destination from **File > Archive Project…**.
+Add the archive drive from its root, even if the drive is empty. Choose
+**File > Archive Project…**, pick the source project folder, and tick each
+destination volume. You can include disconnected volumes. Choose **Queue Archive**,
+then press **Apply**. See the [user manual](manual/index.html) for illustrated instructions.
 If the initial scan is still queued, JVVV runs it before starting the archive.
 
 JVVV copies the project folder to the root of that drive and hashes the source
@@ -233,6 +234,20 @@ bytes as it copies them. It reads the destination back to verify the copy and
 adds a project marker such as `Project Name.jvvv-project.json` inside the
 copied folder. The project appears under the selected volume in the catalogue
 as soon as verification finishes, without a full drive scan.
+
+Connected, independently writable drives can share one source read, hash and
+preview generation. Expand the project in **Queue Manager** to see each copy.
+Once a drive shows **Verified**, you can eject it normally. An applied copy
+waiting for another drive starts when that drive is connected. It reads the
+project from its original location during copying and verifies the destination
+against the saved hashes. Keep the source available through the drive swap.
+
+To add a destination later, right-click the archived project folder or the
+completed queue entry and choose **Add another copy…**. The catalogue retains
+the original file list, hashes, preview references and verified locations even
+after removing completed queue entries. If the original file list changes or
+destination read-back differs from the saved version, the new copy reports an
+error. Existing verified copies remain available.
 
 When two approved projects are queued for the same HDD, JVVV can prepare the
 next project while verifying the first. It reads and hashes the next source into
