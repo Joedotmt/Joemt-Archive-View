@@ -325,22 +325,6 @@ def test_file_manager_opens_folders_and_reveals_files():
     assert calls == [(folder, False), (file_item, True)]
 
 
-def test_search_open_keeps_offline_catalogue_folders_available():
-    open_button = ValueWidget()
-    reveal_button = ValueWidget()
-    folder = SimpleNamespace(is_folder=True, missing=False, connected=False)
-    window = SimpleNamespace(
-        selected_search_item=lambda: folder,
-        open_file_button=open_button,
-        reveal_file_button=reveal_button,
-    )
-
-    MainWindow.on_search_selection_changed(window)
-
-    assert open_button.value is True
-    assert reveal_button.value is False
-
-
 def test_catalogue_navigation_clears_volume_filter_before_switching_tabs():
     events = []
     select_results = iter((False, True))

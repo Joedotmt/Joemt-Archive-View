@@ -27,7 +27,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QMessageBox, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QMessageBox, QPushButton, QWidget  # noqa: E402
 
 from preview_fixtures import write_test_image, write_tiny_mp4  # noqa: E402
 
@@ -89,9 +89,6 @@ FAILED_STEP_LABEL = "FFmpeg executable"
 FAILED_STEP_DETAIL = "FFmpeg could not be found on PATH."
 GENERIC_MISSING_REASON = (
     "No preview exists at the expected location. Rescan the volume to generate it."
-)
-DEFAULT_PREVIEW_BUTTON_TOOLTIP = (
-    "Open the preview in the operating system's default application"
 )
 INVALID_PREVIEW_REASON_PREFIX = "The preview file exists but is not valid: "
 
@@ -376,29 +373,6 @@ class FakeMenu:
         return next(item for item in self.items if item is not None and item.text == text)
 
 
-class FakeButton:
-    def __init__(self, text: str = "") -> None:
-        self._text = text
-        self._enabled = True
-        self._tooltip = ""
-
-    def setText(self, text: str) -> None:
-        self._text = text
-
-    def text(self) -> str:
-        return self._text
-
-    def setEnabled(self, enabled: bool) -> None:
-        self._enabled = bool(enabled)
-
-    def isEnabled(self) -> bool:
-        return self._enabled
-
-    def setToolTip(self, text: str) -> None:
-        self._tooltip = text
-
-    def toolTip(self) -> str:
-        return self._tooltip
 
 
 class FakeProgress:
@@ -743,12 +717,12 @@ def test_context_menu_for_an_image_offers_open_and_reveal_preview_when_it_exists
         "Open File Location",
         "Copy Path",
         "Open Preview",
-        "Reveal Preview",
+        "Open Preview Location",
         None,
         "Properties",
     ]
     open_action = menu.action("Open Preview")
-    reveal_action = menu.action("Reveal Preview")
+    reveal_action = menu.action("Open Preview Location")
     assert open_action.enabled and reveal_action.enabled
     assert open_action.tooltip == "" and reveal_action.tooltip == ""
     # Disconnected source volume (spec §19): the original stays unavailable
@@ -774,7 +748,7 @@ def test_context_menu_disables_preview_actions_and_explains_when_the_preview_is_
     )
 
     open_action = menu.action("Open Preview")
-    reveal_action = menu.action("Reveal Preview")
+    reveal_action = menu.action("Open Preview Location")
     assert not open_action.enabled and not reveal_action.enabled
     assert open_action.tooltip == GENERIC_MISSING_REASON
     assert open_action.status_tip == GENERIC_MISSING_REASON
@@ -804,7 +778,7 @@ def test_context_menu_disables_preview_actions_for_a_corrupt_preview_file(
         window, catalogue.target(image_id, "Photos/corrupt.jpg")
     )
     open_action = image_menu.action("Open Preview")
-    reveal_action = image_menu.action("Reveal Preview")
+    reveal_action = image_menu.action("Open Preview Location")
     assert not open_action.enabled and not reveal_action.enabled
     assert open_action.tooltip.startswith(INVALID_PREVIEW_REASON_PREFIX)
     # The validator's own explanation follows the prefix, and every disabled
@@ -817,7 +791,7 @@ def test_context_menu_disables_preview_actions_for_a_corrupt_preview_file(
         window, catalogue.target(video_id, "Videos/corrupt.mp4")
     )
     play_action = video_menu.action("Play Preview")
-    assert not play_action.enabled and not video_menu.action("Reveal Preview").enabled
+    assert not play_action.enabled and not video_menu.action("Open Preview Location").enabled
     assert play_action.tooltip.startswith(INVALID_PREVIEW_REASON_PREFIX)
     assert opened == []
 
@@ -839,7 +813,7 @@ def test_context_menu_for_a_video_offers_play_preview(monkeypatch, catalogue, tm
         "Open File Location",
         "Copy Path",
         "Play Preview",
-        "Reveal Preview",
+        "Open Preview Location",
         None,
         "Properties",
     ]
@@ -941,12 +915,7 @@ def test_preview_unavailable_reason_explains_each_situation(tmp_path):
 # open_preview_for_target (spec §19, §44, §45, §46)
 # ---------------------------------------------------------------------------
 def make_open_window(catalogue: Catalogue, settings: PreviewSettings):
-    refreshed = []
-    window = SimpleNamespace(
-        db=catalogue.db,
-        preview_settings=settings,
-        on_search_selection_changed=lambda: refreshed.append(True),
-    )
+    window = SimpleNamespace(db=catalogue.db, preview_settings=settings)
     bind(
         window,
         "catalogue_item_media_kind",
@@ -954,7 +923,7 @@ def make_open_window(catalogue: Catalogue, settings: PreviewSettings):
         "preview_unavailable_reason",
         "_mark_preview_missing",
     )
-    return window, refreshed
+    return window
 
 
 def test_open_preview_launches_the_existing_preview_externally(monkeypatch, catalogue, tmp_path):
@@ -970,14 +939,13 @@ def test_open_preview_launches_the_existing_preview_externally(monkeypatch, cata
     monkeypatch.setattr(
         QMessageBox, "information", lambda *args, **kwargs: pytest.fail("no dialog expected")
     )
-    window, refreshed = make_open_window(catalogue, settings)
+    window = make_open_window(catalogue, settings)
     target = catalogue.target(file_id, "Photos/alpha.jpg")
 
     MainWindow.open_preview_for_target(window, target)
     MainWindow.open_preview_for_target(window, target, reveal=True)
 
     assert opened == [(preview, False), (preview, True)]
-    assert refreshed == []
 
 
 def test_open_preview_for_a_vanished_file_explains_and_marks_the_status_missing(
@@ -1006,7 +974,7 @@ def test_open_preview_for_a_vanished_file_explains_and_marks_the_status_missing(
     monkeypatch.setattr(
         "jvvv.app.open_in_file_manager", lambda *args, **kwargs: pytest.fail("must not open")
     )
-    window, refreshed = make_open_window(catalogue, settings)
+    window = make_open_window(catalogue, settings)
 
     MainWindow.open_preview_for_target(window, catalogue.target(file_id, "Photos/gone.jpg"))
 
@@ -1024,7 +992,6 @@ def test_open_preview_for_a_vanished_file_explains_and_marks_the_status_missing(
     assert row["media_kind"] == "image"
     assert row["profile_id"] == settings.image.profile_id
     assert bytes(row["source_hash"]) == digest
-    assert refreshed == [True]
 
     # A recorded failure is kept as a failure and its reason is shown.
     failed_id = catalogue.add_file("Videos/broken.mov", digest_for("broken"))
@@ -1049,7 +1016,6 @@ def test_open_preview_for_a_vanished_file_explains_and_marks_the_status_missing(
     MainWindow.open_preview_for_target(window, catalogue.target(bare_id, "Photos/bare.png"))
     assert infos[-1][2].endswith(GENERIC_MISSING_REASON)
     assert catalogue.db.get_file_preview_status(bare_id) is None
-    assert refreshed == [True, True, True]
 
 
 def test_open_preview_refuses_a_corrupt_preview_file_and_explains(monkeypatch, catalogue, tmp_path):
@@ -1079,7 +1045,7 @@ def test_open_preview_refuses_a_corrupt_preview_file_and_explains(monkeypatch, c
     monkeypatch.setattr(
         "jvvv.app.open_in_file_manager", lambda *args, **kwargs: pytest.fail("must not open")
     )
-    window, refreshed = make_open_window(catalogue, settings)
+    window = make_open_window(catalogue, settings)
     target = catalogue.target(file_id, "Photos/corrupt.jpg")
 
     MainWindow.open_preview_for_target(window, target)
@@ -1096,7 +1062,6 @@ def test_open_preview_refuses_a_corrupt_preview_file_and_explains(monkeypatch, c
     # the next scan detects the corruption and regenerates it (spec §11).
     row = catalogue.db.get_file_preview_status(file_id)
     assert row["status"] == "available"
-    assert refreshed == [True, True]
 
     # Same for a video whose .mp4 is garbage, with or without a stored status.
     video_digest = digest_for("corrupt-clip")
@@ -1120,10 +1085,9 @@ def test_open_preview_ignores_non_media_targets_and_reports_launch_failures(
     monkeypatch.setattr(
         QMessageBox, "information", lambda *args, **kwargs: pytest.fail("no dialog for .txt")
     )
-    window, refreshed = make_open_window(catalogue, settings)
+    window = make_open_window(catalogue, settings)
 
     MainWindow.open_preview_for_target(window, catalogue.target(text_id, "Docs/notes.txt"))
-    assert refreshed == []
 
     digest = digest_for("alpha")
     image_id = catalogue.add_file("Photos/alpha.jpg", digest)
@@ -1139,26 +1103,6 @@ def test_open_preview_ignores_non_media_targets_and_reports_launch_failures(
     )
     MainWindow.open_preview_for_target(window, catalogue.target(image_id, "Photos/alpha.jpg"))
     assert warnings == [("Open Preview Failed", "No application is associated with this file.")]
-
-
-def test_open_selected_search_preview_opens_the_selected_file_only(catalogue):
-    opened = []
-    file_item = catalogue.search_item(5, "Photos/alpha.jpg")
-    folder_item = catalogue.search_item(6, "Photos", item_type="folder")
-    window = SimpleNamespace(
-        selected_search_item=lambda: file_item,
-        open_preview_for_target=lambda target: opened.append(target),
-    )
-    bind(window, "catalogue_ref_for_search_item")
-
-    MainWindow.open_selected_search_preview(window)
-    assert opened == [catalogue.target(5, "Photos/alpha.jpg")]
-
-    window.selected_search_item = lambda: folder_item
-    MainWindow.open_selected_search_preview(window)
-    window.selected_search_item = lambda: None
-    MainWindow.open_selected_search_preview(window)
-    assert len(opened) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1422,144 +1366,41 @@ def test_file_properties_add_offline_preview_rows_for_media_records(tmp_path):
     assert "Media details" not in text_rows
 
 
-# ---------------------------------------------------------------------------
-# Search tab preview button (spec §19)
-# ---------------------------------------------------------------------------
-def make_search_window(
-    catalogue: Catalogue,
-    settings: PreviewSettings,
-    item,
-    *,
-    with_preview_button: bool = True,
-) -> SimpleNamespace:
-    window = SimpleNamespace(
-        db=catalogue.db,
-        preview_settings=settings,
-        selected_search_item=lambda: item,
-        open_file_button=FakeButton("Open"),
-        reveal_file_button=FakeButton("Reveal"),
-    )
-    if with_preview_button:
-        window.open_preview_button = FakeButton("Open Preview")
-    bind(
-        window,
-        "catalogue_ref_for_search_item",
-        "catalogue_item_media_kind",
-        "preview_info_for_target",
-        "preview_unavailable_reason",
-    )
-    return window
-
-
-def test_search_selection_enables_play_preview_for_a_video_with_a_preview(catalogue, tmp_path):
+def test_search_uses_its_context_menu_for_preview_actions(main_window, catalogue, tmp_path, monkeypatch):
+    window = main_window
     settings = enabled_settings(tmp_path)
-    digest = digest_for("clip")
-    file_id = catalogue.add_file("Videos/clip.mp4", digest)
+    digest = digest_for("search-clip")
+    path = "Videos/clip.mp4"
+    file_id = catalogue.add_file(path, digest)
     write_video_preview(settings, digest)
-    window = make_search_window(catalogue, settings, catalogue.search_item(file_id, "Videos/clip.mp4"))
+    item = catalogue.search_item(file_id, path)
+    opened = []
 
-    MainWindow.on_search_selection_changed(window)
+    def use_menu(target, _owner, _point, *, include_catalogue_location):
+        menu = window.build_catalogue_item_context_menu(
+            target, include_catalogue_location=include_catalogue_location
+        )
+        actions = {action.text(): action for action in menu.actions()}
+        assert "View in Catalogue" in actions
+        for label in ("Play Preview", "Open Preview Location"):
+            assert actions[label].isEnabled()
+            actions[label].trigger()
 
-    button = window.open_preview_button
-    assert button.text() == "Play Preview"
-    assert button.isEnabled()
-    assert button.toolTip() == DEFAULT_PREVIEW_BUTTON_TOOLTIP
-    # Offline original (spec §19): Open/Reveal stay disabled while the preview works.
-    assert not window.open_file_button.isEnabled()
-    assert not window.reveal_file_button.isEnabled()
+    with monkeypatch.context() as patch:
+        patch.setattr(window, "db", catalogue.db)
+        patch.setattr(window, "preview_settings", settings)
+        patch.setattr(window, "show_catalogue_item_context_menu", use_menu)
+        patch.setattr(window, "open_preview_for_target", lambda target, reveal=False: opened.append((target, reveal)))
+        window._set_catalogue_open(True)
+        window.tabs.setCurrentWidget(window.search_tab)
+        window.search_model.set_items([item])
+        window.show()
+        QApplication.processEvents()
 
-
-def test_search_selection_disables_the_preview_button_with_a_reason_when_missing(
-    catalogue, tmp_path
-):
-    settings = enabled_settings(tmp_path)
-    file_id = catalogue.add_file("Photos/alpha.jpg", digest_for("alpha"))
-    window = make_search_window(catalogue, settings, catalogue.search_item(file_id, "Photos/alpha.jpg"))
-
-    MainWindow.on_search_selection_changed(window)
-
-    button = window.open_preview_button
-    assert button.text() == "Open Preview"
-    assert not button.isEnabled()
-    assert button.toolTip() == GENERIC_MISSING_REASON
-
-    unhashed_id = catalogue.add_file("Photos/unhashed.png", None)
-    window.selected_search_item = lambda: catalogue.search_item(unhashed_id, "Photos/unhashed.png")
-    MainWindow.on_search_selection_changed(window)
-    assert not button.isEnabled()
-    assert button.toolTip() == (
-        "No content hash is recorded for this file, so no preview path can be derived."
-    )
-
-
-def test_search_selection_disables_the_preview_button_for_a_corrupt_preview_file(
-    catalogue, tmp_path
-):
-    """Spec §46: the search tab's button treats an unreadable preview as unavailable."""
-
-    settings = enabled_settings(tmp_path)
-    digest = digest_for("corrupt-clip")
-    file_id = catalogue.add_file("Videos/corrupt.mp4", digest)
-    write_corrupt_preview(settings, "video", digest)
-    window = make_search_window(catalogue, settings, catalogue.search_item(file_id, "Videos/corrupt.mp4"))
-    window.open_preview_button.setEnabled(True)
-
-    MainWindow.on_search_selection_changed(window)
-
-    button = window.open_preview_button
-    assert button.text() == "Play Preview"
-    assert not button.isEnabled()
-    assert button.toolTip().startswith(INVALID_PREVIEW_REASON_PREFIX)
-    assert len(button.toolTip()) > len(INVALID_PREVIEW_REASON_PREFIX)
-
-    # Replacing the corrupt file with a valid preview makes the button live again.
-    write_video_preview(settings, digest)
-    MainWindow.on_search_selection_changed(window)
-    assert button.isEnabled()
-    assert button.toolTip() == DEFAULT_PREVIEW_BUTTON_TOOLTIP
-
-
-def test_search_selection_disables_the_preview_button_for_folders_and_other_files(
-    catalogue, tmp_path
-):
-    settings = enabled_settings(tmp_path)
-    text_id = catalogue.add_file("Docs/notes.txt", digest_for("notes"))
-    folder_item = catalogue.search_item(catalogue.root_id, "Docs", item_type="folder")
-    window = make_search_window(catalogue, settings, folder_item)
-
-    MainWindow.on_search_selection_changed(window)
-    button = window.open_preview_button
-    assert not button.isEnabled()
-    assert button.text() == "Open Preview"
-    assert button.toolTip() == DEFAULT_PREVIEW_BUTTON_TOOLTIP
-    assert window.open_file_button.isEnabled()  # folders open in the catalogue
-
-    window.selected_search_item = lambda: catalogue.search_item(text_id, "Docs/notes.txt")
-    MainWindow.on_search_selection_changed(window)
-    assert not button.isEnabled()
-    assert button.toolTip() == "Offline previews are available for images and videos only."
-
-    window.selected_search_item = lambda: None
-    button.setEnabled(True)
-    MainWindow.on_search_selection_changed(window)
-    assert not button.isEnabled()
-    assert button.toolTip() == DEFAULT_PREVIEW_BUTTON_TOOLTIP
-
-
-def test_search_selection_without_a_preview_button_still_updates_the_other_buttons(
-    catalogue, tmp_path
-):
-    folder_item = catalogue.search_item(catalogue.root_id, "Docs", item_type="folder")
-    window = make_search_window(
-        catalogue, enabled_settings(tmp_path), folder_item, with_preview_button=False
-    )
-    window.open_file_button.setEnabled(False)
-
-    MainWindow.on_search_selection_changed(window)
-
-    assert window.open_file_button.isEnabled()
-    assert not window.reveal_file_button.isEnabled()
-    assert not hasattr(window, "open_preview_button")
+        assert [button.text() for button in window.search_tab.findChildren(QPushButton)] == ["Search"]
+        index = window.search_model.index(0, 0)
+        window.search_table.customContextMenuRequested.emit(window.search_table.visualRect(index).center())
+        assert opened == [(catalogue.target(file_id, path), False), (catalogue.target(file_id, path), True)]
 
 
 # ---------------------------------------------------------------------------
@@ -2135,8 +1976,6 @@ def test_window_menu_offers_the_offline_preview_manager(main_window):
     assert isinstance(window.preview_settings, PreviewSettings)
     assert window.preview_cache_dialog is None
     assert window.last_preview_statistics is None
-    assert window.open_preview_button.text() == "Open Preview"
-    assert not window.open_preview_button.isEnabled()
 
 
 def test_help_explains_offline_previews_and_the_backup_policy(app):
@@ -2383,7 +2222,7 @@ def test_preview_property_actions_offer_open_and_reveal_only_for_a_usable_previe
     )
 
     actions = MainWindow.preview_property_actions(make_window(usable), video_record)
-    assert [label for label, _callback in actions] == ["Play Preview", "Reveal Preview"]
+    assert [label for label, _callback in actions] == ["Play Preview", "Open Preview Location"]
     actions[0][1]()
     actions[1][1]()
     assert calls == [("Videos/clip.mp4", False), ("Videos/clip.mp4", True)]
@@ -2394,7 +2233,7 @@ def test_preview_property_actions_offer_open_and_reveal_only_for_a_usable_previe
     )
     assert [label for label, _ in MainWindow.preview_property_actions(make_window(image_info), image_record)] == [
         "Open Preview",
-        "Reveal Preview",
+        "Open Preview Location",
     ]
 
     # Spec §46: a present-but-invalid preview is not offered; neither is a missing one.
@@ -2425,11 +2264,11 @@ def test_item_properties_dialog_adds_action_buttons_that_launch_callbacks(app):
         [("Name", "clip.mp4")],
         actions=[
             ("Play Preview", lambda: calls.append("play")),
-            ("Reveal Preview", lambda: calls.append("reveal")),
+            ("Open Preview Location", lambda: calls.append("reveal")),
         ],
     )
     try:
-        assert [button.text() for button in dialog.action_buttons] == ["Play Preview", "Reveal Preview"]
+        assert [button.text() for button in dialog.action_buttons] == ["Play Preview", "Open Preview Location"]
         dialog.action_buttons[0].click()
         dialog.action_buttons[1].click()
         assert calls == ["play", "reveal"]
@@ -2509,7 +2348,7 @@ def test_open_preview_without_a_configured_root_does_not_rewrite_the_status(monk
     monkeypatch.setattr(
         "jvvv.app.open_in_file_manager", lambda *args, **kwargs: pytest.fail("must not open")
     )
-    window, _refreshed = make_open_window(catalogue, settings)
+    window = make_open_window(catalogue, settings)
 
     MainWindow.open_preview_for_target(window, catalogue.target(file_id, "Photos/unrooted.jpg"))
 

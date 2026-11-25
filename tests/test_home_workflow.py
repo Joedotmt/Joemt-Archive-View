@@ -153,6 +153,9 @@ def test_home_commands_are_blocked_while_open_and_return_home_can_be_cancelled(w
     window.open_catalogue_path(tmp_path / "Other.jvvv")
     assert window.catalogue_path == path
     assert all(not action.isVisible() and not action.isEnabled() for action in window.home_actions)
+    assert window.home_button.text() == ""
+    assert not window.home_button.icon().isNull()
+    assert window.home_button.accessibleName() == "Return to Home"
     monkeypatch.setattr(window, "_confirm_snapshot_before_close", lambda: False)
     window.home_button.click()
     assert window.catalogue_path == path

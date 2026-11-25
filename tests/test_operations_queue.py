@@ -60,6 +60,8 @@ def test_queue_allows_shared_qnap_reads_and_keeps_destination_disks_exclusive():
     assert first.conflicts_with(OperationDisks((7, 2), (7, 7), True, False))
 
 def test_queue_manager_sorts_by_status_and_edits_the_right_clicked_row(monkeypatch):
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QMenu, QPushButton
 
     from jvvv import operations_ui
@@ -103,6 +105,14 @@ def test_queue_manager_sorts_by_status_and_edits_the_right_clicked_row(monkeypat
         pending.customContextMenuRequested.emit(pending.visualItemRect(pending.item(1, 0)).center())
         assert seen[-1] == {"Move Up", "Remove"}
         assert invoked[-1] == ("move", "ready", -1)
+        pending.scrollToBottom()
+        blank = QPoint(10, pending.viewport().height() - 5)
+        assert not pending.indexAt(blank).isValid()
+        QTest.mouseClick(pending.viewport(), Qt.MouseButton.LeftButton, pos=blank)
+        assert pending.currentRow() == -1
+        assert dialog.detail.text() == "No task selected."
+        dialog.refresh(jobs, active=True, preview_failure_job_id="warning")
+        assert pending.currentRow() == -1
 
         failed = dialog.tables["Failed"]
         choice = "Retry"

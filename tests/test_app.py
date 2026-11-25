@@ -81,11 +81,10 @@ def test_menus_group_actions_and_windows_for_the_current_context(monkeypatch):
 
         window._set_catalogue_open(True)
         assert visible_entries(window.file_menu) == [
-            "Add Volume…", "Archive Project…", "Queue Manager", "Open Catalogue Folder",
-            "Close Catalogue / Return Home", "Exit",
+            "Add Volume…", "Archive Project…", "Open Catalogue Folder", "Close Catalogue", "Exit",
         ]
         assert visible_entries(window.window_menu) == [
-            "App Settings", "Catalogue Settings", "Snapshot Manager", "Backup Evidence",
+            "App Settings", "Catalogue Settings", "Queue Manager", "Snapshot Manager", "Backup Evidence",
             "Preview Manager", "Catalogue Information", "Help",
         ]
         for action in window.home_actions:
@@ -421,7 +420,6 @@ def test_perform_search_delegates_database_work_to_worker():
         db=FakeDatabase(),
         search_edit=SimpleNamespace(text=lambda: " report "),
         search_model=SimpleNamespace(set_items=lambda items: None),
-        on_search_selection_changed=lambda: None,
         search_include_paths=False,
         search_request_id=0,
         search_thread=None,

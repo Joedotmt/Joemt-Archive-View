@@ -19,7 +19,6 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QByteArray,
     QDate,
-    QEvent,
     QEventLoop,
     QFileInfo,
     QItemSelectionModel,
@@ -74,18 +73,17 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStackedWidget,
     QTableView,
-    QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QTextBrowser,
     QToolButton,
-    QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .config import APP_NAME
+from .list_ui import ListTableView, ListTableWidget, ListTreeWidget
 from .archive_job import (
     VERIFY_PHASE,
     check_archive_write_locations, is_archive_volume_root, is_scanned_archive_volume,
@@ -579,10 +577,12 @@ class StandardTableModel(QAbstractTableModel):
         column: int,
         order: Qt.SortOrder = Qt.SortOrder.AscendingOrder,
     ) -> None:  # type: ignore[override]
+        if not 0 <= column < len(self.columns):
+            return
         self.sort_column = column
         self.sort_order = order
         self.layoutAboutToBeChanged.emit()
-        self._sort_items()
+        self._sort_items(preserve_indexes=True)
         self.layoutChanged.emit()
 
     def role_value(self, item: Any, role: int) -> Any:
@@ -591,22 +591,33 @@ class StandardTableModel(QAbstractTableModel):
     def group_key(self, item: Any) -> Any:
         return 0
 
-    def _sort_items(self) -> None:
+    def _sort_items(self, *, preserve_indexes: bool = False) -> None:
+        indexes = self.persistentIndexList() if preserve_indexes else []
         reverse = self.sort_order == Qt.SortOrder.DescendingOrder
         column = self.columns[self.sort_column]
         sort_key = column.sort_key or column.display
-        sorted_items: list[Any] = []
-        group_keys = sorted({self.group_key(item) for item in self.items})
-        for group_key in group_keys:
-            group_items = [item for item in self.items if self.group_key(item) == group_key]
-            sorted_items.extend(
-                sorted(
-                    group_items,
-                    key=lambda item: self._normalized_sort_value(sort_key(item)),
-                    reverse=reverse,
-                )
+        groups: dict[Any, list[int]] = {}
+        for row, item in enumerate(self.items):
+            groups.setdefault(self.group_key(item), []).append(row)
+        row_order: list[int] = []
+        for group in sorted(groups):
+            rows = groups[group]
+            rows.sort(
+                key=lambda row: self._normalized_sort_value(sort_key(self.items[row])),
+                reverse=reverse,
             )
-        self.items = sorted_items
+            row_order.extend(rows)
+        self.items = [self.items[row] for row in row_order]
+        if indexes:
+            old_rows = {index.row() for index in indexes}
+            new_rows = {
+                old_row: new_row for new_row, old_row in enumerate(row_order)
+                if old_row in old_rows
+            }
+            self.changePersistentIndexList(
+                indexes,
+                [self.index(new_rows[index.row()], index.column()) for index in indexes],
+            )
 
     def _normalized_sort_value(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -1827,6 +1838,26 @@ class CatalogueIconProvider:
         return icon
 
 
+def home_icon(palette: QPalette) -> QIcon:
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.scale(4, 4)
+    pen = QPen(palette.color(QPalette.ColorRole.ButtonText))
+    pen.setWidthF(1.4)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.drawPolyline(QPolygon([QPoint(1, 7), QPoint(8, 1), QPoint(15, 7)]))
+    painter.drawPolyline(QPolygon([
+        QPoint(3, 6), QPoint(3, 14), QPoint(6, 14), QPoint(6, 10),
+        QPoint(10, 10), QPoint(10, 14), QPoint(13, 14), QPoint(13, 6),
+    ]))
+    painter.end()
+    return QIcon(pixmap)
+
+
 class BackupStatusIconProvider:
     COLORS = {
         "verified": "#1fa9b8",
@@ -1992,6 +2023,37 @@ class SearchResultItem(_FolderTypedItem):
     connected: bool
     backup: BackupDisplay = NOT_ANALYSED_BACKUP_DISPLAY
 
+
+INDEXED_SIZE_COLUMN = TableColumn(
+    "Size",
+    lambda item: display_indexed_size(item.size_bytes),
+    sort_key=lambda item: size_sort_key(item.size_bytes),
+    alignment=Qt.AlignmentFlag.AlignRight,
+)
+MODIFIED_COLUMN = TableColumn(
+    "Modified",
+    lambda item: display_db_time(item.modified_at),
+    sort_key=lambda item: item.modified_at or "",
+)
+RELATIVE_PATH_COLUMN = TableColumn(
+    "Relative Path", lambda item: relative_path_for_display(item.relative_path),
+)
+
+
+def other_copies_column(icons: BackupStatusIconProvider) -> TableColumn:
+    def is_parent_entry(item: BrowserItem | SearchResultItem) -> bool:
+        return getattr(item, "is_parent_entry", False)
+
+    return TableColumn(
+        "Other copies",
+        lambda item: "N/A" if is_parent_entry(item) else item.backup.text,
+        sort_key=lambda item: (item.backup.sort_rank, item.backup.coverage_fraction),
+        decoration=lambda item: None if is_parent_entry(item) else icons.icon_for(item.backup),
+        tooltip=lambda item: None if is_parent_entry(item) else item.backup.tooltip,
+        header_tooltip=BACKUP_COLUMN_HEADER_TOOLTIP,
+    )
+
+
 class BrowserTableModel(StandardTableModel):
     def __init__(
         self,
@@ -2004,28 +2066,11 @@ class BrowserTableModel(StandardTableModel):
         super().__init__(
             [
                 TableColumn("Name", lambda item: item.name, decoration=self.icons.icon_for),
-                TableColumn(
-                    "Other copies",
-                    lambda item: "N/A" if item.is_parent_entry else item.backup.text,
-                    sort_key=lambda item: (
-                        item.backup.sort_rank,
-                        item.backup.coverage_fraction,
-                    ),
-                    decoration=lambda item: None
-                    if item.is_parent_entry
-                    else self.backup_icons.icon_for(item.backup),
-                    tooltip=lambda item: None if item.is_parent_entry else item.backup.tooltip,
-                    header_tooltip=BACKUP_COLUMN_HEADER_TOOLTIP,
-                ),
+                other_copies_column(self.backup_icons),
                 TableColumn("Type", lambda item: item.type_label),
-                TableColumn(
-                    "Size",
-                    lambda item: display_indexed_size(item.size_bytes),
-                    sort_key=lambda item: size_sort_key(item.size_bytes),
-                    alignment=Qt.AlignmentFlag.AlignRight,
-                ),
-                TableColumn("Modified", lambda item: display_db_time(item.modified_at), sort_key=lambda item: item.modified_at or ""),
-                TableColumn("Relative Path", lambda item: relative_path_for_display(item.relative_path)),
+                INDEXED_SIZE_COLUMN,
+                MODIFIED_COLUMN,
+                RELATIVE_PATH_COLUMN,
                 TableColumn("Status", lambda item: "Missing" if item.missing else "Indexed"),
             ],
             parent,
@@ -2144,16 +2189,6 @@ class VolumeTableModel(StandardTableModel):
         return None
 
 
-class VolumeTableView(QTableView):
-    """A table that can scroll half a viewport beyond its final row."""
-
-    def updateGeometries(self) -> None:  # type: ignore[override]
-        super().updateGeometries()
-        scroll_bar = self.verticalScrollBar()
-        trailing_space = max(0, self.viewport().height() // 2)
-        scroll_bar.setMaximum(scroll_bar.maximum() + trailing_space)
-
-
 class SearchResultsTableModel(StandardTableModel):
     def __init__(
         self,
@@ -2166,17 +2201,7 @@ class SearchResultsTableModel(StandardTableModel):
         super().__init__(
             [
                 TableColumn("Name", lambda item: item.name, decoration=self.icon_for),
-                TableColumn(
-                    "Other copies",
-                    lambda item: item.backup.text,
-                    sort_key=lambda item: (
-                        item.backup.sort_rank,
-                        item.backup.coverage_fraction,
-                    ),
-                    decoration=lambda item: self.backup_icons.icon_for(item.backup),
-                    tooltip=lambda item: item.backup.tooltip,
-                    header_tooltip=BACKUP_COLUMN_HEADER_TOOLTIP,
-                ),
+                other_copies_column(self.backup_icons),
                 TableColumn("Kind", lambda item: item.item_type.title()),
                 TableColumn("Volume", lambda item: display_volume_name(item.volume_name)),
                 TableColumn(
@@ -2184,14 +2209,9 @@ class SearchResultsTableModel(StandardTableModel):
                     lambda item: item.drive_id or "-",
                     sort_key=lambda item: drive_id_sort_key(item.drive_id),
                 ),
-                TableColumn("Relative Path", lambda item: relative_path_for_display(item.relative_path)),
-                TableColumn(
-                    "Size",
-                    lambda item: display_indexed_size(item.size_bytes),
-                    sort_key=lambda item: size_sort_key(item.size_bytes),
-                    alignment=Qt.AlignmentFlag.AlignRight,
-                ),
-                TableColumn("Modified", lambda item: display_db_time(item.modified_at), sort_key=lambda item: item.modified_at or ""),
+                RELATIVE_PATH_COLUMN,
+                INDEXED_SIZE_COLUMN,
+                MODIFIED_COLUMN,
                 connection_status_column("Volume Status", self.backup_icons),
             ],
             parent,
@@ -3150,8 +3170,7 @@ class ItemPropertiesDialog(QDialog):
         self.details_edit.setPlainText(self.copy_text)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        # Extra actions (spec §20: [Open Preview] / [Play Preview] / [Reveal
-        # Preview]) launch external applications only; nothing is shown inline.
+        # Preview actions launch external applications.
         for label, callback in actions or ():
             action_button = buttons.addButton(label, QDialogButtonBox.ButtonRole.ActionRole)
             action_button.clicked.connect(
@@ -3169,6 +3188,25 @@ class ItemPropertiesDialog(QDialog):
 
     def copy_all(self) -> None:
         QApplication.clipboard().setText(self.copy_text)
+
+
+class _ReportTableItem(QTableWidgetItem):
+    def __init__(self, text: str, sort_key: int | float | None) -> None:
+        super().__init__(text)
+        self.sort_key = sort_key
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if isinstance(other, _ReportTableItem):
+            return (self.sort_key is not None, self.sort_key) < (
+                other.sort_key is not None, other.sort_key,
+            )
+        return super().__lt__(other)
+
+
+def _coverage_report_item(text: str) -> _ReportTableItem:
+    if text == "<0.1%":
+        return _ReportTableItem(text, 0.05)
+    return _ReportTableItem(text, float(text[:-1]) if text.endswith("%") else None)
 
 
 class BackupEvidenceDialog(QDialog):
@@ -3375,16 +3413,8 @@ class BackupEvidenceDialog(QDialog):
         layout.addWidget(self.progress)
         layout.addWidget(buttons)
 
-    def _report_table(self, headers: list[str]) -> QTableWidget:
-        table = QTableWidget(0, len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        table.setAlternatingRowColors(True)
-        table.setShowGrid(False)
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
+    def _report_table(self, headers: list[str]) -> ListTableWidget:
+        table = ListTableWidget(headers)
         table.setSortingEnabled(True)
         return table
 
@@ -3476,13 +3506,20 @@ class BackupEvidenceDialog(QDialog):
         self._populate_mirrors(mirrors, volume_references, stale)
         self._populate_scans(scans, volume_references)
 
-    def _set_table_rows(self, table: QTableWidget, rows: list[list[str]]) -> None:
+    def _set_table_rows(
+        self, table: ListTableWidget, rows: list[list[str | int | _ReportTableItem]],
+    ) -> None:
         table.setSortingEnabled(False)
         table.setRowCount(len(rows))
         for row_index, values in enumerate(rows):
             for column_index, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setToolTip(value)
+                if isinstance(value, int):
+                    item = _ReportTableItem(f"{value:,}", value)
+                elif isinstance(value, str):
+                    item = QTableWidgetItem(value)
+                else:
+                    item = value
+                item.setToolTip(item.text())
                 table.setItem(row_index, column_index, item)
         table.resizeColumnsToContents()
         table.setSortingEnabled(True)
@@ -3565,13 +3602,13 @@ class BackupEvidenceDialog(QDialog):
             rows.append(
                 [
                     volume_references.get(volume_id, f"Volume {volume_id}"),
-                    f"{total_files:,}",
-                    f"{strong_files:,}",
-                    f"{possible_files:,}",
-                    f"{ambiguous_files:,}",
-                    f"{excluded_files:,}",
-                    file_text,
-                    byte_text,
+                    total_files,
+                    strong_files,
+                    possible_files,
+                    ambiguous_files,
+                    excluded_files,
+                    _coverage_report_item(file_text),
+                    _coverage_report_item(byte_text),
                     status_text,
                 ]
             )
@@ -3605,8 +3642,8 @@ class BackupEvidenceDialog(QDialog):
                 [
                     volume_references.get(first_id, f"Volume {first_id}"),
                     volume_references.get(second_id, f"Volume {second_id}"),
-                    coverage_percent_text(None, None, a_on_b) or "N/A",
-                    coverage_percent_text(None, None, b_on_a) or "N/A",
+                    _coverage_report_item(coverage_percent_text(None, None, a_on_b) or "N/A"),
+                    _coverage_report_item(coverage_percent_text(None, None, b_on_a) or "N/A"),
                     "Outdated · re-run analysis"
                     if analysis_stale
                     else ("Full match (layout & sizes)" if complete else "Partial overlap"),
@@ -3711,10 +3748,10 @@ class BackupEvidenceDialog(QDialog):
                     display_db_time(str(attempted_at)) if attempted_at else "Never",
                     outcome,
                     display_db_time(str(applied_at)) if applied_at else "Never",
-                    f"{files:,}",
-                    f"{folders:,}",
-                    f"{access_errors:,}",
-                    f"{hash_errors:,}",
+                    files,
+                    folders,
+                    access_errors,
+                    hash_errors,
                     meaning,
                 ]
             )
@@ -3738,27 +3775,17 @@ class SnapshotPickerDialog(QDialog):
 
         location = QLabel(f"Repository: {repository.path}")
         location.setWordWrap(True)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Taken", "Label", "Volumes", "Files"])
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table = ListTableWidget(["Taken", "Label", "Volumes", "Files"])
         for manifest in reversed(manifests):
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            for column, text in enumerate(
+            self.table.append_text_row(
                 (
                     display_db_time(manifest.created_at),
                     manifest.label,
                     str(manifest.volume_count),
                     f"{manifest.file_count:,}",
-                )
-            ):
-                item = QTableWidgetItem(text)
-                item.setData(Qt.ItemDataRole.UserRole, manifest.snapshot_id)
-                self.table.setItem(row, column, item)
+                ),
+                user_data=manifest.snapshot_id,
+            )
         self.table.resizeColumnsToContents()
         if self.table.rowCount():
             self.table.selectRow(0)
@@ -3767,7 +3794,12 @@ class SnapshotPickerDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Choose New Catalogue Location…")
+        choose_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        choose_button.setText("Choose New Catalogue Location…")
+        choose_button.setEnabled(self.current_manifest() is not None)
+        self.table.itemSelectionChanged.connect(
+            lambda: choose_button.setEnabled(self.current_manifest() is not None)
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -3841,13 +3873,7 @@ class RelinkRepositoryDialog(QDialog):
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Location", "Match", "Snapshots", "Latest snapshot"])
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table = ListTableWidget(["Location", "Match", "Snapshots", "Latest snapshot"])
         self.table.itemSelectionChanged.connect(self.update_buttons)
         self.table.doubleClicked.connect(lambda _index: self.accept())
         self.found_label = QLabel("")
@@ -3889,14 +3915,10 @@ class RelinkRepositoryDialog(QDialog):
                     self.table.selectRow(existing_row)
                 return
         self.candidates.append(candidate)
-        row = self.table.rowCount()
-        self.table.insertRow(row)
+        row = len(self.candidates) - 1
         latest = candidate.latest_snapshot_id.split("-")[0] if candidate.latest_snapshot_id else "—"
         values = (str(candidate.path), candidate.match_label, str(candidate.snapshot_count), latest)
-        for column, text in enumerate(values):
-            item = QTableWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, row)
-            self.table.setItem(row, column, item)
+        self.table.append_text_row(values, user_data=row)
         self.table.resizeColumnsToContents()
         if select:
             self.table.selectRow(row)
@@ -4006,26 +4028,15 @@ class SnapshotHistoryDialog(QDialog):
         repository_layout.addWidget(self.location_label)
         repository_layout.addWidget(self.stats_label)
 
-        self.snapshot_table = QTableWidget(0, 5)
-        self.snapshot_table.setHorizontalHeaderLabels(
+        self.snapshot_table = ListTableWidget(
             ["Taken", "Label", "Volumes", "Files", "Changed since previous"]
         )
-        self.snapshot_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.snapshot_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.snapshot_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.snapshot_table.verticalHeader().setVisible(False)
-        self.snapshot_table.horizontalHeader().setStretchLastSection(True)
         self.snapshot_table.itemSelectionChanged.connect(self.populate_selected)
 
-        self.volume_table = QTableWidget(0, 5)
-        self.volume_table.setHorizontalHeaderLabels(
-            ["Drive ID", "Name", "Files", "Folders", "Change in this snapshot"]
+        self.volume_table = ListTableWidget(
+            ["Drive ID", "Name", "Files", "Folders", "Change in this snapshot"],
+            selection_mode=QAbstractItemView.SelectionMode.NoSelection,
         )
-        self.volume_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.volume_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.volume_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.volume_table.verticalHeader().setVisible(False)
-        self.volume_table.horizontalHeader().setStretchLastSection(True)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.snapshots_group = QGroupBox("Snapshots")
@@ -4172,8 +4183,6 @@ class SnapshotHistoryDialog(QDialog):
                 if delta.preview_settings_changed:
                     parts.append("preview settings")
                 change_text = ", ".join(parts)
-            row = self.snapshot_table.rowCount()
-            self.snapshot_table.insertRow(row)
             values = (
                 display_db_time(manifest.created_at),
                 manifest.label,
@@ -4181,10 +4190,7 @@ class SnapshotHistoryDialog(QDialog):
                 f"{manifest.file_count:,}",
                 change_text,
             )
-            for column, text in enumerate(values):
-                item = QTableWidgetItem(text)
-                item.setData(Qt.ItemDataRole.UserRole, manifest.snapshot_id)
-                self.snapshot_table.setItem(row, column, item)
+            self.snapshot_table.append_text_row(values, user_data=manifest.snapshot_id)
         self.snapshot_table.resizeColumnsToContents()
         if self.snapshot_table.rowCount():
             selected_row = next((
@@ -4234,8 +4240,6 @@ class SnapshotHistoryDialog(QDialog):
                 key=lambda record: drive_id_sort_key(record.drive_id or None) + (record.name.casefold(),),
             )
             for record in records:
-                row = self.volume_table.rowCount()
-                self.volume_table.insertRow(row)
                 values = (
                     record.drive_id,
                     record.name,
@@ -4243,9 +4247,7 @@ class SnapshotHistoryDialog(QDialog):
                     f"{record.counts.folders:,}",
                     changed.get(record.uuid, ""),
                 )
-                for column, text in enumerate(values):
-                    item = QTableWidgetItem(text)
-                    self.volume_table.setItem(row, column, item)
+                self.volume_table.append_text_row(values)
             self.volume_table.resizeColumnsToContents()
         self.update_buttons()
 
@@ -4645,7 +4647,7 @@ class HelpDialog(QDialog):
             ("1. Create a catalogue",
              "Start on <b>Home</b>: open a recent catalogue, choose <b>Open Catalogue</b>, "
              "or choose <b>Create Empty Catalogue</b> and pick a name. "
-             "Use <b>Close Catalogue / Return Home</b> to return Home before opening another. "
+             "Use the Home button or <b>File → Close Catalogue</b> before opening another. "
              "The <b>Window</b> menu opens settings, managers, catalogue information, and Help. "
              "App Settings and Help are always available; catalogue windows appear while a catalogue is open. "
              "A catalogue is a "
@@ -4713,7 +4715,7 @@ class HelpDialog(QDialog):
             a {{ text-decoration: none; }}
         </style>
         <h1>Quick start</h1>
-        <p><b>Home → Open or Create Catalogue → Browse or Search → Close Catalogue / Return Home</b></p>
+        <p><b>Home → Open or Create Catalogue → Browse or Search → Close Catalogue</b></p>
         {section_html}
         <hr>
         <p><b>About</b><br>{APP_NAME} is GPLv3 open-source software by Joemt.<br>
@@ -5676,17 +5678,6 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._set_catalogue_open(False)
 
-    def eventFilter(self, source: QObject, event: QEvent) -> bool:  # type: ignore[override]
-        if (
-            source is self.volume_table.viewport()
-            and event.type() == QEvent.Type.MouseButtonPress
-            and event.button() == Qt.MouseButton.LeftButton
-        ):
-            point = event.position().toPoint() if hasattr(event, "position") else event.pos()
-            if not self.volume_table.indexAt(point).isValid():
-                self.clear_volume_selection()
-        return super().eventFilter(source, event)
-
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.save_all_table_header_states()
         if self._catalogue_open_in_progress() and self.db is None:
@@ -5734,16 +5725,13 @@ class MainWindow(QMainWindow):
         self.archive_project_action = QAction("Archive Project\u2026", self)
         self.archive_project_action.triggered.connect(lambda: self.archive_project())
         self.file_menu.addAction(self.archive_project_action)
-        self.operations_queue_action = QAction("Queue Manager", self)
-        self.operations_queue_action.triggered.connect(self.show_operations_queue)
-        self.file_menu.addAction(self.operations_queue_action)
         self.workspace_file_separator = self.file_menu.addSeparator()
 
         self.open_catalogue_location_action = QAction("Open Catalogue Folder", self)
         self.open_catalogue_location_action.triggered.connect(self.open_catalogue_location)
         self.file_menu.addAction(self.open_catalogue_location_action)
 
-        self.close_catalogue_action = QAction("Close Catalogue / Return Home", self)
+        self.close_catalogue_action = QAction("Close Catalogue", self)
         self.close_catalogue_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Close))
         self.close_catalogue_action.triggered.connect(lambda: self.close_catalogue())
         self.file_menu.addAction(self.close_catalogue_action)
@@ -5777,6 +5765,10 @@ class MainWindow(QMainWindow):
         self.catalogue_settings_action.triggered.connect(self.show_catalogue_settings)
         self.window_menu.addAction(self.catalogue_settings_action)
         self.window_settings_separator = self.window_menu.addSeparator()
+
+        self.operations_queue_action = QAction("Queue Manager", self)
+        self.operations_queue_action.triggered.connect(self.show_operations_queue)
+        self.window_menu.addAction(self.operations_queue_action)
 
         self.snapshot_history_action = QAction("Snapshot Manager", self)
         self.snapshot_history_action.setToolTip(
@@ -5875,12 +5867,12 @@ class MainWindow(QMainWindow):
             self.folder_tree.setIndentation(self.scaled_ui_value(16))
         if hasattr(self, "browser_backup_filter_combo"):
             self.browser_backup_filter_combo.setMaximumWidth(self.scaled_ui_value(280))
-        if hasattr(self, "up_button"):
+        for button in (getattr(self, "home_button", None), getattr(self, "up_button", None)):
+            if button is None:
+                continue
             navigation_size = self.scaled_ui_value(26)
-            self.up_button.setFixedSize(navigation_size, navigation_size)
-            self.up_button.setIconSize(
-                QSize(self.scaled_ui_value(16), self.scaled_ui_value(16))
-            )
+            button.setFixedSize(navigation_size, navigation_size)
+            button.setIconSize(QSize(self.scaled_ui_value(16), self.scaled_ui_value(16)))
 
         if hasattr(self, "scan_progress"):
             configure_progress_bar(self.scan_progress, self.ui_zoom)
@@ -5945,8 +5937,14 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.catalogue_page)
         self.catalogue_header = QWidget()
         header_layout = QHBoxLayout(self.catalogue_header)
-        self.home_button = QPushButton("Close Catalogue / Return Home")
+        self.home_button = QToolButton()
+        self.home_button.setObjectName("navigationButton")
+        self.home_button.setIcon(home_icon(QApplication.palette()))
+        self.home_button.setAccessibleName("Return to Home")
         self.home_button.setToolTip("Close this catalogue and return to Home")
+        navigation_size = self.scaled_ui_value(26)
+        self.home_button.setFixedSize(navigation_size, navigation_size)
+        self.home_button.setIconSize(QSize(self.scaled_ui_value(16), self.scaled_ui_value(16)))
         self.home_button.clicked.connect(self.close_catalogue_action.trigger)
         self.catalogue_name_label = QLabel()
         name_font = self.catalogue_name_label.font()
@@ -6023,13 +6021,7 @@ class MainWindow(QMainWindow):
         recent_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         recent_layout = QVBoxLayout(recent_group)
         recent_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.recent_catalogue_table = QTableWidget(0, 2)
-        self.recent_catalogue_table.setHorizontalHeaderLabels(["Catalogue", "Location"])
-        self.recent_catalogue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.recent_catalogue_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.recent_catalogue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.recent_catalogue_table.verticalHeader().setVisible(False)
-        self.recent_catalogue_table.horizontalHeader().setStretchLastSection(True)
+        self.recent_catalogue_table = ListTableWidget(["Catalogue", "Location"])
         self.recent_catalogue_table.setColumnWidth(0, 220)
         self.recent_catalogue_table.doubleClicked.connect(lambda _index: self.open_recent_catalogue())
         self.recent_catalogue_table.itemSelectionChanged.connect(self.update_recent_catalogue_buttons)
@@ -6105,13 +6097,7 @@ class MainWindow(QMainWindow):
         paths = load_recent_catalogue_paths(self.settings)
         self.recent_catalogue_table.setRowCount(0)
         for path in paths:
-            row = self.recent_catalogue_table.rowCount()
-            self.recent_catalogue_table.insertRow(row)
-            for column, text in enumerate((Path(path).name, path)):
-                item = QTableWidgetItem(text)
-                item.setData(Qt.ItemDataRole.UserRole, path)
-                item.setToolTip(path)
-                self.recent_catalogue_table.setItem(row, column, item)
+            self.recent_catalogue_table.append_text_row((Path(path).name, path), user_data=path, tooltip=path)
         self.recent_empty_label.setVisible(not paths)
         self.recent_catalogue_table.setVisible(bool(paths))
         self.recent_open_button.setVisible(bool(paths))
@@ -6178,11 +6164,10 @@ class MainWindow(QMainWindow):
         self.refresh_recent_catalogues()
 
     def _build_catalogue_workspace(self) -> QWidget:
-        self.volume_table = VolumeTableView()
+        self.volume_table = ListTableView()
         self.volume_table.setObjectName("volumeTable")
         self.volume_table.setModel(self.volume_model)
         self.configure_table_view(self.volume_table)
-        self.volume_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.volume_table.setItemDelegateForColumn(
             VOLUME_CONNECTION_COLUMN,
             self.volume_connection_delegate,
@@ -6190,7 +6175,6 @@ class MainWindow(QMainWindow):
         self.volume_table.setItemDelegateForColumn(VOLUME_FULL_COLUMN, self.volume_full_delegate)
         self.volume_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.volume_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.volume_table.viewport().installEventFilter(self)
         QTimer.singleShot(
             0,
             lambda: self.apply_table_default_columns(
@@ -6364,9 +6348,8 @@ class MainWindow(QMainWindow):
         self.offline_label = QLabel("")
         self.offline_label.setObjectName("offlineNotice")
         self.offline_label.setVisible(False)
-        self.folder_tree = QTreeWidget()
+        self.folder_tree = ListTreeWidget()
         self.folder_tree.setObjectName("folderTree")
-        self.folder_tree.setHeaderHidden(True)
         self.folder_tree.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
         self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.folder_tree.setUniformRowHeights(True)
@@ -6442,7 +6425,7 @@ class MainWindow(QMainWindow):
         backup_filter_row.addWidget(self.browser_backup_filter_combo)
         backup_filter_row.addStretch(1)
 
-        self.file_table = QTableView()
+        self.file_table = ListTableView()
         self.file_table.setObjectName("fileTable")
         self.file_table.setModel(self.browser_model)
         self.configure_table_view(self.file_table)
@@ -6488,17 +6471,7 @@ class MainWindow(QMainWindow):
 
     def configure_table_view(self, table: QTableView) -> None:
         table.setSortingEnabled(True)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setAlternatingRowColors(True)
-        table.setShowGrid(False)
-        self.configure_table_palette(table)
         table.setIconSize(QSize(self.scaled_ui_value(18), self.scaled_ui_value(18)))
-        table.setWordWrap(False)
-        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        table.setTextElideMode(Qt.TextElideMode.ElideRight)
-        table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(self.scaled_ui_value(24))
 
         header = table.horizontalHeader()
@@ -6507,13 +6480,6 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(False)
         header.setSortIndicatorShown(True)
-
-    def configure_table_palette(self, table: QTableView) -> None:
-        palette = QPalette(QApplication.palette())
-        base_color = palette.color(QPalette.ColorRole.Base)
-        alternate_color = base_color.lighter(112) if base_color.lightness() < 128 else base_color.darker(104)
-        palette.setColor(QPalette.ColorRole.AlternateBase, alternate_color)
-        table.setPalette(palette)
 
     def apply_table_default_columns(
         self,
@@ -6610,15 +6576,6 @@ class MainWindow(QMainWindow):
         self.search_edit.setPlaceholderText(self.search_placeholder_text())
         self.search_button = QPushButton("Search")
         self.search_button.setObjectName("searchButton")
-        self.open_file_button = QPushButton("Open")
-        self.reveal_file_button = QPushButton("Reveal")
-        self.open_preview_button = QPushButton("Open Preview")
-        self.open_file_button.setEnabled(False)
-        self.reveal_file_button.setEnabled(False)
-        self.open_preview_button.setEnabled(False)
-        self.open_preview_button.setToolTip(
-            "Open the preview in the operating system's default application"
-        )
         self.search_backup_filter_combo = QComboBox()
         self.search_backup_filter_combo.setObjectName("searchBackupFilter")
         for label, key in BACKUP_FILTER_OPTIONS:
@@ -6635,11 +6592,8 @@ class MainWindow(QMainWindow):
         search_row.addWidget(QLabel("Other-copy status"))
         search_row.addWidget(self.search_backup_filter_combo)
         search_row.addWidget(self.search_button)
-        search_row.addWidget(self.open_file_button)
-        search_row.addWidget(self.open_preview_button)
-        search_row.addWidget(self.reveal_file_button)
 
-        self.search_table = QTableView()
+        self.search_table = ListTableView()
         self.search_table.setObjectName("searchTable")
         self.search_table.setModel(self.search_model)
         self.configure_table_view(self.search_table)
@@ -6725,12 +6679,8 @@ class MainWindow(QMainWindow):
         self.search_backup_filter_combo.currentIndexChanged.connect(
             lambda _index: self.perform_search()
         )
-        self.search_table.selectionModel().selectionChanged.connect(self.on_search_selection_changed)
         self.search_table.doubleClicked.connect(self.open_search_index)
         self.search_table.customContextMenuRequested.connect(self.show_search_context_menu)
-        self.open_file_button.clicked.connect(self.open_selected_search_item)
-        self.open_preview_button.clicked.connect(self.open_selected_search_preview)
-        self.reveal_file_button.clicked.connect(lambda: self.open_selected_real_item(reveal=True))
 
         self.refresh_action = QAction("Refresh", self)
         self.refresh_action.setShortcut("F5")
@@ -6797,10 +6747,8 @@ class MainWindow(QMainWindow):
                 color_mode,
                 accent_color,
             )
-        for table_name in ("volume_table", "file_table", "search_table"):
-            table = getattr(self, table_name, None)
-            if table is not None:
-                MainWindow.configure_table_palette(self, table)
+            if hasattr(self, "home_button"):
+                self.home_button.setIcon(home_icon(application.palette()))
 
     def show_preferences(self) -> None:
         original_appearance = (
@@ -6928,9 +6876,6 @@ class MainWindow(QMainWindow):
         dialog = getattr(self, "preview_cache_dialog", None)
         if dialog is not None:
             dialog.set_settings(applied)
-        refresh_search = getattr(self, "on_search_selection_changed", None)
-        if callable(refresh_search):
-            refresh_search()
         self.statusBar().showMessage("Preview settings saved in this catalogue.", 4000)
         return True
 
@@ -7023,7 +6968,6 @@ class MainWindow(QMainWindow):
                 "Preview Not Available",
                 f"The preview is not available.\n\n{reason}",
             )
-            self.on_search_selection_changed()
             return
         try:
             # External applications only (spec §19, §44, §45): the operating
@@ -7062,12 +7006,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"The preview status could not be updated in the catalogue: {exc}", 10000
             )
-
-    def open_selected_search_preview(self) -> None:
-        item = self.selected_search_item()
-        if item is None or item.is_folder:
-            return
-        self.open_preview_for_target(self.catalogue_ref_for_search_item(item))
 
     def open_catalogue_location(self) -> None:
         if self.catalogue_path is None:
@@ -8496,8 +8434,6 @@ class MainWindow(QMainWindow):
         self.refresh_volumes(reload_browser=False)
         if self.search_edit.text().strip():
             self.perform_search()
-        else:
-            self.on_search_selection_changed()
         self.statusBar().showMessage("Connected volumes updated.", 3000)
 
     def _stop_repository_for_close(self) -> bool:
@@ -8762,7 +8698,6 @@ class MainWindow(QMainWindow):
         self.scan_log.clear()
         self.show_volume_details(None)
         self.clear_browser()
-        self.on_search_selection_changed()
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(0)
         self.scan_progress.setFormat("Idle")
@@ -10436,7 +10371,7 @@ class MainWindow(QMainWindow):
             preview_action.triggered.connect(
                 lambda checked=False, target=target: self.open_preview_for_target(target)
             )
-            reveal_preview_action = menu.addAction("Reveal Preview")
+            reveal_preview_action = menu.addAction("Open Preview Location")
             reveal_preview_action.setEnabled(available)
             if reason:
                 reveal_preview_action.setToolTip(reason)
@@ -10574,7 +10509,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def preview_property_actions(self, record) -> list[tuple[str, Callable[[], None]]]:
-        """[Open/Play Preview] and [Reveal Preview] for a file whose preview is usable."""
+        """Preview actions for a file whose preview is usable."""
 
         if record["item_type"] != "file":
             return []
@@ -10596,7 +10531,7 @@ class MainWindow(QMainWindow):
                 lambda target=target: self.open_preview_for_target(target),
             ),
             (
-                "Reveal Preview",
+                "Open Preview Location",
                 lambda target=target: self.open_preview_for_target(target, reveal=True),
             ),
         ]
@@ -11046,7 +10981,6 @@ class MainWindow(QMainWindow):
             ):
                 self.search_worker.cancel()
             self.search_model.set_items([])
-            self.on_search_selection_changed()
             self.statusBar().clearMessage()
             return
         query = self.search_edit.text().strip()
@@ -11059,7 +10993,6 @@ class MainWindow(QMainWindow):
             ):
                 self.search_worker.cancel()
             self.search_model.set_items([])
-            self.on_search_selection_changed()
             self.statusBar().clearMessage()
             return
 
@@ -11070,7 +11003,6 @@ class MainWindow(QMainWindow):
             self.search_include_paths,
         )
         self.search_model.set_items([])
-        self.on_search_selection_changed()
         if self.search_thread is not None:
             self.pending_search_request = request
             if self.search_thread.isRunning() and self.search_worker is not None:
@@ -11132,7 +11064,6 @@ class MainWindow(QMainWindow):
             self.search_model.sort_order,
         )
         self.set_search_empty_state(result_count == 0)
-        self.on_search_selection_changed()
         self.statusBar().showMessage(f"{result_count} search results.", 4000)
 
     @Slot(int)
@@ -11146,7 +11077,6 @@ class MainWindow(QMainWindow):
             return
         self.search_model.set_items([])
         self.set_search_empty_state(False)
-        self.on_search_selection_changed()
         self.statusBar().showMessage("Search failed.", 4000)
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Critical)
@@ -11173,35 +11103,6 @@ class MainWindow(QMainWindow):
             self._start_search(pending)
         else:
             self.search_button.setText("Search")
-
-    def on_search_selection_changed(self, selected=None, deselected=None) -> None:
-        item = self.selected_search_item()
-        real_available = item is not None and not item.missing and item.connected
-        self.open_file_button.setEnabled(item is not None and (item.is_folder or real_available))
-        self.reveal_file_button.setEnabled(real_available)
-        preview_button = getattr(self, "open_preview_button", None)
-        if preview_button is None:
-            return
-        preview_available = False
-        label = "Open Preview"
-        tooltip = "Open the preview in the operating system's default application"
-        if item is not None and not item.is_folder and getattr(self, "db", None) is not None:
-            target = self.catalogue_ref_for_search_item(item)
-            media_kind, info, file_row = self.preview_info_for_target(target)
-            if media_kind in {"image", "video"}:
-                label = preview_open_label(media_kind)
-                # Spec §46: an existing-but-corrupt preview is not available.
-                preview_available = info is not None and info.exists and info.valid
-                if not preview_available:
-                    tooltip = self.preview_unavailable_reason(media_kind, info, file_row)
-            else:
-                tooltip = "Offline previews are available for images and videos only."
-        preview_button.setText(label)
-        preview_button.setEnabled(preview_available)
-        preview_button.setToolTip(tooltip)
-
-    def selected_search_item(self) -> SearchResultItem | None:
-        return self.search_model.item_at(self.search_table.currentIndex())
 
     def show_search_context_menu(self, point: QPoint) -> None:
         if self.db is None:
@@ -11232,16 +11133,6 @@ class MainWindow(QMainWindow):
             relative_path=item.relative_path,
             missing=item.missing,
         )
-
-    def open_selected_real_item(self, reveal: bool) -> None:
-        item = self.selected_search_item()
-        if item is not None:
-            self.open_real_catalogue_item(self.catalogue_ref_for_search_item(item), reveal)
-
-    def open_selected_search_item(self) -> None:
-        item = self.selected_search_item()
-        if item is not None:
-            self.open_catalogue_item(self.catalogue_ref_for_search_item(item))
 
     def open_search_index(self, index: QModelIndex) -> None:
         item = self.search_model.item_at(index)

@@ -24,6 +24,36 @@ from jvvv.app import (
 )
 
 
+def test_backup_evidence_sorts_counts_and_coverage_by_numeric_value():
+    app = QApplication.instance() or QApplication([])
+    dialog = BackupEvidenceDialog()
+    try:
+        counts = (10, 1000, 2)
+        percents = (100.0, 2.0, 10.0)
+        dialog.set_records(
+            {},
+            [],
+            [
+                {"source_volume_id": row, "source_coverage_percent": percent}
+                for row, percent in enumerate(percents, start=1)
+            ],
+            [
+                {"volume_id": row, "latest_attempt_files": count}
+                for row, count in enumerate(counts, start=1)
+            ],
+            {},
+        )
+        scans = dialog.scan_table
+        scans.sortItems(4, Qt.SortOrder.AscendingOrder)
+        assert [scans.item(row, 4).text() for row in range(3)] == ["2", "10", "1,000"]
+        mirrors = dialog.mirror_table
+        mirrors.sortItems(2, Qt.SortOrder.AscendingOrder)
+        assert [mirrors.item(row, 2).text() for row in range(3)] == ["2%", "10%", "100%"]
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
 def test_item_copy_evidence_uses_words_and_explains_metadata_limit():
     status = SimpleNamespace(
         status="likely",

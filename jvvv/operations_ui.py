@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QMenu, QProgressBar, QPushButton,
-    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QDialog, QHBoxLayout, QHeaderView, QLabel, QMenu, QProgressBar, QPushButton,
+    QTabWidget, QTableWidgetItem, QVBoxLayout,
 )
 
+from .list_ui import ListTableWidget
 from .operations_queue import STATUS_TABS, STATUSES, Operation
 
 
@@ -24,7 +25,7 @@ class OperationsDialog(QDialog):
         self.setWindowTitle("Queue Manager")
         self.resize(850, 380)
         self.tabs = QTabWidget()
-        self.tables: dict[str, QTableWidget] = {}
+        self.tables: dict[str, ListTableWidget] = {}
         self.jobs_by_tab: dict[str, list[Operation]] = {}
         self.preview_failure_job_id = None
         for tab in dict.fromkeys(STATUS_TABS.values()):
@@ -58,14 +59,10 @@ class OperationsDialog(QDialog):
         layout.addLayout(controls)
 
     @staticmethod
-    def _operation_table() -> QTableWidget:
-        table = QTableWidget(0, 5)
-        table.setHorizontalHeaderLabels(["Operation", "Volume", "Source project", "Status", "Progress"])
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.verticalHeader().hide()
+    def _operation_table() -> ListTableWidget:
+        table = ListTableWidget(["Operation", "Volume", "Source project", "Status", "Progress"])
         header = table.horizontalHeader()
+        header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
@@ -105,8 +102,12 @@ class OperationsDialog(QDialog):
 
     def _show_selection(self):
         tab = self.tabs.tabText(self.tabs.currentIndex())
-        job = self._selected_job(self.tables[tab], self.jobs_by_tab[tab])
-        self.detail.setText(job.detail if job is not None else f"No {tab.lower()} tasks.")
+        jobs = self.jobs_by_tab[tab]
+        job = self._selected_job(self.tables[tab], jobs)
+        if job is not None:
+            self.detail.setText(job.detail)
+        else:
+            self.detail.setText("No task selected." if jobs else f"No {tab.lower()} tasks.")
 
     def refresh(self, jobs, active, *, preview_failure_job_id=None):
         self.preview_failure_job_id = preview_failure_job_id
@@ -139,6 +140,7 @@ class OperationsDialog(QDialog):
     @staticmethod
     def _refresh_table(table, jobs, selected):
         with QSignalBlocker(table):
+            select_row = table.rowCount() == 0 or selected is not None
             table.setRowCount(len(jobs))
             selected_row = 0
             for row, job in enumerate(jobs):
@@ -150,5 +152,5 @@ class OperationsDialog(QDialog):
                     table.setItem(row, column, cell)
                 if selected is not None and job.id == selected.id:
                     selected_row = row
-            if jobs:
+            if jobs and select_row:
                 table.selectRow(selected_row)

@@ -6,12 +6,16 @@ from threading import Event, get_ident
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QPoint, QSettings, QSize, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QTreeWidgetItem
 
-from jvvv.app import BackupDisplay, BrowserItem, CatalogueItemRef, MainWindow, VolumeConnections, volume_location_key
+from jvvv.app import (
+    BackupDisplay, BrowserItem, CatalogueItemRef, MainWindow, StandardTableModel, TableColumn,
+    VolumeConnections, volume_location_key,
+)
 from jvvv.database import create_catalogue
+from jvvv.list_ui import ListTableView, ListTableWidget, ListTreeWidget
 from jvvv.utils import VolumeSnapshot, format_size
 from test_catalogue_directory import populate
 
@@ -40,6 +44,98 @@ def populated_volume(window, tmp_path):
     populate(window.db, volume_id, "photo", 8, errors=0)
     window.db.update_volume_storage(volume_id, 3 * 1024**4, 2 * 1024**4, 1024**4)
     return window.db.get_volume(volume_id)
+
+
+def test_sorting_volumes_keeps_the_selected_volume_and_its_details(window, tmp_path):
+    window.volume_connection_timer.stop()
+    volume = populated_volume(window, tmp_path)
+    other = window.db.create_volume(
+        "Video Archive", str(tmp_path / "Video Drive"), {"drive_id": "AID-002"}
+    )
+    window.refresh_volumes()
+    table = window.volume_table
+    table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+    assert window.select_volume(volume["id"])
+    table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+
+    assert [item.id for item in window.volume_model.items] == [other, volume["id"]]
+    assert table.selectionModel().selectedRows()[0].row() == 1
+    assert window.selected_volume_id() == window.current_volume_id == volume["id"]
+    assert window.detail_labels["name"].text() == "Photo Archive"
+
+    window.show()
+    QApplication.processEvents()
+    blank = QPoint(10, table.viewport().height() - 5)
+    assert not table.indexAt(blank).isValid()
+    QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton, pos=blank)
+    assert window.selected_volume_id() is None
+    assert window.current_volume_id is None
+    assert window.detail_labels["name"].text() == "-"
+
+
+@pytest.mark.parametrize("widget_type", [ListTableView, ListTableWidget, ListTreeWidget])
+def test_lists_scroll_past_the_last_row_and_clear_selection_in_blank_space(widget_type):
+    app = QApplication.instance() or QApplication([])
+    labels = [f"Item {row}" for row in range(40)]
+    if widget_type is ListTableView:
+        view = widget_type()
+        model = StandardTableModel([TableColumn("Name", str)], view)
+        view.setModel(model)
+        model.set_items(labels)
+    elif widget_type is ListTableWidget:
+        view = widget_type(["Name"])
+        for label in labels:
+            view.append_text_row([label])
+    else:
+        view = widget_type()
+        view.addTopLevelItems([QTreeWidgetItem([label]) for label in labels])
+
+    try:
+        view.resize(300, 200)
+        view.show()
+        app.processEvents()
+        scrollbar = view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        last = view.model().index(len(labels) - 1, 0)
+        last_rect = view.visualRect(last)
+        assert 0 <= last_rect.top() < last_rect.bottom() <= view.viewport().height() // 2 + 1
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=last_rect.center())
+        assert view.currentIndex() == last
+        assert view.selectionModel().hasSelection()
+        blank = QPoint(last_rect.center().x(), view.viewport().height() - 5)
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=blank)
+        assert not view.currentIndex().isValid()
+        assert not view.selectionModel().hasSelection()
+    finally:
+        view.close()
+
+
+def test_folder_tree_keeps_trailing_scroll_space_after_navigation_and_row_changes():
+    app = QApplication.instance() or QApplication([])
+    tree = ListTreeWidget()
+    tree.setUniformRowHeights(True)
+    root = QTreeWidgetItem(tree, ["Volume"])
+    folders = [QTreeWidgetItem(root, [f"Folder {row:02d}"]) for row in range(40)]
+    root.setExpanded(True)
+    try:
+        tree.resize(300, 200)
+        tree.show()
+        app.processEvents()
+
+        tree.setCurrentItem(folders[-1])
+        tree.scrollToBottom()
+        assert 0 <= tree.visualItemRect(folders[-1]).bottom() <= tree.viewport().height() // 2
+
+        scrollbar = tree.verticalScrollBar()
+        position = scrollbar.value()
+        tree.setCurrentItem(folders[-2])
+        assert scrollbar.value() == position
+
+        root.setSizeHint(0, QSize(100, 24))
+        tree.scrollToBottom()
+        assert 0 <= tree.visualItemRect(folders[-1]).bottom() <= tree.viewport().height() // 2
+    finally:
+        tree.close()
 
 
 def test_selected_volume_shows_saved_connector_storage_and_counts_while_offline(window, tmp_path, monkeypatch):

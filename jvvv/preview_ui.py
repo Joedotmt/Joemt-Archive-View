@@ -22,7 +22,6 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -32,7 +31,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -42,13 +40,13 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QTabWidget,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .database import Database
+from .list_ui import ListTableWidget
 from .media_metadata import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from .preview_cache import (
     STAGE_CONFIGURATION,
@@ -696,16 +694,7 @@ class PreviewFailuresDialog(QDialog):
         else:
             self.storage_label.setVisible(False)
 
-        self.table = QTableWidget(0, len(FAILURE_COLUMNS))
-        self.table.setHorizontalHeaderLabels(list(FAILURE_COLUMNS))
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        self.table.setWordWrap(False)
-        header = self.table.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table = ListTableWidget(FAILURE_COLUMNS)
         self._populate_table()
 
         self.copy_text = self._build_copy_text()
@@ -918,16 +907,7 @@ class PreviewCacheDialog(QDialog):
         unreferenced_layout.addLayout(unused_toolbar)
         self.unreferenced_count_label = _muted_label("Not checked yet.")
         unreferenced_layout.addWidget(self.unreferenced_count_label)
-        self.unreferenced_table = QTableWidget(0, len(UNREFERENCED_COLUMNS))
-        self.unreferenced_table.setHorizontalHeaderLabels(list(UNREFERENCED_COLUMNS))
-        self.unreferenced_table.verticalHeader().setVisible(False)
-        self.unreferenced_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.unreferenced_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.unreferenced_table.setAlternatingRowColors(True)
-        self.unreferenced_table.setWordWrap(False)
-        header = self.unreferenced_table.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.unreferenced_table = ListTableWidget(UNREFERENCED_COLUMNS)
         for column, width in enumerate((32, 70, 180, 180, 90)):
             self.unreferenced_table.setColumnWidth(column, width)
         self.unreferenced_table.itemChanged.connect(self._on_table_item_changed)

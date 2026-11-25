@@ -98,8 +98,8 @@ Double-click an entry or use **Open Selected**; **Remove from List** only forget
 the entry and leaves the catalogue on disk. Offline locations stay in the list.
 
 An open catalogue has its own workspace, with its name and location at the top.
-Use **Close Catalogue / Return Home** to return Home before opening or creating another
-catalogue. Catalogue actions and Catalogue Settings appear only in the workspace;
+Use the Home button or **File → Close Catalogue** before opening or creating
+another catalogue. Catalogue actions and Catalogue Settings appear only in the workspace;
 App Settings, Help, and UI zoom remain available on both screens.
 
 The Selected Volume panel shows connector type, connection, catalogue status,
@@ -110,10 +110,10 @@ copy status** control; **All items** shows everything in the current folder.
 The top bar has three menus: **File** for catalogue and volume actions, **View**
 for zoom, and **Window** for settings, managers, information, and Help. On Home,
 Window contains only **App Settings** and **Help**. With a catalogue open, it also
-offers **Catalogue Settings**, **Snapshot Manager**, **Backup Evidence**,
+offers **Catalogue Settings**, **Queue Manager**, **Snapshot Manager**, **Backup Evidence**,
 **Preview Manager**, and **Catalogue Information**. File keeps catalogue
 opening and creation actions on Home; the workspace instead offers **Add Volume…**,
-**Open Catalogue Folder**, and **Close Catalogue / Return Home**.
+**Open Catalogue Folder**, and **Close Catalogue**.
 
 ### Catalogue folder layout
 
@@ -484,10 +484,10 @@ direct failures from previews that were not attempted. Preview failures never
 affect the catalogue records, scan health, or copy-evidence analysis.
 
 In the catalogue and search views, an image or video's context menu offers
-**Open Preview** / **Play Preview** and **Reveal Preview** whenever the preview
-file exists, even while the original volume is offline; the search tab also has
-an **Open Preview** button. Both use the operating system's default image or
-video application — JVVV never contains an embedded viewer or player.
+**Open Preview** / **Play Preview** and **Open Preview Location** whenever the
+preview is usable, even while the original volume is offline. Opening the
+preview launches the operating system's default image or video application.
+Opening its location shows the preview file in the file manager.
 Properties show whether a preview is available, its profile, dimensions,
 duration, size, and location, or why the last scan could not create it.
 
